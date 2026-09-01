@@ -3,6 +3,7 @@ name: Sync upstream into integration
 # Keeps this fork current with Dicklesworthstone/coding_agent_account_manager:
 #   main        = exact mirror of upstream/main (fast-forward only)
 #   integration = main + every fix/* branch not yet merged upstream
+# Runs daily (04:17 UTC) and on demand via workflow_dispatch.
 # The merge is incremental: upstream/main and any new fix/* branch are merged
 # INTO the existing integration branch, so resolutions already recorded there
 # are kept. A conflict fails the run and opens an issue instead of guessing.
