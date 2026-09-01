@@ -692,7 +692,6 @@ func TestGetVaultIdentity_ClaudeMaxReachesJSON(t *testing.T) {
 	}
 }
 
-
 // TestGetVaultIdentity_ClaudeEmailFromSettings covers the whole status/ls
 // display path: a vault Claude profile whose .credentials.json carries no
 // email must still report the one its .claude.json snapshot holds, instead of
@@ -732,8 +731,8 @@ func TestGetVaultIdentity_ClaudeEmailFromSettings(t *testing.T) {
 	if email != "work@example.com" {
 		t.Errorf("formatIdentityDisplay() email = %q, want %q", email, "work@example.com")
 	}
-	if plan != "Pro" { // "max" normalizes to pro, FormatPlanType capitalizes
-		t.Errorf("formatIdentityDisplay() plan = %q, want %q", plan, "Pro")
+	if plan != "Max" { // FormatPlanType keeps the real tier and capitalizes it
+		t.Errorf("formatIdentityDisplay() plan = %q, want %q", plan, "Max")
 	}
 }
 
