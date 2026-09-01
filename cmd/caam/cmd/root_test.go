@@ -686,3 +686,83 @@ func TestGetVaultIdentity_ClaudeNoSettingsFile(t *testing.T) {
 		t.Errorf("formatIdentityDisplay() email = %q, want %q", email, "n/a")
 	}
 }
+
+	"encoding/json"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+		{
+			name: "claude on the max plan",
+			identity: &identity.Identity{
+				Provider: "claude",
+				Email:    "",
+				PlanType: "max",
+			},
+			wantEmail: "n/a",
+			wantPlan:  "Max", // Must not be collapsed to "Pro"
+		},
+
+// TestNormalizePlanType checks that normalization only canonicalizes spelling.
+// It must never collapse distinct tiers: a Claude Max account that reports
+// subscriptionType "max" has to keep reading "max" in storage, display, and
+// `--json` output.
+func TestNormalizePlanType(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"max", "max"},
+		{"  MAX  ", "max"},
+		{"Ultra", "ultra"},
+		{"plus", "plus"},
+		{"premium", "premium"},
+		{"pro", "pro"},
+		{"Team", "team"},
+		{"ENTERPRISE", "enterprise"},
+		{"free", "free"},
+		{"claude_pro_2025", "claude_pro_2025"},
+		{"   ", ""},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := normalizePlanType(tt.input); got != tt.want {
+				t.Errorf("normalizePlanType(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGetVaultIdentity_ClaudeMaxReachesJSON covers the value that robot.go
+// serializes as plan_type: a vaulted Max account must surface as "max".
+func TestGetVaultIdentity_ClaudeMaxReachesJSON(t *testing.T) {
+	vaultDir := t.TempDir()
+	prev := vault
+	vault = authfile.NewVault(vaultDir)
+	t.Cleanup(func() { vault = prev })
+
+	profileDir := filepath.Join(vaultDir, "claude", "work")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	creds := `{"claudeAiOauth":{"accessToken":"t","subscriptionType":"max","rateLimitTier":"default_claude_max_20x","expiresAt":9999999999999}}`
+	if err := os.WriteFile(filepath.Join(profileDir, ".credentials.json"), []byte(creds), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	id := getVaultIdentity("claude", "work")
+	if id == nil {
+		t.Fatal("getVaultIdentity() = nil, want identity")
+	}
+	if id.PlanType != "max" {
+		t.Errorf("PlanType = %q, want %q", id.PlanType, "max")
+	}
+
+	info := RobotProfileInfo{PlanType: id.PlanType}
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"plan_type":"max"`) {
+		t.Errorf("robot JSON = %s, want plan_type \"max\"", data)
+	}
+}
