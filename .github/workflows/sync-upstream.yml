@@ -2,7 +2,7 @@ name: Sync upstream into integration
 
 # Keeps this fork current with Dicklesworthstone/coding_agent_account_manager:
 #   main        = exact mirror of upstream/main (fast-forward only)
-#   integration = main + every fix/* branch not yet merged upstream
+#   integration = main + every fix/* and feat/* branch not yet merged upstream
 # Runs daily (04:17 UTC) and on demand via workflow_dispatch.
 # The merge is incremental: upstream/main and any new fix/* branch are merged
 # INTO the existing integration branch, so resolutions already recorded there
@@ -57,7 +57,7 @@ jobs:
             fi
           }
           merge_or_fail upstream/main
-          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/fix/); do
+          for ref in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/fix/ refs/remotes/origin/feat/); do
             merge_or_fail "$ref"
           done
 
