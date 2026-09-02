@@ -76,11 +76,15 @@ type claudeSettingsIdentity struct {
 // shallow profile's <home>/.claude/.credentials.json).
 func claudeSettingsCandidates(credentialsPath string) []string {
 	dir := filepath.Dir(credentialsPath)
-	candidates := []string{filepath.Join(dir, claudeSettingsFile)}
-	if filepath.Base(dir) == ".claude" {
-		candidates = append(candidates, filepath.Join(filepath.Dir(dir), claudeSettingsFile))
+	sibling := filepath.Join(dir, claudeSettingsFile)
+	if filepath.Base(dir) != ".claude" {
+		return []string{sibling}
 	}
-	return candidates
+	// A live or shallow HOME keeps its identity in <home>/.claude.json. A
+	// stray .claude.json INSIDE the .claude directory (left by another tool,
+	// and mirrored into every shallow profile by the symlink farm) must not
+	// win over it, so the parent comes first and the sibling is a fallback.
+	return []string{filepath.Join(filepath.Dir(dir), claudeSettingsFile), sibling}
 }
 
 // fillFromClaudeSettings copies the identity fields that are still empty out

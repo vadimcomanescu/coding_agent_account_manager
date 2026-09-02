@@ -2264,8 +2264,7 @@ func claudeFileSetPath(fileSet AuthFileSet, name string) string {
 }
 
 // ClaudeLiveIdentityKeys derives the identity of the currently logged-in
-// Claude account from the live ~/.claude.json named by fileSet (pass
-// ClaudeAuthFiles() to resolve it the way every other caam command does).
+// Claude account from the live ~/.claude.json.
 func ClaudeLiveIdentityKeys(fileSet AuthFileSet) []string {
 	settingsPath := claudeFileSetPath(fileSet, claudeSettingsFile)
 	if settingsPath == "" {

@@ -36,7 +36,6 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
 	grokprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/grok"
 	opencodeprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/opencode"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/tui"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/warnings"
@@ -302,13 +301,6 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
 	}
 
-	// The credential this profile's health is read from. The vault snapshot is
-	// the fallback; the live file below supersedes it when readable.
-	cred := expInfo
-	if err != nil {
-		cred = nil
-	}
-
 	// Prefer the profile's own live credential over the vault snapshot.
 	// Vault copies are frozen at backup/activate time while tools refresh
 	// the live file in place, so a snapshot expiry can be days stale and
@@ -374,9 +366,6 @@ func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
 	}
 	if info := liveAuthExpiry(tool); info != nil && !info.ExpiresAt.IsZero() {
 		applyExpiryInfo(ph, info)
-	}
-	if info.HasRefreshToken && refresh.SelfRefreshing(tool) {
-		ph.SelfRefreshing = true
 	}
 }
 

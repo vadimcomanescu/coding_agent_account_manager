@@ -216,6 +216,15 @@ func TestCollectQuotaRowsReadsLiveSnapshotAndShallow(t *testing.T) {
 	shallowHome := filepath.Join(shallowBase, "spare")
 	writeQuotaCache(t, filepath.Join(shallowHome, ".claude.json"), 1788200000000, "shallow-uuid", 7)
 	writeShallowMeta(t, shallowHome, "spare", "claude")
+	require.NoError(t, os.MkdirAll(filepath.Join(shallowHome, ".claude"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(shallowHome, ".claude", ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"t"}}`), 0o600))
+	// A shallow profile that never logged in carries a seeded copy of someone
+	// else's cache and must not appear as an account of its own.
+	blankHome := filepath.Join(shallowBase, "blank")
+	writeQuotaCache(t, filepath.Join(blankHome, ".claude.json"), 1788200000000, "live-uuid", 53)
+	writeShallowMeta(t, blankHome, "blank", "claude")
+	require.NoError(t, os.MkdirAll(filepath.Join(blankHome, ".claude"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(blankHome, ".claude", ".credentials.json"), []byte(""), 0o600))
 	mgr, err := shallow.NewManager(shallowBase, homeDir)
 	require.NoError(t, err)
 
@@ -253,6 +262,10 @@ func TestCollectQuotaRowsReadsLiveSnapshotAndShallow(t *testing.T) {
 	spare := byName["spare"]
 	assert.Equal(t, quotaSourceShallow, spare.Source)
 	assert.Equal(t, 7, spare.Windows[0].Percent)
+
+	_, blankListed := byName["blank"]
+	assert.False(t, blankListed, "a shallow profile without a credential is not an account")
+	assert.Equal(t, []string{"active"}, work.Lanes, "the seeded copy must not add a lane to the real account")
 }
 
 func TestCollectQuotaRowsUnreadableVault(t *testing.T) {

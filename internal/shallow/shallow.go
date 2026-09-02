@@ -617,9 +617,18 @@ func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 		return nil
 	}
 	realClaudeJSON := filepath.Join(m.realHome, ".claude.json")
-	if _, err := os.Stat(realClaudeJSON); err == nil {
-		if cerr := copyFileMode(realClaudeJSON, claudeJSONPath, 0o600); cerr != nil {
-			return fmt.Errorf("seed .claude.json from real HOME: %w", cerr)
+	if data, err := os.ReadFile(realClaudeJSON); err == nil {
+		// The real file carries the real account's identity and usage cache.
+		// A profile created empty is going to log in as a different account,
+		// so those keys are dropped: kept, they would make the new profile
+		// look like the real account to every reader (status, quota, the
+		// double-spend guard) until its first login rewrites them.
+		seeded, serr := stripClaudeIdentity(data)
+		if serr != nil {
+			return fmt.Errorf("seed .claude.json from real HOME: %w", serr)
+		}
+		if werr := writeFileAtomic(claudeJSONPath, seeded, 0o600); werr != nil {
+			return fmt.Errorf("seed .claude.json from real HOME: %w", werr)
 		}
 		return nil
 	}
@@ -627,6 +636,28 @@ func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 		return fmt.Errorf("write skeleton .claude.json: %w", err)
 	}
 	return nil
+}
+
+// claudeIdentityKeys are the top-level .claude.json keys that describe which
+// account the file belongs to and what that account has consumed. Everything
+// else in the file is configuration and onboarding state worth inheriting.
+var claudeIdentityKeys = []string{"oauthAccount", "userID", "cachedUsageUtilization"}
+
+// stripClaudeIdentity returns the .claude.json bytes with the account
+// identity and usage cache removed.
+func stripClaudeIdentity(data []byte) ([]byte, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("parse .claude.json: %w", err)
+	}
+	for _, k := range claudeIdentityKeys {
+		delete(root, k)
+	}
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, '\n'), nil
 }
 
 // ensureClaudeOnboarding merges the minimum non-secret readiness marker

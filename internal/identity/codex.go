@@ -79,10 +79,6 @@ type tokenCandidate struct {
 // codexTokenCandidates lists every token that may carry identity claims, in
 // preference order: id tokens (top-level, then nested) before access tokens.
 func codexTokenCandidates(auth map[string]interface{}) []tokenCandidate {
-	return append(codexIDTokenCandidates(auth), codexAccessTokenCandidates(auth)...)
-}
-
-func codexIDTokenCandidates(auth map[string]interface{}) []tokenCandidate {
 	candidates := []tokenCandidate{
 		{value: stringFromMap(auth, "id_token"), source: "id_token"},
 		{value: stringFromMap(auth, "idToken"), source: "idToken"},

@@ -268,8 +268,12 @@ func TestExtractFromClaudeCredentials_IdentityFromParentClaudeJSON(t *testing.T)
 	if err != nil {
 		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
 	}
-	if id.Email != "beside@example.com" {
-		t.Errorf("Email = %q, want the sibling file's %q", id.Email, "beside@example.com")
+	// Fork: the HOME-level file wins. A .claude.json inside the .claude
+	// directory is a stray left by another tool (seen in the field, mirrored
+	// into every shallow profile by the symlink farm) and only serves as a
+	// fallback when the HOME-level file is missing.
+	if id.Email != "live@example.com" {
+		t.Errorf("Email = %q, want the HOME-level file's %q", id.Email, "live@example.com")
 	}
 }
 

@@ -595,3 +595,44 @@ func TestCreateProducesNoBrokenSymlinks(t *testing.T) {
 		t.Fatalf("walk: %v", err)
 	}
 }
+
+// TestCreateEmptyProfileStripsRealIdentity pins the seeding rule: an empty
+// profile inherits the real HOME's configuration and onboarding state from
+// .claude.json, but never the real account's identity or usage cache.
+func TestCreateEmptyProfileStripsRealIdentity(t *testing.T) {
+	realHome := t.TempDir()
+	base := filepath.Join(t.TempDir(), "orch-homes")
+	if err := os.MkdirAll(filepath.Join(realHome, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, ".claude", ".credentials.json"), []byte(`{"claudeAiOauth":{"accessToken":"real"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seed := `{"hasCompletedOnboarding":true,"theme":"dark","oauthAccount":{"accountUuid":"real-uuid","emailAddress":"real@example.com"},"userID":"abc","cachedUsageUtilization":{"accountUuid":"real-uuid"}}`
+	if err := os.WriteFile(filepath.Join(realHome, ".claude.json"), []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := NewManager(base, realHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Create("fresh", CreateOptions{Provider: "claude"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(base, "fresh", ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("seeded .claude.json is not JSON: %v", err)
+	}
+	for _, k := range []string{"oauthAccount", "userID", "cachedUsageUtilization"} {
+		if _, ok := got[k]; ok {
+			t.Errorf("seeded .claude.json still carries %q", k)
+		}
+	}
+	if got["hasCompletedOnboarding"] != true || got["theme"] != "dark" {
+		t.Errorf("configuration keys were not inherited: %v", got)
+	}
+}

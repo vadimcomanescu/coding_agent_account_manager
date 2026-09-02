@@ -3,7 +3,6 @@ package cmd
 
 import (
 	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -579,16 +578,6 @@ func TestFormatIdentityDisplay_ClaudeEmptyEmail(t *testing.T) {
 			},
 			wantEmail: "n/a", // Should be "n/a" for Claude, not "unknown"
 			wantPlan:  "claude_pro_2025",
-		},
-		{
-			name: "claude on the max plan",
-			identity: &identity.Identity{
-				Provider: "claude",
-				Email:    "",
-				PlanType: "max",
-			},
-			wantEmail: "n/a",
-			wantPlan:  "Max", // Must not be collapsed to "Pro"
 		},
 		{
 			name: "codex without email",

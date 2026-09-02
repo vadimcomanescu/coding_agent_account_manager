@@ -319,6 +319,11 @@ func collectShallowQuotaRows(scan quotaScan) []quotaRow {
 		if err != nil || provider != "claude" {
 			continue
 		}
+		// A profile that has not logged in yet holds no account of its own;
+		// whatever its seeded .claude.json says belongs to someone else.
+		if credPath, err := scan.shallowMgr.CredentialPath(p.Name); err != nil || !shallowCredentialPresent(credPath) {
+			continue
+		}
 		path := filepath.Join(p.Path, ".claude.json")
 		rows = append(rows, buildQuotaRow(scan, p.Name, p.Path, path, quotaSourceShallow, false))
 	}

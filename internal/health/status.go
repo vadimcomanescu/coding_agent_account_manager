@@ -157,8 +157,6 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		score += 0.25
 	case PlanTierStandard:
 		score += 0.2
-	case PlanTierUnrated:
-		// Free/unknown plans get no bonus.
 	}
 
 	// Factor 4: Penalty (from errors, with decay)
