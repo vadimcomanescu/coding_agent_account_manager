@@ -260,6 +260,22 @@ wait
 
 > **Note:** `caam shallow-profile` does not (yet) call any reverse-engineered Anthropic endpoints to display per-account live usage data. That's a separate concern tracked in the original report (issue #16) and intentionally deferred.
 
+
+### Daily flow (fork)
+
+```bash
+caam shallow-spawn vadim            # open Claude as that profile, in this terminal
+caam shallow-spawn alice --tool codex
+caam next claude                    # rotate the main lane (~/.claude); plain `claude` sessions follow
+caam quota                          # usage per account, all lanes, no network
+caam shallow-profile list           # LOGIN column shows who each profile is right now
+```
+
+- **Create on first use.** An unknown name is created as an empty profile and the first session logs in; credentials are never copied from the vault (two homes sharing one refresh-token family invalidate each other, #19). Empty profiles inherit configuration from the real HOME but not its identity or usage cache.
+- **Double-spend guard.** Spawning a profile that is logged in as the account already active in `~/.claude` is refused, since both sessions would draw on one quota; `--force` overrides.
+- **PATH.** The shallow HOME's `.local/bin` (a symlink to the real one) is put first on `PATH`, so Claude Code's "native install is not on PATH" diagnostic stays quiet under a shallow HOME.
+**Configuration follows the main lane.** On every `shallow-spawn`, the profile's `.claude.json` is refreshed from your real `~/.claude.json`: theme, editor mode, notifications, global MCP servers, and per-project trust and tool approvals come from the main lane, while the profile keeps its own login identity and usage cache. Change settings in a plain `claude` session and every shallow session picks them up on its next spawn. `~/.claude/settings.json` is shared directly through the symlink farm.
+
 ---
 
 ## Supported Tools
@@ -272,7 +288,6 @@ wait
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
 | **Grok Build** (xAI) | OAuth/OIDC: `~/.grok/auth.json` (+ `~/.grok/config.toml`); respects `GROK_HOME` | `grok login` (browser OIDC) |
 
-**Configuration follows the main lane.** On every `shallow-spawn`, the profile's `.claude.json` is refreshed from your real `~/.claude.json`: theme, editor mode, notifications, global MCP servers, and per-project trust and tool approvals come from the main lane, while the profile keeps its own login identity and usage cache. Change settings in a plain `claude` session and every shallow session picks them up on its next spawn. `~/.claude/settings.json` is shared directly through the symlink farm.
 
 ### Claude Code (Claude Max)
 
