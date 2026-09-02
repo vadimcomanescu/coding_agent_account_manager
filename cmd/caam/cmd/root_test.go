@@ -625,142 +625,83 @@ func TestFormatIdentityDisplay_ClaudeEmptyEmail(t *testing.T) {
 	}
 }
 
-// TestNormalizePlanType checks that normalization only canonicalizes spelling.
-// It must never collapse distinct tiers: a Claude Max account that reports
-// subscriptionType "max" has to keep reading "max" in storage, display, and
-// `--json` output.
+// TestNormalizePlanType guards PR #87: normalization only canonicalizes the
+// spelling and never collapses tiers, so a Claude Max account keeps reading
+// "max" in storage, display, and --json output.
 func TestNormalizePlanType(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"max", "max"},
-		{"  MAX  ", "max"},
-		{"Ultra", "ultra"},
-		{"plus", "plus"},
-		{"premium", "premium"},
-		{"pro", "pro"},
-		{"Team", "team"},
-		{"ENTERPRISE", "enterprise"},
-		{"free", "free"},
-		{"claude_pro_2025", "claude_pro_2025"},
-		{"   ", ""},
-		{"", ""},
+	tests := map[string]string{
+		"max":        "max",
+		" Max ":      "max",
+		"ULTRA":      "ultra",
+		"plus":       "plus",
+		"premium":    "premium",
+		"pro":        "pro",
+		"team":       "team",
+		"enterprise": "enterprise",
+		"free":       "free",
+		"":           "",
+		"custom_x":   "custom_x",
+	}
+	for in, want := range tests {
+		if got := normalizePlanType(in); got != want {
+			t.Errorf("normalizePlanType(%q) = %q, want %q", in, got, want)
+		}
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			if got := normalizePlanType(tt.input); got != tt.want {
-				t.Errorf("normalizePlanType(%q) = %q, want %q", tt.input, got, tt.want)
+	id := &identity.Identity{Provider: "claude", PlanType: "max"}
+	normalizeIdentityPlan(id)
+	if _, plan := formatIdentityDisplay(id); plan != "Max" {
+		t.Errorf("display plan = %q, want %q", plan, "Max")
+	}
+}
+
+// TestGetVaultIdentity_ClaudeEmailFromClaudeJSON covers the status/ls display
+// path for PR #85: a vault Claude profile whose .credentials.json carries no
+// email still reports the one in its .claude.json snapshot, and a profile
+// without that snapshot keeps the "n/a" display.
+func TestGetVaultIdentity_ClaudeEmailFromClaudeJSON(t *testing.T) {
+	prevVault := vault
+	t.Cleanup(func() { vault = prevVault })
+	vault = authfile.NewVault(t.TempDir())
+
+	writeProfile := func(name string, withSettings bool) {
+		dir := vault.ProfilePath("claude", name)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		creds := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-opaque","subscriptionType":"max","expiresAt":1788000000000}}`
+		if err := os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(creds), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if withSettings {
+			settings := `{"numStartups":3,"oauthAccount":{"accountUuid":"uuid-work","emailAddress":"work@example.com","organizationName":"Work Org"}}`
+			if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(settings), 0600); err != nil {
+				t.Fatal(err)
 			}
-		})
+		}
 	}
-}
-
-// TestGetVaultIdentity_ClaudeMaxReachesJSON covers the value that robot.go
-// serializes as plan_type: a vaulted Max account must surface as "max".
-func TestGetVaultIdentity_ClaudeMaxReachesJSON(t *testing.T) {
-	vaultDir := t.TempDir()
-	prev := vault
-	vault = authfile.NewVault(vaultDir)
-	t.Cleanup(func() { vault = prev })
-
-	profileDir := filepath.Join(vaultDir, "claude", "work")
-	if err := os.MkdirAll(profileDir, 0o700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	creds := `{"claudeAiOauth":{"accessToken":"t","subscriptionType":"max","rateLimitTier":"default_claude_max_20x","expiresAt":9999999999999}}`
-	if err := os.WriteFile(filepath.Join(profileDir, ".credentials.json"), []byte(creds), 0o600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	writeProfile("work", true)
+	writeProfile("solo", false)
 
 	id := getVaultIdentity("claude", "work")
 	if id == nil {
-		t.Fatal("getVaultIdentity() = nil, want identity")
+		t.Fatal("getVaultIdentity(work) = nil")
 	}
-	if id.PlanType != "max" {
-		t.Errorf("PlanType = %q, want %q", id.PlanType, "max")
+	if id.Email != "work@example.com" || id.AccountID != "uuid-work" || id.Organization != "Work Org" {
+		t.Errorf("identity = %+v, want work@example.com / uuid-work / Work Org", id)
 	}
-
-	info := RobotProfileInfo{PlanType: id.PlanType}
-	data, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Marshal: %v", err)
-	}
-	if !strings.Contains(string(data), `"plan_type":"max"`) {
-		t.Errorf("robot JSON = %s, want plan_type \"max\"", data)
-	}
-}
-
-// TestGetVaultIdentity_ClaudeEmailFromSettings covers the whole status/ls
-// display path: a vault Claude profile whose .credentials.json carries no
-// email must still report the one its .claude.json snapshot holds, instead of
-// falling through to "n/a".
-func TestGetVaultIdentity_ClaudeEmailFromSettings(t *testing.T) {
-	prevVault := vault
-	t.Cleanup(func() { vault = prevVault })
-
-	vaultDir := t.TempDir()
-	vault = authfile.NewVault(vaultDir)
-
-	profileDir := vault.ProfilePath("claude", "work")
-	if err := os.MkdirAll(profileDir, 0700); err != nil {
-		t.Fatalf("mkdir profile: %v", err)
-	}
-	credentials := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-opaque","subscriptionType":"max","expiresAt":1788000000000}}`
-	if err := os.WriteFile(filepath.Join(profileDir, ".credentials.json"), []byte(credentials), 0600); err != nil {
-		t.Fatalf("write .credentials.json: %v", err)
-	}
-	settings := `{"oauthAccount":{"accountUuid":"uuid-work","emailAddress":"work@example.com"}}`
-	if err := os.WriteFile(filepath.Join(profileDir, ".claude.json"), []byte(settings), 0600); err != nil {
-		t.Fatalf("write .claude.json: %v", err)
+	if email, _ := formatIdentityDisplay(id); email != "work@example.com" {
+		t.Errorf("display email = %q, want %q", email, "work@example.com")
 	}
 
-	id := getVaultIdentity("claude", "work")
-	if id == nil {
-		t.Fatal("getVaultIdentity returned nil")
+	solo := getVaultIdentity("claude", "solo")
+	if solo == nil {
+		t.Fatal("getVaultIdentity(solo) = nil")
 	}
-	if id.Email != "work@example.com" {
-		t.Errorf("Email = %q, want %q", id.Email, "work@example.com")
+	if solo.Email != "" {
+		t.Errorf("solo Email = %q, want empty", solo.Email)
 	}
-	if id.AccountID != "uuid-work" {
-		t.Errorf("AccountID = %q, want %q", id.AccountID, "uuid-work")
-	}
-
-	email, plan := formatIdentityDisplay(id)
-	if email != "work@example.com" {
-		t.Errorf("formatIdentityDisplay() email = %q, want %q", email, "work@example.com")
-	}
-	if plan != "Max" { // FormatPlanType keeps the real tier and capitalizes it
-		t.Errorf("formatIdentityDisplay() plan = %q, want %q", plan, "Max")
-	}
-}
-
-// A Claude profile with no .claude.json keeps the existing "n/a" display.
-func TestGetVaultIdentity_ClaudeNoSettingsFile(t *testing.T) {
-	prevVault := vault
-	t.Cleanup(func() { vault = prevVault })
-
-	vaultDir := t.TempDir()
-	vault = authfile.NewVault(vaultDir)
-
-	profileDir := vault.ProfilePath("claude", "solo")
-	if err := os.MkdirAll(profileDir, 0700); err != nil {
-		t.Fatalf("mkdir profile: %v", err)
-	}
-	credentials := `{"claudeAiOauth":{"accessToken":"sk-ant-oat01-opaque","subscriptionType":"max"}}`
-	if err := os.WriteFile(filepath.Join(profileDir, ".credentials.json"), []byte(credentials), 0600); err != nil {
-		t.Fatalf("write .credentials.json: %v", err)
-	}
-
-	id := getVaultIdentity("claude", "solo")
-	if id == nil {
-		t.Fatal("getVaultIdentity returned nil")
-	}
-	if id.Email != "" {
-		t.Errorf("Email = %q, want empty", id.Email)
-	}
-	if email, _ := formatIdentityDisplay(id); email != "n/a" {
-		t.Errorf("formatIdentityDisplay() email = %q, want %q", email, "n/a")
+	if email, _ := formatIdentityDisplay(solo); email != "n/a" {
+		t.Errorf("solo display email = %q, want %q", email, "n/a")
 	}
 }

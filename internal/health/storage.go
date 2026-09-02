@@ -34,9 +34,10 @@ type ProfileHealth struct {
 	// PenaltyUpdatedAt is when the penalty was last updated.
 	PenaltyUpdatedAt time.Time `json:"penalty_updated_at,omitempty"`
 
-	// PlanType is the subscription tier as the provider reports it, lowercased
-	// (free, pro, plus, team, max, ultra, premium, enterprise). Ranked by
-	// PlanTierOf; never collapsed to a single paid spelling.
+	// PlanType is the subscription tier as the provider reports it,
+	// lowercased (free, pro, plus, team, max, ultra, premium, enterprise).
+	// Scorers rank it through PlanTierOf; it is never collapsed to a single
+	// paid spelling, so "max" stays "max" in storage and output.
 	PlanType string `json:"plan_type,omitempty"`
 
 	// LastChecked is when health was last verified.
@@ -50,13 +51,12 @@ type ProfileHealth struct {
 	// problem.
 	RateLimitedUntil time.Time `json:"-"`
 
-	// SelfRefreshing marks a credential whose access token is renewed in place
-	// by the provider's own CLI (Claude Code) from a stored refresh token.
-	// caam can neither perform nor needs to perform that refresh, so an
-	// approaching or just-passed access-token expiry is normal lifecycle and
-	// must not downgrade the profile or produce advice the operator cannot act
-	// on (issue #22). Filled in at report time by the caller, which knows the
-	// provider; never persisted.
+	// SelfRefreshing marks TokenExpiresAt as the expiry of an access token
+	// the provider's own CLI renews in place (Claude Code, when a refresh
+	// token is present). Set at report time alongside TokenExpiresAt and
+	// never persisted: the token's TTL is then informational only and must
+	// not lower the verdict, list a reason, or recommend a refresh caam
+	// cannot perform (PR #84).
 	SelfRefreshing bool `json:"-"`
 }
 

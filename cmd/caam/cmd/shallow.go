@@ -64,8 +64,8 @@ Layout under ~/orch-homes/<name>/ (claude shown):
 
 Spawn under a shallow identity with:
 
-  caam shallow-spawn <name>            # runs that profile's own provider CLI
-  caam shallow-spawn <name> -- <cmd>   # runs something else instead
+  caam shallow-spawn <name>            # runs the profile's own provider CLI
+  caam shallow-spawn <name> -- <cmd>   # runs any other command
 
 which sets HOME=~/orch-homes/<name> (plus CODEX_HOME/GEMINI_HOME for those
 providers) and execs the command. shallow-spawn also creates the profile if it
@@ -240,7 +240,8 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(cmd.OutOrStdout(), "  Credentials: %s\n", opts.CredentialFromLabel)
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "\nNext steps:\n")
-	fmt.Fprintf(cmd.OutOrStdout(), "  caam shallow-spawn %s        # opens %s under this profile\n", name, shallowSpawnHintBin(provider))
+	fmt.Fprintf(cmd.OutOrStdout(), "  caam shallow-spawn %s              # opens %s under this profile\n", name, shallowSpawnHintBin(provider))
+	fmt.Fprintf(cmd.OutOrStdout(), "  caam shallow-spawn %s -- <cmd>     # or any other command\n", name)
 	return nil
 }
 
@@ -545,26 +546,10 @@ var shallowSpawnCmd = &cobra.Command{
 command under it. Concurrent invocations under different names hit
 independent .credentials.json files and can run truly in parallel.
 
-  caam shallow-spawn alice
-
-is the short form: with no '-- <cmd>' section it runs the profile's OWN
-provider CLI (claude for a claude profile, codex for codex, agy for agy), so
-"open Claude as alice in this terminal" is one command. Pass '-- <cmd>' to run
-anything else instead; explicit commands behave exactly as before.
-
-Create on first use: an unknown <name> is provisioned as an EMPTY shallow
-profile (layout from --tool, default claude) and the session starts right
-away, so the first run of a new identity is a login prompt rather than an
-error. Credentials are never copied from the vault here — two profiles sharing
-one refresh-token family invalidate each other (issue #19). Use
-'caam shallow-profile create <name> --from-vault <tool>/<profile>' when a vault
-copy really is what you want.
-
-Double-spend guard (claude only): if the profile is already logged in as the
-SAME account that is active in your real HOME, the spawn is refused, because
-both sessions would draw down one subscription's quota. Pass --force to
-override. The check is skipped when either side has no oauthAccount recorded,
-and for codex/agy, which keep no comparable account identity on disk.
+With no '-- <cmd>' section the profile's own provider CLI is run (claude for
+a claude profile, codex for codex, agy for agy), so "open Claude as alice in
+this terminal" is just 'caam shallow-spawn alice'. Pass '-- <cmd> [args...]'
+to run anything else under the profile instead.
 
 Each spawn also backfills missing symlinks for user-installed skills
 (~/.claude/skills, ~/.codex/skills, ~/.gemini/skills) into the shallow
@@ -572,8 +557,7 @@ profile, so spawned sessions see the same skill library as direct ones.
 Auth/config files stay real and private; nothing is copied or overwritten.
 
 Examples:
-  caam shallow-spawn alice                     # open Claude as alice (creating alice if new)
-  caam shallow-spawn cx --tool codex           # first use: codex layout, then open codex
+  caam shallow-spawn alice                     # open claude as alice
   caam shallow-spawn alice -- claude --print "explain this codebase"
   caam shallow-spawn alice -- bash -c 'echo $HOME'
   caam shallow-spawn alice --force             # open it even if alice is the live account
@@ -689,24 +673,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Default command: with no `-- <cmd>` section, run the profile's own
-	// provider CLI. This is the whole point of the short form — `caam
-	// shallow-spawn alice` means "open Claude as alice, here, now".
+	// Short form: no '-- <cmd>' means "open this profile's own provider CLI".
 	if len(rest) == 0 {
 		rest = []string{shallowSpawnHintBin(provider)}
-	}
-
-	// Double-spend guard: refuse to open a claude profile that is already the
-	// live account, unless the user insists with --force.
-	force, _ := cmd.Flags().GetBool("force")
-	if !force {
-		if label, conflict := shallowSpawnDoubleSpend(provider, prof.Path); conflict {
-			who := name
-			if label != "" {
-				who = fmt.Sprintf("%s (%s)", name, label)
-			}
-			return fmt.Errorf("%q is the account already active in your real HOME (~/.claude.json); running it here too would spend the same quota twice. Run %q directly in this terminal, or pass --force", who, shallowSpawnHintBin(provider))
-		}
 	}
 
 	// Skill-share repair (#56): user-installed skills (e.g. ~/.codex/skills

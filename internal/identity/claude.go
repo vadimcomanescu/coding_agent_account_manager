@@ -9,19 +9,19 @@ import (
 	"time"
 )
 
-// claudeSettingsFile is the Claude Code settings file that carries the account
-// identity block.
+// claudeSettingsFile is the Claude Code state file that carries the account
+// identity block (oauthAccount) next to the credentials.
 const claudeSettingsFile = ".claude.json"
 
 // ExtractFromClaudeCredentials reads Claude .credentials.json and extracts identity.
 //
-// Current Claude auth files (as of early 2026) carry only expiresAt and
-// subscriptionType in claudeAiOauth: accountId and email are no longer written
-// there. The account identity lives in the .claude.json that accompanies the
-// credentials, under oauthAccount (accountUuid / emailAddress /
-// organizationName), so that file supplies whatever the credentials omit.
-// Whatever the credentials still carry wins, and a missing or unparseable
-// .claude.json simply leaves the identity fields empty.
+// Current Claude auth files (early 2026 onward) carry only expiresAt and
+// subscriptionType in claudeAiOauth; accountId and email are no longer written
+// there. Claude Code records the account identity in the .claude.json that
+// accompanies the credentials instead, under "oauthAccount" (emailAddress,
+// accountUuid, organizationName). Whatever claudeAiOauth still provides wins;
+// the .claude.json fills in only the fields it left empty, and a missing or
+// unreadable .claude.json simply leaves them empty.
 //
 // See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-001)
 func ExtractFromClaudeCredentials(path string) (*Identity, error) {
@@ -49,27 +49,46 @@ func ExtractFromClaudeCredentials(path string) (*Identity, error) {
 		}
 	}
 
-	applyClaudeSettingsIdentity(identity, path)
+	fillFromClaudeSettings(identity, claudeSettingsCandidates(path))
 
 	return identity, nil
 }
 
-// claudeOAuthAccount is the identity block of a .claude.json. The file also
-// carries per-project session history and runs to hundreds of kilobytes, so
-// it is decoded into this struct rather than a generic map: the decoder then
-// walks the rest of the document without allocating it.
+// claudeOAuthAccount is the identity block Claude Code writes into
+// .claude.json. The file also holds per-project session state and grows to
+// hundreds of kilobytes, so it is decoded into this narrow struct rather than
+// a generic map.
 type claudeOAuthAccount struct {
 	AccountUUID      string `json:"accountUuid"`
 	EmailAddress     string `json:"emailAddress"`
 	OrganizationName string `json:"organizationName"`
 }
 
-// applyClaudeSettingsIdentity fills the identity fields absent from
-// .credentials.json out of the oauthAccount block of the .claude.json that
-// accompanies it. Fields already read from the credentials are left alone.
-func applyClaudeSettingsIdentity(identity *Identity, credentialsPath string) {
-	for _, settingsPath := range claudeSettingsCandidates(credentialsPath) {
-		account, ok := readClaudeOAuthAccount(settingsPath)
+type claudeSettingsIdentity struct {
+	OAuthAccount *claudeOAuthAccount `json:"oauthAccount"`
+}
+
+// claudeSettingsCandidates lists where the .claude.json paired with a
+// credentials file lives: beside it (vault profile snapshots, and
+// CLAUDE_CONFIG_DIR layouts, keep the two side by side), and, when the
+// credentials sit in a ".claude" directory, in that directory's parent
+// (the live ~/.claude/.credentials.json pairs with ~/.claude.json, as does a
+// shallow profile's <home>/.claude/.credentials.json).
+func claudeSettingsCandidates(credentialsPath string) []string {
+	dir := filepath.Dir(credentialsPath)
+	candidates := []string{filepath.Join(dir, claudeSettingsFile)}
+	if filepath.Base(dir) == ".claude" {
+		candidates = append(candidates, filepath.Join(filepath.Dir(dir), claudeSettingsFile))
+	}
+	return candidates
+}
+
+// fillFromClaudeSettings copies the identity fields that are still empty out
+// of the first candidate .claude.json that parses and carries an
+// oauthAccount block.
+func fillFromClaudeSettings(identity *Identity, candidates []string) {
+	for _, path := range candidates {
+		account, ok := readClaudeOAuthAccount(path)
 		if !ok {
 			continue
 		}
@@ -86,39 +105,19 @@ func applyClaudeSettingsIdentity(identity *Identity, credentialsPath string) {
 	}
 }
 
-// claudeSettingsCandidates lists the .claude.json locations that pair with a
-// .credentials.json at credentialsPath, most authoritative first: the parent
-// directory (a live or shallow HOME keeps ~/.claude/.credentials.json next to
-// ~/.claude.json), then the same directory (vault profile snapshots and
-// CLAUDE_CONFIG_DIR layouts keep the two side by side). Parent goes first
-// because a stray ~/.claude/.claude.json left behind by another tool is
-// mirrored into every shallow profile's .claude/ by the symlink farm, and
-// would otherwise win over the profile's real identity file.
-func claudeSettingsCandidates(credentialsPath string) []string {
-	dir := filepath.Dir(credentialsPath)
-	return []string{
-		filepath.Join(filepath.Dir(dir), claudeSettingsFile),
-		filepath.Join(dir, claudeSettingsFile),
-	}
-}
-
-// readClaudeOAuthAccount parses the oauthAccount block out of a .claude.json.
-// The bool reports whether the file yielded any identity at all: unreadable,
-// unparseable, oauthAccount-less, and legacy bare-string oauthAccount files
-// all report false so the next candidate path gets a turn.
-func readClaudeOAuthAccount(path string) (claudeOAuthAccount, bool) {
-	var root struct {
-		OAuthAccount claudeOAuthAccount `json:"oauthAccount"`
-	}
-
+// readClaudeOAuthAccount returns the oauthAccount block of the .claude.json
+// at path. ok is false when the file is missing, unparseable, or has no
+// oauthAccount.
+func readClaudeOAuthAccount(path string) (*claudeOAuthAccount, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return claudeOAuthAccount{}, false
+		return nil, false
 	}
-	if err := json.Unmarshal(data, &root); err != nil {
-		return claudeOAuthAccount{}, false
+	var settings claudeSettingsIdentity
+	if err := json.Unmarshal(data, &settings); err != nil || settings.OAuthAccount == nil {
+		return nil, false
 	}
-	return root.OAuthAccount, root.OAuthAccount != claudeOAuthAccount{}
+	return settings.OAuthAccount, true
 }
 
 func parseEpoch(value interface{}) (time.Time, bool) {

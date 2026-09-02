@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-// TestMain runs this package's tests under an isolated HOME. See RunIsolated.
+// TestMain runs this package's tests under an isolated HOME. See IsolatedMain.
 func TestMain(m *testing.M) {
-	os.Exit(RunIsolated(m))
+	os.Exit(IsolatedMain(m))
 }

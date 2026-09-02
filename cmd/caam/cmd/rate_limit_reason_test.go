@@ -79,9 +79,9 @@ func TestApplyLiveExpiryOverridesStaleSnapshot(t *testing.T) {
 	}
 }
 
-// TestApplyLiveExpiryMarksClaudeSelfRefreshing covers issue #22: a Claude
+// TestApplyLiveExpiryMarksClaudeSelfRefreshing covers PR #84: a Claude
 // credential carrying a refresh token is renewed in place by Claude Code, so
-// the health snapshot must record that its access-token TTL is not a fault.
+// its access-token TTL must not lower the verdict or recommend a refresh.
 func TestApplyLiveExpiryMarksClaudeSelfRefreshing(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
@@ -92,7 +92,7 @@ func TestApplyLiveExpiryMarksClaudeSelfRefreshing(t *testing.T) {
 	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	// An access token in the last minutes of its ~8h life, refreshable.
+	// Last minutes of an ~8h access token, refreshable by Claude Code.
 	creds := fmt.Sprintf(
 		`{"claudeAiOauth":{"accessToken":"tok","refreshToken":"ref","expiresAt":%d,"subscriptionType":"max"}}`,
 		time.Now().Add(10*time.Minute).UnixMilli(),
@@ -112,5 +112,19 @@ func TestApplyLiveExpiryMarksClaudeSelfRefreshing(t *testing.T) {
 	}
 	if rec := health.FormatRecommendation("claude", "main", ph); rec != "" {
 		t.Errorf("FormatRecommendation() = %q, want empty (caam cannot refresh Claude)", rec)
+	}
+
+	// The same credential without a refresh token is treated as before.
+	creds = fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"tok","expiresAt":%d}}`, time.Now().Add(10*time.Minute).UnixMilli())
+	if err := os.WriteFile(filepath.Join(claudeDir, ".credentials.json"), []byte(creds), 0o600); err != nil {
+		t.Fatalf("write creds: %v", err)
+	}
+	ph = &health.ProfileHealth{}
+	applyLiveExpiry("claude", ph)
+	if ph.SelfRefreshing {
+		t.Error("SelfRefreshing = true without a refresh token, want false")
+	}
+	if status := health.CalculateStatus(ph); status == health.StatusHealthy {
+		t.Errorf("status = %v, want a downgraded verdict for a non-refreshable token expiring in 10m", status)
 	}
 }

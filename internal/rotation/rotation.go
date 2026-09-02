@@ -528,7 +528,7 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 				if bonus := planBonus(h.PlanType); bonus > 0 {
 					score.Score += bonus
 					score.Reasons = append(score.Reasons, Reason{
-						Text:     fmt.Sprintf("%s plan", health.FormatPlanType(h.PlanType)),
+						Text:     health.FormatPlanType(h.PlanType) + " plan",
 						Positive: true,
 					})
 				}
@@ -641,8 +641,8 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 }
 
 // planBonus converts a subscription plan into rotation score points. The
-// ranking itself lives in health.PlanTierOf so that this scorer and the health
-// scorer cannot drift apart; only the point values are local.
+// ranking lives in health.PlanTierOf so this scorer and the health scorer
+// cannot drift apart; only the point values are local.
 func planBonus(planType string) float64 {
 	switch health.PlanTierOf(planType) {
 	case health.PlanTierEnterprise:

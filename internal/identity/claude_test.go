@@ -172,182 +172,190 @@ func TestExtractFromClaudeCredentials_OpaqueToken(t *testing.T) {
 	}
 }
 
-// Claude Code stopped writing email/accountId into .credentials.json and now
-// keeps the account identity in .claude.json under oauthAccount. The vault
-// snapshots both files side by side, so extraction must fall back to it.
-
-func TestExtractFromClaudeCredentials_EmailFromSettings(t *testing.T) {
-	dir := t.TempDir()
-	exp := time.Now().Add(4 * time.Hour).UTC()
-	writeJSON(t, filepath.Join(dir, ".credentials.json"), map[string]interface{}{
-		"claudeAiOauth": map[string]interface{}{
-			"accessToken":      "sk-ant-oat01-opaque",
-			"expiresAt":        exp.UnixMilli(),
-			"subscriptionType": "max",
-		},
-	})
-	writeJSON(t, filepath.Join(dir, ".claude.json"), map[string]interface{}{
-		"userID": "per-installation-id-not-an-identity",
-		"oauthAccount": map[string]interface{}{
-			"accountUuid":      "0552aaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-			"emailAddress":     "vault@example.com",
-			"organizationName": "example-org",
-			"displayName":      "Example User",
-		},
-	})
-
-	identity, err := ExtractFromClaudeCredentials(filepath.Join(dir, ".credentials.json"))
+// writeClaudeSettings writes a .claude.json with the given oauthAccount block
+// (plus filler keys, since the real file is mostly unrelated state) into dir.
+func writeClaudeSettings(t *testing.T, dir string, account map[string]interface{}) {
+	t.Helper()
+	content := map[string]interface{}{
+		"numStartups":            42,
+		"hasCompletedOnboarding": true,
+		"projects":               map[string]interface{}{"/tmp/repo": map[string]interface{}{"allowedTools": []string{}}},
+	}
+	if account != nil {
+		content["oauthAccount"] = account
+	}
+	data, err := json.Marshal(content)
 	if err != nil {
-		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+		t.Fatalf("marshal .claude.json: %v", err)
 	}
-	if identity.Email != "vault@example.com" {
-		t.Errorf("Email = %q, want %q", identity.Email, "vault@example.com")
-	}
-	if identity.AccountID != "0552aaaa-bbbb-cccc-dddd-eeeeeeeeeeee" {
-		t.Errorf("AccountID = %q, want the oauthAccount accountUuid", identity.AccountID)
-	}
-	if identity.Organization != "example-org" {
-		t.Errorf("Organization = %q, want %q", identity.Organization, "example-org")
-	}
-	// .credentials.json stays the source for plan and expiry.
-	if identity.PlanType != "max" {
-		t.Errorf("PlanType = %q, want %q", identity.PlanType, "max")
-	}
-	if identity.ExpiresAt.Unix() != exp.Unix() {
-		t.Errorf("ExpiresAt = %v, want unix %d", identity.ExpiresAt, exp.Unix())
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), data, 0600); err != nil {
+		t.Fatalf("write .claude.json: %v", err)
 	}
 }
 
-// The live layout puts .credentials.json in ~/.claude/ and .claude.json one
-// level up in the home directory.
-func TestExtractFromClaudeCredentials_SettingsInParentDir(t *testing.T) {
+// TestExtractFromClaudeCredentials_IdentityFromClaudeJSON covers PR #85: the
+// current credentials carry no email, but the .claude.json beside them (a
+// vault snapshot) holds the account identity under oauthAccount.
+func TestExtractFromClaudeCredentials_IdentityFromClaudeJSON(t *testing.T) {
+	dir := t.TempDir()
+	cred := map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			"accessToken":      "sk-ant-oat01-opaque",
+			"subscriptionType": "max",
+			"expiresAt":        time.Now().Add(4 * time.Hour).UnixMilli(),
+		},
+	}
+	data, _ := json.Marshal(cred)
+	credPath := filepath.Join(dir, ".credentials.json")
+	if err := os.WriteFile(credPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSettings(t, dir, map[string]interface{}{
+		"accountUuid":      "uuid-1234",
+		"emailAddress":     "vault@example.com",
+		"organizationName": "vault-org",
+	})
+
+	id, err := ExtractFromClaudeCredentials(credPath)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+	if id.Email != "vault@example.com" {
+		t.Errorf("Email = %q, want %q", id.Email, "vault@example.com")
+	}
+	if id.AccountID != "uuid-1234" {
+		t.Errorf("AccountID = %q, want %q", id.AccountID, "uuid-1234")
+	}
+	if id.Organization != "vault-org" {
+		t.Errorf("Organization = %q, want %q", id.Organization, "vault-org")
+	}
+	if id.PlanType != "max" {
+		t.Errorf("PlanType = %q, want %q (credentials stay authoritative)", id.PlanType, "max")
+	}
+	if id.ExpiresAt.IsZero() {
+		t.Error("ExpiresAt should come from the credentials")
+	}
+}
+
+// The live layout keeps the credentials in ~/.claude/ and the identity in
+// ~/.claude.json, one directory up.
+func TestExtractFromClaudeCredentials_IdentityFromParentClaudeJSON(t *testing.T) {
 	home := t.TempDir()
 	claudeDir := filepath.Join(home, ".claude")
 	if err := os.MkdirAll(claudeDir, 0700); err != nil {
-		t.Fatalf("mkdir .claude: %v", err)
+		t.Fatal(err)
 	}
-	writeJSON(t, filepath.Join(claudeDir, ".credentials.json"), map[string]interface{}{
-		"claudeAiOauth": map[string]interface{}{"subscriptionType": "max"},
-	})
-	writeJSON(t, filepath.Join(home, ".claude.json"), map[string]interface{}{
-		"oauthAccount": map[string]interface{}{"emailAddress": "live@example.com"},
+	credPath := filepath.Join(claudeDir, ".credentials.json")
+	if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{"subscriptionType":"pro"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSettings(t, home, map[string]interface{}{
+		"accountUuid":  "uuid-live",
+		"emailAddress": "live@example.com",
 	})
 
-	identity, err := ExtractFromClaudeCredentials(filepath.Join(claudeDir, ".credentials.json"))
+	id, err := ExtractFromClaudeCredentials(credPath)
 	if err != nil {
 		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
 	}
-	if identity.Email != "live@example.com" {
-		t.Errorf("Email = %q, want %q", identity.Email, "live@example.com")
+	if id.Email != "live@example.com" || id.AccountID != "uuid-live" {
+		t.Errorf("identity = %+v, want live@example.com / uuid-live", id)
+	}
+
+	// A .claude.json beside the credentials outranks the parent's.
+	writeClaudeSettings(t, claudeDir, map[string]interface{}{"emailAddress": "beside@example.com"})
+	id, err = ExtractFromClaudeCredentials(credPath)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+	if id.Email != "beside@example.com" {
+		t.Errorf("Email = %q, want the sibling file's %q", id.Email, "beside@example.com")
 	}
 }
 
-// A legacy .credentials.json that still carries its own email keeps it.
-func TestExtractFromClaudeCredentials_CredentialsEmailWins(t *testing.T) {
+// The parent directory is only consulted for a ".claude" credentials dir:
+// a stray .claude.json one level above an arbitrary directory is not paired.
+func TestExtractFromClaudeCredentials_ParentOnlyForDotClaudeDir(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "profile")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	credPath := filepath.Join(dir, ".credentials.json")
+	if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSettings(t, root, map[string]interface{}{"emailAddress": "stray@example.com"})
+
+	id, err := ExtractFromClaudeCredentials(credPath)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
+	}
+	if id.Email != "" {
+		t.Errorf("Email = %q, want empty (unrelated parent .claude.json must not be used)", id.Email)
+	}
+}
+
+// Legacy credentials that still carry email/accountId keep them.
+func TestExtractFromClaudeCredentials_CredentialsFieldsWin(t *testing.T) {
 	dir := t.TempDir()
-	writeJSON(t, filepath.Join(dir, ".credentials.json"), map[string]interface{}{
-		"claudeAiOauth": map[string]interface{}{
-			"email":     "credentials@example.com",
-			"accountId": "acc-from-credentials",
-		},
-	})
-	writeJSON(t, filepath.Join(dir, ".claude.json"), map[string]interface{}{
-		"oauthAccount": map[string]interface{}{
-			"emailAddress": "settings@example.com",
-			"accountUuid":  "uuid-from-settings",
-		},
+	credPath := filepath.Join(dir, ".credentials.json")
+	if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{"email":"legacy@example.com","accountId":"acc-legacy"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeSettings(t, dir, map[string]interface{}{
+		"accountUuid":      "uuid-settings",
+		"emailAddress":     "settings@example.com",
+		"organizationName": "settings-org",
 	})
 
-	identity, err := ExtractFromClaudeCredentials(filepath.Join(dir, ".credentials.json"))
+	id, err := ExtractFromClaudeCredentials(credPath)
 	if err != nil {
 		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
 	}
-	if identity.Email != "credentials@example.com" {
-		t.Errorf("Email = %q, want %q", identity.Email, "credentials@example.com")
+	if id.Email != "legacy@example.com" || id.AccountID != "acc-legacy" {
+		t.Errorf("identity = %+v, want the credentials' own email/accountId", id)
 	}
-	if identity.AccountID != "acc-from-credentials" {
-		t.Errorf("AccountID = %q, want %q", identity.AccountID, "acc-from-credentials")
-	}
-}
-
-// A .credentials.json without a claudeAiOauth object still picks up identity
-// from its .claude.json.
-func TestExtractFromClaudeCredentials_SettingsWithoutOauthObject(t *testing.T) {
-	dir := t.TempDir()
-	writeJSON(t, filepath.Join(dir, ".credentials.json"), map[string]interface{}{"unrelated": "value"})
-	writeJSON(t, filepath.Join(dir, ".claude.json"), map[string]interface{}{
-		"oauthAccount": map[string]interface{}{"emailAddress": "orphan@example.com"},
-	})
-
-	identity, err := ExtractFromClaudeCredentials(filepath.Join(dir, ".credentials.json"))
-	if err != nil {
-		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
-	}
-	if identity.Email != "orphan@example.com" {
-		t.Errorf("Email = %q, want %q", identity.Email, "orphan@example.com")
+	if id.Organization != "settings-org" {
+		t.Errorf("Organization = %q, want %q (filled from .claude.json since credentials have none)", id.Organization, "settings-org")
 	}
 }
 
-func TestExtractFromClaudeCredentials_SettingsUnusable(t *testing.T) {
-	cases := []struct {
-		name     string
-		settings string
-	}{
-		{name: "malformed json", settings: "{not json"},
-		{name: "no oauthAccount", settings: `{"userID":"abc","projects":{}}`},
-		{name: "legacy string oauthAccount", settings: `{"oauthAccount":"bare-account-string"}`},
-		{name: "empty email", settings: `{"oauthAccount":{"emailAddress":""}}`},
+// Missing, malformed, or oauthAccount-less .claude.json leaves the identity
+// fields empty rather than failing the whole extraction.
+func TestExtractFromClaudeCredentials_ClaudeJSONFallbacks(t *testing.T) {
+	cases := map[string]func(t *testing.T, dir string){
+		"missing": func(t *testing.T, dir string) {},
+		"malformed": func(t *testing.T, dir string) {
+			_ = os.WriteFile(filepath.Join(dir, ".claude.json"), []byte("{oops"), 0600)
+		},
+		"no account": func(t *testing.T, dir string) {
+			writeClaudeSettings(t, dir, nil)
+		},
+		"null account": func(t *testing.T, dir string) {
+			_ = os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"oauthAccount":null}`), 0600)
+		},
 	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			writeJSON(t, filepath.Join(dir, ".credentials.json"), map[string]interface{}{
-				"claudeAiOauth": map[string]interface{}{"subscriptionType": "max"},
-			})
-			if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(tc.settings), 0600); err != nil {
-				t.Fatalf("write .claude.json: %v", err)
+			credPath := filepath.Join(dir, ".credentials.json")
+			if err := os.WriteFile(credPath, []byte(`{"claudeAiOauth":{"subscriptionType":"max"}}`), 0600); err != nil {
+				t.Fatal(err)
 			}
+			setup(t, dir)
 
-			identity, err := ExtractFromClaudeCredentials(filepath.Join(dir, ".credentials.json"))
+			id, err := ExtractFromClaudeCredentials(credPath)
 			if err != nil {
 				t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
 			}
-			if identity.Email != "" || identity.AccountID != "" {
-				t.Errorf("Expected empty identity, got email=%q accountId=%q", identity.Email, identity.AccountID)
+			if id.Email != "" || id.AccountID != "" || id.Organization != "" {
+				t.Errorf("identity = %+v, want empty identity fields", id)
 			}
-			if identity.PlanType != "max" {
-				t.Errorf("PlanType = %q, want %q", identity.PlanType, "max")
+			if id.PlanType != "max" {
+				t.Errorf("PlanType = %q, want %q", id.PlanType, "max")
 			}
 		})
-	}
-}
-
-// No .claude.json at all: the credentials are read as before.
-func TestExtractFromClaudeCredentials_SettingsAbsent(t *testing.T) {
-	dir := t.TempDir()
-	writeJSON(t, filepath.Join(dir, ".credentials.json"), map[string]interface{}{
-		"claudeAiOauth": map[string]interface{}{"subscriptionType": "max"},
-	})
-
-	identity, err := ExtractFromClaudeCredentials(filepath.Join(dir, ".credentials.json"))
-	if err != nil {
-		t.Fatalf("ExtractFromClaudeCredentials error: %v", err)
-	}
-	if identity.Email != "" || identity.AccountID != "" {
-		t.Errorf("Expected empty identity, got email=%q accountId=%q", identity.Email, identity.AccountID)
-	}
-}
-
-func writeJSON(t *testing.T, path string, content map[string]interface{}) {
-	t.Helper()
-
-	data, err := json.Marshal(content)
-	if err != nil {
-		t.Fatalf("marshal %s: %v", path, err)
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatalf("write %s: %v", path, err)
 	}
 }
 

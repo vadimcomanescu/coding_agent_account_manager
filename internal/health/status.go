@@ -47,31 +47,28 @@ func (s HealthStatus) Icon() string {
 	}
 }
 
-// PlanTier ranks a subscription plan by the usage headroom it buys. Health
-// scoring and rotation scoring both rank plans, so the ordering lives here once
-// instead of in a switch per package: adding a plan means editing PlanTierOf
-// and nothing else.
+// PlanTier ranks subscription plans by the usage headroom they buy. Health
+// scoring and rotation scoring both reward better plans; they rank through
+// this one function so the two can never disagree about what "better" means,
+// and so the stored plan can keep the provider's real spelling ("max")
+// instead of being collapsed to a spelling the scorers happen to know.
 type PlanTier int
 
 const (
-	// PlanTierUnrated covers free plans, blank values, and provider-specific
-	// strings we do not recognize (for example "claude_pro_2025"). These earn
-	// no scoring bonus.
+	// PlanTierUnrated is a free plan, a blank value, or a spelling caam does
+	// not recognize (e.g. "claude_pro_2025"). It earns no bonus.
 	PlanTierUnrated PlanTier = iota
-	// PlanTierStandard covers entry paid seats: pro, plus, team.
+	// PlanTierStandard is an entry paid seat: pro, plus, team.
 	PlanTierStandard
-	// PlanTierHighVolume covers premium individual seats with substantially
-	// larger quotas: Claude Max, Gemini Ultra, and similar.
+	// PlanTierHighVolume is a premium individual seat with a substantially
+	// larger quota: Claude Max, Gemini Ultra, and similar.
 	PlanTierHighVolume
-	// PlanTierEnterprise covers negotiated enterprise contracts, which have
-	// the most headroom and are the safest to route work to.
+	// PlanTierEnterprise is a negotiated enterprise contract.
 	PlanTierEnterprise
 )
 
-// PlanTierOf maps a plan string (as stored by normalizePlanType: lowercase and
-// trimmed) to its tier. Unknown values are deliberately unrated rather than
-// guessed at, so a new provider spelling degrades to "no bonus" instead of a
-// wrong one.
+// PlanTierOf maps a plan string, in any case and with surrounding whitespace,
+// to its tier. Unknown values are unrated rather than guessed at.
 func PlanTierOf(planType string) PlanTier {
 	switch strings.ToLower(strings.TrimSpace(planType)) {
 	case "enterprise":
@@ -122,8 +119,8 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 
 	// Factor 1: Token expiry (primary)
 	if h.SelfRefreshing {
-		// The provider's own CLI renews this access token in place, so its
-		// TTL says nothing about the account (issue #22).
+		// The provider's CLI renews this token on next use; its TTL says
+		// nothing about whether the account works (PR #84).
 		score += 1.0
 	} else if h.TokenExpiresAt.IsZero() {
 		// Unknown expiry - neutral
@@ -151,8 +148,8 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		score -= 0.5
 	}
 
-	// Factor 3: Plan type bonus, ranked by PlanTierOf so this agrees with the
-	// rotation scorer.
+	// Factor 3: Plan type bonus, ranked through PlanTierOf so it agrees with
+	// the rotation scorer.
 	switch PlanTierOf(h.PlanType) {
 	case PlanTierEnterprise:
 		score += 0.3
@@ -175,9 +172,9 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		status = StatusWarning
 	}
 
-	// Override if token is strictly expired or critical errors met.
-	// A self-refreshing credential is exempt: its access-token TTL is renewed
-	// by the provider's CLI, not by anything the operator does.
+	// Override if token is strictly expired or critical errors met. A
+	// self-refreshing credential is exempt: its TTL is renewed by the
+	// provider's CLI, not by anything the operator does.
 	if !h.TokenExpiresAt.IsZero() && !h.SelfRefreshing {
 		if h.TokenExpiresAt.Before(now) {
 			if h.RateLimited(now) {

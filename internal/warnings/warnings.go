@@ -164,12 +164,11 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 		return warnings
 	}
 
-	// Claude Code renews its own access token in place from the refresh token
-	// stored beside it, and caam's Claude refresh is disabled, so the ~8h
-	// access-token TTL is routine and "caam refresh claude <profile>" cannot
-	// succeed. Warning here fires on every command and recommends an action
-	// that always fails (issue #22).
-	if refresh.SelfRefreshing(tool) && expInfo.HasRefreshToken {
+	// A self-refreshing credential (Claude Code with a refresh token) renews
+	// its short-lived access token by itself, and the "caam refresh" this
+	// would recommend is unsupported for it. Warning on every invocation
+	// about a TTL that is routine lifecycle is noise (PR #84).
+	if expInfo.SelfRefreshing {
 		return warnings
 	}
 

@@ -8,7 +8,7 @@ import (
 )
 
 // TestMain runs this package's tests under an isolated HOME so nothing they
-// exercise can reach the developer's real auth files. See testutil.RunIsolated.
+// exercise can reach the developer's real auth files. See testutil.IsolatedMain.
 func TestMain(m *testing.M) {
-	os.Exit(testutil.RunIsolated(m))
+	os.Exit(testutil.IsolatedMain(m))
 }

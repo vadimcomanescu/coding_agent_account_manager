@@ -318,20 +318,21 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 	// staying zero, which capped the verdict at 🟡 Warning forever (issue
 	// #60).
 	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
-		cred = liveExp
-	}
-
-	if cred != nil && !cred.ExpiresAt.IsZero() {
-		ph.TokenExpiresAt = cred.ExpiresAt
-	}
-	// Claude Code renews its own access token from the refresh token stored
-	// beside it, and caam's Claude refresh is disabled, so the short TTL is
-	// routine lifecycle rather than a fault to report (issue #22).
-	if cred != nil && cred.HasRefreshToken && refresh.SelfRefreshing(tool) {
-		ph.SelfRefreshing = true
+		applyExpiryInfo(ph, liveExp)
+	} else if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
+		// Fallback: the vault snapshot is the best information we have.
+		applyExpiryInfo(ph, expInfo)
 	}
 
 	return ph
+}
+
+// applyExpiryInfo records a parsed credential's expiry on the health
+// snapshot, together with whether that credential is self-refreshing (so
+// the TTL is informational rather than a fault, PR #84).
+func applyExpiryInfo(ph *health.ProfileHealth, info *health.ExpiryInfo) {
+	ph.TokenExpiresAt = info.ExpiresAt
+	ph.SelfRefreshing = info.SelfRefreshing
 }
 
 // liveAuthExpiry parses token expiry from the tool's live (in-use) auth
@@ -371,12 +372,8 @@ func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
 	if ph == nil {
 		return
 	}
-	info := liveAuthExpiry(tool)
-	if info == nil {
-		return
-	}
-	if !info.ExpiresAt.IsZero() {
-		ph.TokenExpiresAt = info.ExpiresAt
+	if info := liveAuthExpiry(tool); info != nil && !info.ExpiresAt.IsZero() {
+		applyExpiryInfo(ph, info)
 	}
 	if info.HasRefreshToken && refresh.SelfRefreshing(tool) {
 		ph.SelfRefreshing = true
@@ -547,10 +544,10 @@ func primePlanTypes(tool string, profiles []string) {
 }
 
 // normalizePlanType canonicalizes the spelling of a provider-reported plan so
-// storage, display, and scoring all agree on one form. It deliberately does not
-// collapse tiers: a Claude Max account reports subscriptionType "max" and must
-// keep reading "max" in `caam status`, `caam ls`, and `--json` output. Scoring
-// ranks the tiers via health.PlanTierOf instead of requiring one spelling.
+// storage, display, and scoring agree on one form. It does not collapse
+// tiers: a Claude Max account reports subscriptionType "max" and keeps
+// reading "max" in `caam status`, `caam ls`, and --json output. Scoring
+// ranks plans through health.PlanTierOf rather than by spelling.
 func normalizePlanType(planType string) string {
 	return strings.ToLower(strings.TrimSpace(planType))
 }
@@ -562,10 +559,10 @@ func formatIdentityDisplay(id *identity.Identity) (string, string) {
 		return email, plan
 	}
 
-	// For Claude the email comes from the profile's .claude.json oauthAccount,
-	// since current auth files no longer carry it. A profile snapshotted
-	// without that file has no email to show: "n/a" instead of "unknown"
-	// marks that as expected, not an error.
+	// For Claude the email comes from the oauthAccount block of the profile's
+	// .claude.json (the credentials file no longer carries it). A profile
+	// snapshotted without that file has no email to show: "n/a" instead of
+	// "unknown" marks that as expected, not an error.
 	// See: docs/CLAUDE_AUTH_INVENTORY.md (CLAUDE-001, CLAUDE-002)
 	if id.Provider == "claude" && strings.TrimSpace(id.Email) == "" {
 		email = "n/a"
