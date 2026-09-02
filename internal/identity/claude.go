@@ -87,14 +87,18 @@ func applyClaudeSettingsIdentity(identity *Identity, credentialsPath string) {
 }
 
 // claudeSettingsCandidates lists the .claude.json locations that pair with a
-// .credentials.json at credentialsPath: the same directory (vault profile
-// snapshots and CLAUDE_CONFIG_DIR layouts keep the two side by side) and its
-// parent (the live ~/.claude/.credentials.json pairs with ~/.claude.json).
+// .credentials.json at credentialsPath, most authoritative first: the parent
+// directory (a live or shallow HOME keeps ~/.claude/.credentials.json next to
+// ~/.claude.json), then the same directory (vault profile snapshots and
+// CLAUDE_CONFIG_DIR layouts keep the two side by side). Parent goes first
+// because a stray ~/.claude/.claude.json left behind by another tool is
+// mirrored into every shallow profile's .claude/ by the symlink farm, and
+// would otherwise win over the profile's real identity file.
 func claudeSettingsCandidates(credentialsPath string) []string {
 	dir := filepath.Dir(credentialsPath)
 	return []string{
-		filepath.Join(dir, claudeSettingsFile),
 		filepath.Join(filepath.Dir(dir), claudeSettingsFile),
+		filepath.Join(dir, claudeSettingsFile),
 	}
 }
 

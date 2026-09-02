@@ -466,3 +466,33 @@ func TestFixture_ClaudeInvalid(t *testing.T) {
 		t.Error("expected error for invalid JSON fixture")
 	}
 }
+
+// TestExtractFromClaudeCredentials_ParentIdentityWinsOverStraySibling pins the
+// candidate order: a live or shallow HOME may carry a stale .claude.json INSIDE
+// its .claude directory (left by another tool and mirrored into shallow
+// profiles by the symlink farm); the HOME-level file is the account's identity.
+func TestExtractFromClaudeCredentials_ParentIdentityWinsOverStraySibling(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	creds := filepath.Join(dir, ".credentials.json")
+	if err := os.WriteFile(creds, []byte(`{"claudeAiOauth":{"accessToken":"t","subscriptionType":"max","expiresAt":9999999999999}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"oauthAccount":{"accountUuid":"stale","emailAddress":"stale@example.com"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"oauthAccount":{"accountUuid":"real","emailAddress":"real@example.com"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := ExtractFromClaudeCredentials(creds)
+	if err != nil {
+		t.Fatalf("ExtractFromClaudeCredentials: %v", err)
+	}
+	if id.Email != "real@example.com" || id.AccountID != "real" {
+		t.Fatalf("identity = %q / %q, want the HOME-level .claude.json (real@example.com / real)", id.Email, id.AccountID)
+	}
+}
