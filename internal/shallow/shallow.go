@@ -660,6 +660,80 @@ func stripClaudeIdentity(data []byte) ([]byte, error) {
 	return append(out, '\n'), nil
 }
 
+// SyncClaudeConfig refreshes a claude shallow profile's .claude.json from the
+// real HOME's, so configuration made in the main lane (theme, editor mode,
+// notification channel, global MCP servers, per-project trust and tool
+// approvals) reaches every shallow session on its next spawn. The real HOME
+// is the source of truth for everything except what makes the profile its
+// own identity: oauthAccount, userID and cachedUsageUtilization stay as the
+// profile has them. Per-project state is merged: the real HOME's entry wins
+// for a project both sides know, a project only the shallow session has seen
+// is kept. A profile with no .claude.json yet is seeded the same way.
+func (m *Manager) SyncClaudeConfig(name string) error {
+	prof, err := m.Get(name)
+	if err != nil {
+		return err
+	}
+	realData, err := os.ReadFile(filepath.Join(m.realHome, ".claude.json"))
+	if err != nil {
+		return nil // nothing to inherit from
+	}
+	var real map[string]json.RawMessage
+	if err := json.Unmarshal(realData, &real); err != nil {
+		return fmt.Errorf("parse real .claude.json: %w", err)
+	}
+	shallowPath := filepath.Join(prof.Path, ".claude.json")
+	own := map[string]json.RawMessage{}
+	if data, err := os.ReadFile(shallowPath); err == nil {
+		if err := json.Unmarshal(data, &own); err != nil {
+			return fmt.Errorf("parse shallow .claude.json: %w", err)
+		}
+	}
+	merged := make(map[string]json.RawMessage, len(real)+len(claudeIdentityKeys))
+	for k, v := range real {
+		merged[k] = v
+	}
+	for _, k := range claudeIdentityKeys {
+		if v, ok := own[k]; ok {
+			merged[k] = v
+		} else {
+			delete(merged, k)
+		}
+	}
+	if projects, err := mergeClaudeProjects(own["projects"], real["projects"]); err == nil && projects != nil {
+		merged["projects"] = projects
+	}
+	out, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(shallowPath, append(out, '\n'), 0o600)
+}
+
+// mergeClaudeProjects overlays the real HOME's per-project entries onto the
+// shallow profile's. Either side may be absent.
+func mergeClaudeProjects(own, real json.RawMessage) (json.RawMessage, error) {
+	if own == nil && real == nil {
+		return nil, nil
+	}
+	merged := map[string]json.RawMessage{}
+	if own != nil {
+		if err := json.Unmarshal(own, &merged); err != nil {
+			return nil, err
+		}
+	}
+	if real != nil {
+		var r map[string]json.RawMessage
+		if err := json.Unmarshal(real, &r); err != nil {
+			return nil, err
+		}
+		for k, v := range r {
+			merged[k] = v
+		}
+	}
+	return json.Marshal(merged)
+}
+
 // ensureClaudeOnboarding merges the minimum non-secret readiness marker
 // ({"hasCompletedOnboarding": true}) into <home>/.claude.json when — and only
 // when — the profile was seeded from real credentials but its staged state

@@ -272,6 +272,8 @@ wait
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
 | **Grok Build** (xAI) | OAuth/OIDC: `~/.grok/auth.json` (+ `~/.grok/config.toml`); respects `GROK_HOME` | `grok login` (browser OIDC) |
 
+**Configuration follows the main lane.** On every `shallow-spawn`, the profile's `.claude.json` is refreshed from your real `~/.claude.json`: theme, editor mode, notifications, global MCP servers, and per-project trust and tool approvals come from the main lane, while the profile keeps its own login identity and usage cache. Change settings in a plain `claude` session and every shallow session picks them up on its next spawn. `~/.claude/settings.json` is shared directly through the symlink farm.
+
 ### Claude Code (Claude Max)
 
 **Subscription:** Claude Max ($200/month)

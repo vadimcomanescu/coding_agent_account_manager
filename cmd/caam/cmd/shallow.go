@@ -693,6 +693,16 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 			len(created), map[bool]string{true: "y", false: "ies"}[len(created) == 1], name)
 	}
 
+	// Configuration follows the main lane: refresh this profile's .claude.json
+	// from the real HOME (everything but the profile's own identity and usage
+	// cache) so a setting changed in a plain `claude` session applies here
+	// too. Best-effort: a sync failure is reported but never blocks the spawn.
+	if shallow.NormalizeProvider(provider) == "claude" {
+		if serr := mgr.SyncClaudeConfig(name); serr != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not sync Claude configuration into shallow profile %q: %v\n", name, serr)
+		}
+	}
+
 	// Codex daemon caveat (#21, #45): a long-lived `codex app-server`/`mcp-server`
 	// caches auth.json in memory, so a shallow codex session could be served by a
 	// daemon attached to a DIFFERENT identity. By default we only warn (to stderr)
