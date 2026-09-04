@@ -25,11 +25,17 @@ jobs:
         with:
           ref: integration
           fetch-depth: 0
+          # The mirror step pushes upstream/main, which carries
+          # .github/workflows/ci.yml, into main. The default GITHUB_TOKEN may
+          # not create or update workflow files, so that push is rejected
+          # unless SYNC_TOKEN holds a fine-grained token with the workflow
+          # scope (contents: write, workflows: write) on this repository.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.24.4"
+          go-version-file: go.mod
 
       - name: Configure git
         run: |
