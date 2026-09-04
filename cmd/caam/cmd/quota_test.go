@@ -47,10 +47,10 @@ func quotaTestRows(t *testing.T) []quotaRow {
 			Lanes:       []string{"active"},
 			AccountUUID: "0552fa96-40f9-4b38-a33a-0d5ac585167d",
 			FetchedAt:   &fetched,
-			Windows: []usage.CachedWindow{
-				{Kind: usage.CachedKindSession, Label: "5h", Percent: 53, ResetsAt: quotaTestTime(t, "2026-09-01T22:50:00Z")},
-				{Kind: usage.CachedKindWeeklyAll, Label: "weekly", Percent: 11, ResetsAt: quotaTestTime(t, "2026-09-04T06:00:00Z")},
-				{Kind: usage.CachedKindWeeklyScoped, Label: "Fable", Percent: 19, ResetsAt: quotaTestTime(t, "2026-09-04T06:00:00Z")},
+			Windows: []quotaWindow{
+				{Kind: usage.LimitKindSession, Label: "5h", Percent: 53, ResetsAt: quotaTestTime(t, "2026-09-01T22:50:00Z")},
+				{Kind: usage.LimitKindWeeklyAll, Label: "weekly", Percent: 11, ResetsAt: quotaTestTime(t, "2026-09-04T06:00:00Z")},
+				{Kind: usage.LimitKindWeeklyScoped, Label: "Fable", Percent: 19, ResetsAt: quotaTestTime(t, "2026-09-04T06:00:00Z")},
 			},
 		},
 		{
@@ -61,10 +61,10 @@ func quotaTestRows(t *testing.T) []quotaRow {
 			Lanes:       []string{"vault"},
 			AccountUUID: "9fc5c17d-a950-4bd0-b3c6-c1c9e7a9b452",
 			FetchedAt:   &stale,
-			Windows: []usage.CachedWindow{
-				{Kind: usage.CachedKindSession, Label: "5h", Percent: 0, Rolled: true, ResetsAt: quotaTestTime(t, "2026-09-01T10:00:00Z")},
-				{Kind: usage.CachedKindWeeklyAll, Label: "weekly", Percent: 88, ResetsAt: quotaTestTime(t, "2026-09-02T18:59:59Z")},
-				{Kind: usage.CachedKindWeeklyScoped, Label: "Fable", Percent: 96},
+			Windows: []quotaWindow{
+				{Kind: usage.LimitKindSession, Label: "5h", Percent: 0, Rolled: true, ResetsAt: quotaTestTime(t, "2026-09-01T10:00:00Z")},
+				{Kind: usage.LimitKindWeeklyAll, Label: "weekly", Percent: 88, ResetsAt: quotaTestTime(t, "2026-09-02T18:59:59Z")},
+				{Kind: usage.LimitKindWeeklyScoped, Label: "Fable", Percent: 96},
 			},
 		},
 		{
@@ -73,7 +73,7 @@ func quotaTestRows(t *testing.T) []quotaRow {
 			Plan:    "unknown",
 			Source:  quotaSourceShallow,
 			Lanes:   []string{"shallow"},
-			Windows: []usage.CachedWindow{},
+			Windows: []quotaWindow{},
 		},
 	}
 }
@@ -360,33 +360,33 @@ func TestMergeQuotaRowsFoldsLanesOfOneAccount(t *testing.T) {
 	old := quotaTestNow.Add(-3 * time.Hour)
 	fresh := quotaTestNow.Add(-2 * time.Minute)
 	rows := []quotaRow{
-		{Profile: "vadim", Source: quotaSourceSnapshot, AccountUUID: "u1", FetchedAt: &old,
-			Windows: []usage.CachedWindow{{Kind: usage.CachedKindWeeklyAll, Percent: 29}}},
-		{Profile: "adriana", Source: quotaSourceLive, Active: true, AccountUUID: "u2", FetchedAt: &fresh,
-			Windows: []usage.CachedWindow{{Kind: usage.CachedKindWeeklyAll, Percent: 11}}},
-		{Profile: "vadim", Source: quotaSourceShallow, AccountUUID: "u1", FetchedAt: &fresh,
-			Windows: []usage.CachedWindow{{Kind: usage.CachedKindWeeklyAll, Percent: 31}}},
-		{Profile: "sw-adriana", Source: quotaSourceShallow, AccountUUID: "u2", FetchedAt: &old,
-			Windows: []usage.CachedWindow{{Kind: usage.CachedKindWeeklyAll, Percent: 9}}},
-		{Profile: "blank", Source: quotaSourceSnapshot, Windows: []usage.CachedWindow{}},
+		{Profile: "work", Source: quotaSourceSnapshot, AccountUUID: "u1", FetchedAt: &old,
+			Windows: []quotaWindow{{Kind: usage.LimitKindWeeklyAll, Percent: 29}}},
+		{Profile: "home", Source: quotaSourceLive, Active: true, AccountUUID: "u2", FetchedAt: &fresh,
+			Windows: []quotaWindow{{Kind: usage.LimitKindWeeklyAll, Percent: 11}}},
+		{Profile: "work", Source: quotaSourceShallow, AccountUUID: "u1", FetchedAt: &fresh,
+			Windows: []quotaWindow{{Kind: usage.LimitKindWeeklyAll, Percent: 31}}},
+		{Profile: "sw-home", Source: quotaSourceShallow, AccountUUID: "u2", FetchedAt: &old,
+			Windows: []quotaWindow{{Kind: usage.LimitKindWeeklyAll, Percent: 9}}},
+		{Profile: "blank", Source: quotaSourceSnapshot, Windows: []quotaWindow{}},
 	}
 
 	merged := mergeQuotaRows(rows)
 	require.Len(t, merged, 3)
 
-	vadim := merged[0]
-	assert.Equal(t, "vadim", vadim.Profile)
-	assert.Equal(t, quotaSourceShallow, vadim.Source, "the fresher shallow numbers win")
-	assert.Equal(t, 31, vadim.Windows[0].Percent)
-	assert.Equal(t, []string{"vault", "shallow"}, vadim.Lanes)
-	assert.False(t, vadim.Active)
+	work := merged[0]
+	assert.Equal(t, "work", work.Profile)
+	assert.Equal(t, quotaSourceShallow, work.Source, "the fresher shallow numbers win")
+	assert.Equal(t, 31, work.Windows[0].Percent)
+	assert.Equal(t, []string{"vault", "shallow"}, work.Lanes)
+	assert.False(t, work.Active)
 
-	adriana := merged[1]
-	assert.Equal(t, "adriana", adriana.Profile, "the vault name names the row even when a shallow lane exists")
-	assert.Equal(t, quotaSourceLive, adriana.Source, "the live numbers are fresher than the shallow snapshot")
-	assert.Equal(t, 11, adriana.Windows[0].Percent)
-	assert.True(t, adriana.Active)
-	assert.Equal(t, []string{"active", "shallow(sw-adriana)"}, adriana.Lanes)
+	home := merged[1]
+	assert.Equal(t, "home", home.Profile, "the vault name names the row even when a shallow lane exists")
+	assert.Equal(t, quotaSourceLive, home.Source, "the live numbers are fresher than the shallow snapshot")
+	assert.Equal(t, 11, home.Windows[0].Percent)
+	assert.True(t, home.Active)
+	assert.Equal(t, []string{"active", "shallow(sw-home)"}, home.Lanes)
 
 	assert.Equal(t, "blank", merged[2].Profile)
 	assert.Equal(t, []string{"vault"}, merged[2].Lanes)

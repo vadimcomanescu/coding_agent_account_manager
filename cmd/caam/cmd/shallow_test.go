@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/spf13/cobra"
 )
 
@@ -118,8 +119,19 @@ func newShallowTestRoot() *cobra.Command {
 	spawn.Flags().Bool("reload-daemon", false, "")
 	spawn.Flags().Bool("allow-agent-view", false, "")
 	spawn.Flags().String("effort", "", "")
-	spawn.Flags().String("tool", "claude", "")
+	spawn.Flags().Bool("no-sync-config", false, "")
+	spawn.Flags().Bool("create", false, "")
+	spawn.Flags().String("tool", "", "")
 	spawn.Flags().Bool("force", false, "")
+
+	sync := &cobra.Command{
+		Use:  "sync-config [name]",
+		Args: shallowProfileSyncConfigCmd.Args,
+		RunE: shallowProfileSyncConfigCmd.RunE,
+	}
+	sync.Flags().Bool("all", false, "")
+	sync.Flags().Bool("json", false, "")
+	parent.AddCommand(sync)
 
 	root.AddCommand(parent)
 	root.AddCommand(spawn)
@@ -857,8 +869,300 @@ func TestShallowCreateVaultWithoutSnapshotMergesOnboarding(t *testing.T) {
 	}
 }
 
+// TestShallowSpawnSyncsClaudeConfig proves the end-to-end wiring of the
+// shared-configuration refresh (#93): before exec, a claude shallow profile's
+// private .claude.json picks up the allowlisted preference keys from the real
+// ~/.claude.json while keeping its own identity; --no-sync-config and
+// --print-env leave the profile untouched.
+func TestShallowSpawnSyncsClaudeConfig(t *testing.T) {
+	base, realHome := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	profilePath := filepath.Join(base, "alice", ".claude.json")
+	profileState := `{"oauthAccount":{"emailAddress":"alice@example.com"},"theme":"light"}`
+	if err := os.WriteFile(profilePath, []byte(profileState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	realState := `{"oauthAccount":{"emailAddress":"real@example.com"},"theme":"dark","editorMode":"vim"}`
+	if err := os.WriteFile(filepath.Join(realHome, ".claude.json"), []byte(realState), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origExec := spawnExec
+	spawnExec = func(_ string, _ []string, _ []string) error { return nil }
+	t.Cleanup(func() { spawnExec = origExec })
+
+	readProfile := func() string {
+		t.Helper()
+		raw, err := os.ReadFile(profilePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+
+	// --print-env and --no-sync-config are read-only for the profile file.
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--print-env"); err != nil {
+		t.Fatalf("print-env: %v", err)
+	}
+	if got := readProfile(); got != profileState {
+		t.Fatalf("--print-env mutated the profile: %s", got)
+	}
+	if _, stderr, err := runCmdCaptured(t, "shallow-spawn", "alice", "--no-sync-config", "--", "sh", "-c", "true"); err != nil {
+		t.Fatalf("spawn --no-sync-config: %v (stderr %q)", err, stderr)
+	}
+	if got := readProfile(); got != profileState {
+		t.Fatalf("--no-sync-config mutated the profile: %s", got)
+	}
+
+	_, stderr, err := runCmdCaptured(t, "shallow-spawn", "alice", "--", "sh", "-c", "true")
+	if err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+	if !strings.Contains(stderr, "refreshed 2 shared Claude settings") {
+		t.Fatalf("expected refresh note on stderr, got %q", stderr)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(readProfile()), &got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got["theme"]) != `"dark"` || string(got["editorMode"]) != `"vim"` {
+		t.Fatalf("preferences not refreshed: %s", readProfile())
+	}
+	if !strings.Contains(string(got["oauthAccount"]), "alice@example.com") {
+		t.Fatalf("profile identity clobbered by the real HOME's: %s", got["oauthAccount"])
+	}
+	realRaw, _ := os.ReadFile(filepath.Join(realHome, ".claude.json"))
+	if string(realRaw) != realState {
+		t.Fatal("real ~/.claude.json was modified by shallow-spawn")
+	}
+}
+
+// PR #89, part 2: create-on-first-use. Creating implicitly on a bare
+// `shallow-spawn <name>` would turn a typo into a fresh empty identity and a
+// login prompt for the wrong account, with the mistyped profile then lingering
+// on disk. Creation is therefore opt-in via --create, and the bare form's
+// error does the helpful part instead.
+func TestShallowSpawnCreateOnFirstUse(t *testing.T) {
+	base, _ := shallowEnv(t)
+
+	binDir := t.TempDir()
+	for _, name := range []string{"claude", "codex"} {
+		if err := os.WriteFile(filepath.Join(binDir, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var gotBin string
+	origExec := spawnExec
+	spawnExec = func(bin string, _ []string, _ []string) error { gotBin = bin; return nil }
+	t.Cleanup(func() { spawnExec = origExec })
+	origCheck := shallowCodexDaemonCheck
+	shallowCodexDaemonCheck = func(string, bool, string) codexDaemonWarning { return codexDaemonWarning{} }
+	t.Cleanup(func() { shallowCodexDaemonCheck = origCheck })
+
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("typo is an error naming the near miss", func(t *testing.T) {
+		_, _, err := runCmdCaptured(t, "shallow-spawn", "alise")
+		if err == nil {
+			t.Fatal("a name that does not exist must be an error without --create")
+		}
+		for _, want := range []string{`"alise"`, `did you mean "alice"`, "--create", "shallow-profile create"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error missing %q:\n%v", want, err)
+			}
+		}
+		if _, statErr := os.Stat(filepath.Join(base, "alise")); !os.IsNotExist(statErr) {
+			t.Error("the bare form created a profile for a typo")
+		}
+	})
+
+	t.Run("--create provisions an empty profile and spawns", func(t *testing.T) {
+		gotBin = ""
+		_, stderr, err := runCmdCaptured(t, "shallow-spawn", "bob", "--create")
+		if err != nil {
+			t.Fatalf("spawn --create: %v (stderr %q)", err, stderr)
+		}
+		if gotBin != filepath.Join(binDir, "claude") {
+			t.Errorf("spawned %q, want the claude stub", gotBin)
+		}
+		// The notice must say the credentials are empty and why nothing was
+		// copied from the vault (issue #19).
+		for _, want := range []string{"created shallow profile", "empty credentials", "--from-vault"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("notice missing %q:\n%s", want, stderr)
+			}
+		}
+		cred := filepath.Join(base, "bob", ".claude", ".credentials.json")
+		body, rerr := os.ReadFile(cred)
+		if rerr != nil {
+			t.Fatalf("read new credential: %v", rerr)
+		}
+		if len(body) != 0 {
+			t.Errorf("new profile credential = %q, want empty (no vault seeding)", body)
+		}
+	})
+
+	t.Run("--create --tool codex uses the codex layout", func(t *testing.T) {
+		if _, _, err := runCmdCaptured(t, "shallow-spawn", "cx", "--create", "--tool", "codex"); err != nil {
+			t.Fatalf("spawn --create --tool codex: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(base, "cx", ".codex", "auth.json")); err != nil {
+			t.Errorf("codex layout not created: %v", err)
+		}
+	})
+
+	t.Run("--tool conflicting with an existing profile is an error", func(t *testing.T) {
+		_, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--tool", "codex")
+		if err == nil {
+			t.Fatal("--tool on a profile of another provider must be an error, not a no-op")
+		}
+		if !strings.Contains(err.Error(), "claude") || !strings.Contains(err.Error(), "codex") {
+			t.Errorf("error should name both providers: %v", err)
+		}
+	})
+
+	t.Run("--create rejects an unknown tool", func(t *testing.T) {
+		_, _, err := runCmdCaptured(t, "shallow-spawn", "nope", "--create", "--tool", "gpt")
+		if err == nil {
+			t.Fatal("want an error for an unsupported --tool")
+		}
+		if _, statErr := os.Stat(filepath.Join(base, "nope")); !os.IsNotExist(statErr) {
+			t.Error("a rejected --tool still created a profile")
+		}
+	})
+
+	t.Run("--print-env never creates", func(t *testing.T) {
+		_, _, err := runCmdCaptured(t, "shallow-spawn", "ghost", "--create", "--print-env")
+		if err == nil {
+			t.Fatal("--print-env must refuse to create")
+		}
+		if _, statErr := os.Stat(filepath.Join(base, "ghost")); !os.IsNotExist(statErr) {
+			t.Error("--print-env created a profile")
+		}
+	})
+}
+
+// TestNearestShallowProfile: the suggestion has to be silent when nothing is
+// actually close, or it turns into noise that hides the real message.
+func TestNearestShallowProfile(t *testing.T) {
+	_, realHome := shallowEnv(t)
+	mgr, err := shallow.NewManager(filepath.Join(t.TempDir(), "orch"), realHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := nearestShallowProfile(mgr, "alice"); got != "" {
+		t.Errorf("empty base: suggestion = %q, want none", got)
+	}
+	for _, name := range []string{"alice", "adriana-gmail"} {
+		if _, err := mgr.Create(name, shallow.CreateOptions{Provider: "claude"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := nearestShallowProfile(mgr, "alise"); got != "alice" {
+		t.Errorf("nearest to alise = %q, want alice", got)
+	}
+	if got := nearestShallowProfile(mgr, "adriana-gmial"); got != "adriana-gmail" {
+		t.Errorf("nearest to adriana-gmial = %q, want adriana-gmail", got)
+	}
+	if got := nearestShallowProfile(mgr, "zzzzzzzz"); got != "" {
+		t.Errorf("nearest to an unrelated name = %q, want none", got)
+	}
+}
+
+// Issue #103: `caam shallow-profile sync-config` is the explicit reconciliation
+// path. The behaviour is covered in internal/shallow; this pins the CLI
+// surface: name-or---all, the change report, and that a second run is a no-op.
+func TestShallowProfileSyncConfigCommand(t *testing.T) {
+	_, realHome := shallowEnv(t)
+
+	realCodex := filepath.Join(realHome, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(realCodex), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeReal := func(body string) {
+		if err := os.WriteFile(realCodex, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeReal("model = \"gpt-5.2-codex\"\n\n[mcp_servers.kernel]\ncommand = \"npx\"\nargs = [\"mcp-remote\"]\n")
+
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "cx", "--tool", "codex", "--json"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing changed since creation: already in sync.
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "sync-config", "cx")
+	if err != nil {
+		t.Fatalf("sync-config: %v", err)
+	}
+	if !strings.Contains(stdout, "already in sync") {
+		t.Errorf("first sync = %q, want 'already in sync'", stdout)
+	}
+
+	// The operator switches the transport in the real HOME.
+	writeReal("model = \"gpt-5.2-codex\"\n\n[mcp_servers.kernel]\nurl = \"https://kernel.example/mcp\"\n")
+
+	stdout, _, err = runCmdCaptured(t, "shallow-profile", "sync-config", "--all", "--json")
+	if err != nil {
+		t.Fatalf("sync-config --all: %v", err)
+	}
+	var out struct {
+		Count    int `json:"count"`
+		Profiles []struct {
+			Name     string   `json:"name"`
+			Provider string   `json:"provider"`
+			Changed  []string `json:"changed"`
+			Error    string   `json:"error"`
+		} `json:"profiles"`
+	}
+	if uerr := json.Unmarshal([]byte(stdout), &out); uerr != nil {
+		t.Fatalf("unmarshal %q: %v", stdout, uerr)
+	}
+	if out.Count != 1 || out.Profiles[0].Name != "cx" || out.Profiles[0].Provider != "codex" {
+		t.Fatalf("unexpected output: %+v", out)
+	}
+	if out.Profiles[0].Error != "" {
+		t.Fatalf("sync error: %s", out.Profiles[0].Error)
+	}
+	var named bool
+	for _, c := range out.Profiles[0].Changed {
+		if c == "mcp_servers.kernel" {
+			named = true
+		}
+		if strings.ContainsAny(c, "=\"") {
+			t.Errorf("change report leaked a value: %q", c)
+		}
+	}
+	if !named {
+		t.Errorf("changed = %v, want it to name mcp_servers.kernel", out.Profiles[0].Changed)
+	}
+
+	// Second run writes nothing.
+	stdout, _, err = runCmdCaptured(t, "shallow-profile", "sync-config", "cx")
+	if err != nil {
+		t.Fatalf("second sync-config: %v", err)
+	}
+	if !strings.Contains(stdout, "already in sync") {
+		t.Errorf("second sync = %q, want 'already in sync'", stdout)
+	}
+
+	// Neither form nor both forms.
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "sync-config"); err == nil {
+		t.Error("sync-config with no name and no --all must be an error")
+	}
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "sync-config", "cx", "--all"); err == nil {
+		t.Error("sync-config with both a name and --all must be an error")
+	}
+}
+
 // -----------------------------------------------------------------------------
-// shallow-spawn ergonomics: default command, create-on-first-use, double-spend.
+// shallow-spawn: double-spend guard, PATH, live login state in list.
 // -----------------------------------------------------------------------------
 
 // fakeToolBin puts no-op executables for the named tools on PATH so
@@ -892,84 +1196,6 @@ func writeClaudeIdentity(t *testing.T, path, uuid, email string) {
 	body := fmt.Sprintf(`{"hasCompletedOnboarding":true,"oauthAccount":{"accountUuid":%q,"emailAddress":%q}}`, uuid, email)
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write %s: %v", path, err)
-	}
-}
-
-// TestShallowSpawnCreatesMissingProfile: naming a profile that does not exist
-// creates it as an EMPTY shallow profile and continues to spawn, so the first
-// run of a new identity is a login instead of an error.
-func TestShallowSpawnCreatesMissingProfile(t *testing.T) {
-	base, _ := shallowEnv(t)
-	fakeToolBin(t, "claude", "codex")
-	argv := captureSpawn(t)
-
-	_, stderr, err := runCmdCaptured(t, "shallow-spawn", "newbie")
-	if err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
-	if !strings.Contains(stderr, `created shallow profile "newbie" (empty)`) {
-		t.Fatalf("expected create notice on stderr, got %q", stderr)
-	}
-	if !strings.Contains(stderr, "log in") {
-		t.Fatalf("create notice should explain the first run logs in, got %q", stderr)
-	}
-	if len(*argv) != 1 || (*argv)[0] != "claude" {
-		t.Fatalf("argv after create-on-first-use = %v, want [claude]", *argv)
-	}
-	// The profile is a real, EMPTY claude shallow profile.
-	cred := filepath.Join(base, "newbie", ".claude", ".credentials.json")
-	body, err := os.ReadFile(cred)
-	if err != nil {
-		t.Fatalf("read new profile credentials: %v", err)
-	}
-	if strings.TrimSpace(string(body)) != "" {
-		t.Fatalf("first-use profile should have EMPTY credentials, got %q", body)
-	}
-
-	// A second spawn reuses the profile without re-announcing creation.
-	_, stderr2, err := runCmdCaptured(t, "shallow-spawn", "newbie")
-	if err != nil {
-		t.Fatalf("second spawn: %v", err)
-	}
-	if strings.Contains(stderr2, "created shallow profile") {
-		t.Fatalf("second spawn should not recreate, stderr=%q", stderr2)
-	}
-}
-
-// TestShallowSpawnCreatesMissingProfileWithTool: --tool picks the layout for a
-// create-on-first-use spawn.
-func TestShallowSpawnCreatesMissingProfileWithTool(t *testing.T) {
-	base, _ := shallowEnv(t)
-	fakeToolBin(t, "claude", "codex")
-	argv := captureSpawn(t)
-	origCheck := shallowCodexDaemonCheck
-	shallowCodexDaemonCheck = func(string, bool, string) codexDaemonWarning { return codexDaemonWarning{} }
-	t.Cleanup(func() { shallowCodexDaemonCheck = origCheck })
-
-	if _, _, err := runCmdCaptured(t, "shallow-spawn", "cxnew", "--tool", "codex"); err != nil {
-		t.Fatalf("spawn: %v", err)
-	}
-	if len(*argv) != 1 || (*argv)[0] != "codex" {
-		t.Fatalf("argv = %v, want [codex]", *argv)
-	}
-	if _, err := os.Stat(filepath.Join(base, "cxnew", ".codex", "auth.json")); err != nil {
-		t.Fatalf("expected a codex layout: %v", err)
-	}
-}
-
-// TestShallowSpawnPrintEnvDoesNotCreate: --print-env is a dry run. It never
-// provisions a profile; a missing name is an error that names the fix.
-func TestShallowSpawnPrintEnvDoesNotCreate(t *testing.T) {
-	base, _ := shallowEnv(t)
-	_, _, err := runCmdCaptured(t, "shallow-spawn", "ghost", "--print-env")
-	if err == nil {
-		t.Fatal("expected --print-env on a missing profile to fail")
-	}
-	if !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, statErr := os.Stat(filepath.Join(base, "ghost")); !os.IsNotExist(statErr) {
-		t.Fatalf("--print-env must not create the profile (err=%v)", statErr)
 	}
 }
 
@@ -1085,10 +1311,9 @@ func TestShallowSpawnDoubleSpendGuard(t *testing.T) {
 		}
 	})
 
-	// A profile that has never been logged in inherits the real HOME's
-	// .claude.json (that is where its onboarding state comes from), so identity
-	// alone would false-positive. An empty credential file means "not logged in
-	// here yet" and must never be refused.
+	// A profile whose credential file is empty has nothing to spend yet: its
+	// first run is a login. Whatever identity its .claude.json carries, the
+	// guard must let it start.
 	t.Run("skips a profile that is not logged in yet", func(t *testing.T) {
 		base, realHome := shallowEnv(t)
 		fakeToolBin(t, "claude")
@@ -1096,10 +1321,10 @@ func TestShallowSpawnDoubleSpendGuard(t *testing.T) {
 		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "fresh", "--json"); err != nil {
 			t.Fatal(err)
 		}
-		// create copies the real HOME state, so the identities DO match.
-		staged, err := os.ReadFile(filepath.Join(base, "fresh", ".claude.json"))
-		if err != nil || !strings.Contains(string(staged), uuid) {
-			t.Fatalf("precondition: expected the seeded state to carry the live uuid, got %q err=%v", staged, err)
+		writeClaudeIdentity(t, filepath.Join(base, "fresh", ".claude.json"), uuid, "me@example.com")
+		cred, err := os.ReadFile(filepath.Join(base, "fresh", ".claude", ".credentials.json"))
+		if err != nil || strings.TrimSpace(string(cred)) != "" {
+			t.Fatalf("precondition: expected an empty credential file, got %q err=%v", cred, err)
 		}
 		argv := captureSpawn(t)
 		if _, _, err := runCmdCaptured(t, "shallow-spawn", "fresh"); err != nil {
@@ -1150,48 +1375,14 @@ func TestShallowSpawnDoubleSpendGuard(t *testing.T) {
 	})
 }
 
-// TestShallowSpawnHelpDocumentsErgonomics keeps the help text honest about the
-// three ergonomics rules a user has to know before typing the short form.
-func TestShallowSpawnHelpDocumentsErgonomics(t *testing.T) {
-	help := shallowSpawnCmd.Long + "\n" + shallowSpawnCmd.Use + "\n" + shallowSpawnCmd.Short
-	for _, want := range []string{
-		"caam shallow-spawn alice",
-		"--tool",
-		"--force",
-		"--print-env",
-	} {
+// TestShallowSpawnHelpDocumentsGuard keeps the help text honest about the
+// guard and its override.
+func TestShallowSpawnHelpDocumentsGuard(t *testing.T) {
+	help := shallowSpawnCmd.Long
+	for _, want := range []string{"--force", "double-spend", "--print-env"} {
 		if !strings.Contains(help, want) {
 			t.Fatalf("shallow-spawn help does not mention %q", want)
 		}
-	}
-	if !strings.Contains(help, "created") && !strings.Contains(help, "create") {
-		t.Fatal("shallow-spawn help does not mention create-on-first-use")
-	}
-}
-
-// TestShallowSpawnToolConflictsWithExistingProfile: --tool only chooses a
-// layout for a profile being created, so naming an existing profile with a
-// different provider must fail loudly instead of looking like a conversion.
-func TestShallowSpawnToolConflictsWithExistingProfile(t *testing.T) {
-	_, _ = shallowEnv(t)
-	fakeToolBin(t, "claude", "codex")
-	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
-		t.Fatal(err)
-	}
-	argv := captureSpawn(t)
-	_, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--tool", "codex")
-	if err == nil {
-		t.Fatal("expected --tool on an existing claude profile to fail")
-	}
-	if !strings.Contains(err.Error(), "conflicts with existing shallow profile") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(*argv) != 0 {
-		t.Fatalf("conflict must block the exec, argv=%v", *argv)
-	}
-	// The matching --tool is accepted.
-	if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--tool", "claude"); err != nil {
-		t.Fatalf("matching --tool must be accepted: %v", err)
 	}
 }
 

@@ -68,9 +68,7 @@ Spawn under a shallow identity with:
   caam shallow-spawn <name> -- <cmd>   # runs any other command
 
 which sets HOME=~/orch-homes/<name> (plus CODEX_HOME/GEMINI_HOME for those
-providers) and execs the command. shallow-spawn also creates the profile if it
-does not exist yet, so this command is only needed when you want a specific
-credential source (--from-vault / --from-file).`,
+providers) and execs the command.`,
 }
 
 func init() {
@@ -78,6 +76,7 @@ func init() {
 	shallowProfileCmd.AddCommand(shallowProfileCreateCmd)
 	shallowProfileCmd.AddCommand(shallowProfileListCmd)
 	shallowProfileCmd.AddCommand(shallowProfileDeleteCmd)
+	shallowProfileCmd.AddCommand(shallowProfileSyncConfigCmd)
 	rootCmd.AddCommand(shallowProfileCmd)
 	rootCmd.AddCommand(shallowSpawnCmd)
 }
@@ -554,20 +553,52 @@ to run anything else under the profile instead.
 Each spawn also backfills missing symlinks for user-installed skills
 (~/.claude/skills, ~/.codex/skills, ~/.gemini/skills) into the shallow
 profile, so spawned sessions see the same skill library as direct ones.
-Auth/config files stay real and private; nothing is copied or overwritten.
+Auth files stay real and private; nothing else is copied or overwritten.
+
+Each spawn additionally refreshes the SHARED configuration of the profile
+from your real HOME — the main lane is the source of truth for configuration:
+
+  claude  .claude.json preferences (theme, editor mode, notification channel),
+          user-scope mcpServers, and per-project trust / allowedTools / MCP
+          settings. Identity (oauthAccount), usage cache and session state are
+          never touched.
+  codex   .codex/config.toml root settings and whole tables ([mcp_servers.*],
+          [features], [skills], [hooks], [model_providers.*]). Each MCP server
+          is replaced as one unit, so a stale command/args pair cannot survive
+          beside a new url. Hook trust ([hooks.state]), workspace trust
+          ([projects]) and dismissed notices ([notice]) stay the profile's own,
+          and cli_auth_credentials_store = "file" is re-enforced.
+
+Pass --no-sync-config to skip it, or run it on demand with
+'caam shallow-profile sync-config <name>'.
+
+An unknown name is an ERROR, not a new profile: a typo would otherwise become
+a fresh empty identity and a login prompt for the wrong account. The error
+names the closest existing profile. Pass --create to actually provision one
+(with EMPTY credentials — nothing is copied from the vault, because two homes
+sharing one refresh-token family invalidate each other); --tool picks the
+layout. --print-env never creates anything.
 
 Examples:
   caam shallow-spawn alice                     # open claude as alice
+  caam shallow-spawn alice --create            # first run of a new identity: creates, then logs in
+  caam shallow-spawn cx --create --tool codex  # same, with a codex layout
   caam shallow-spawn alice -- claude --print "explain this codebase"
   caam shallow-spawn alice -- bash -c 'echo $HOME'
+  caam shallow-spawn alice --no-sync-config   # keep this profile's own theme etc.
   caam shallow-spawn alice --force             # open it even if alice is the live account
   caam shallow-spawn codex-bob --reload-daemon -- codex
   caam shallow-spawn codex-bob --effort xhigh -- codex --model gpt-5.6-sol
 
 Use 'caam shallow-spawn <name> --print-env' to print the environment that
 WOULD be applied without executing anything (useful for shell wrappers). It is
-a strict dry run: it never creates a missing profile (an unknown name is an
-error there) and the double-spend guard does not apply to it.
+a strict dry run: it never creates a missing profile and the double-spend
+guard does not apply to it.
+
+The double-spend guard refuses to open a claude profile that is logged in as
+the account already active in your real HOME (~/.claude.json): two live
+sessions would draw down one subscription's quota. Run that account's CLI
+directly instead, or pass --force to open it anyway.
 
 --reload-daemon (codex only) mirrors 'caam activate/next': after the on-disk
 auth swap it SIGTERMs any running codex app-server/mcp-server daemon so the
@@ -589,9 +620,269 @@ func init() {
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print HOME=... assignments and exit (no exec)")
 	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 	shallowSpawnCmd.Flags().String("effort", "", "for codex: model reasoning effort (e.g. minimal|low|medium|high|xhigh), injected as '-c model_reasoning_effort=<effort>' since codex has no --effort flag")
-	shallowSpawnCmd.Flags().String("tool", "claude", "provider layout to use when creating a profile that does not exist yet: claude, codex, or agy")
+	shallowSpawnCmd.Flags().Bool("no-sync-config", false, "for claude: do not refresh shared preferences (theme, editor mode, notification channel, user/project MCP servers, project trust and tool approvals) in the profile's .claude.json from your real ~/.claude.json before exec")
+	shallowSpawnCmd.Flags().Bool("create", false, "create the shallow profile (with EMPTY credentials) if it does not exist yet, then start the session; without this a name that does not exist is an error, so a typo cannot silently become a new identity")
+	shallowSpawnCmd.Flags().String("tool", "", "provider layout to use with --create: claude (default), codex, or agy. On an existing profile of a different provider it is an error, not a no-op.")
 	shallowSpawnCmd.Flags().Bool("force", false, "spawn even when this profile is the Claude account already active in your real HOME (double-spend guard override)")
 	shallowSpawnCmd.Flags().Bool("allow-agent-view", false, "for claude: keep Claude Code's Agent View / background supervisor enabled instead of injecting CLAUDE_CODE_DISABLE_AGENT_VIEW=1 (opts back into Agent View, accepting that its cross-session supervisor daemon can bypass per-identity auth isolation — see issue #49)")
+}
+
+// shallowProfileSyncConfigCmd reconciles a shallow profile's shared
+// configuration with the real HOME's (issues #93, #103).
+var shallowProfileSyncConfigCmd = &cobra.Command{
+	Use:   "sync-config [name]",
+	Short: "Refresh a shallow profile's shared configuration from your real HOME",
+	Long: `Reconcile the SHARED settings of a shallow profile with your real HOME's,
+without touching its credentials or its own runtime state.
+
+A shallow profile's provider configuration is a real, private file — it has to
+be, because the provider writes identity and per-home state into it — so it
+diverges from your real HOME the moment you change something there. The most
+common casualty is an MCP server: change a real-home entry from the stdio
+transport to streamable HTTP and every codex profile keeps the old command/args
+block, after which codex refuses to parse its config at all
+("url is not supported for stdio in mcp_servers.<name>").
+
+What is refreshed, per provider:
+
+  claude (<home>/.claude.json)
+      preferences (theme, editor mode, notification channel, autoUpdates …),
+      user-scope mcpServers, and per-project trust / allowedTools / MCP settings
+
+  codex (<home>/.codex/config.toml)
+      root settings (model, reasoning effort, personality, notify, …) and whole
+      tables: [mcp_servers.*], [features], [skills], [hooks], [model_providers.*]
+      and the rest. Each MCP server is replaced as ONE unit, so a stale
+      command/args pair can never survive beside a new url.
+
+What is never touched:
+
+  claude   oauthAccount, usage caches, prompt history, per-project session state
+  codex    [hooks.state.*] (hook trust), [projects.*] (workspace trust),
+           [notice.*] (dismissed notices), and auth.json
+  both     the profile's credentials, and any setting the real HOME does not
+           define — nothing is deleted
+
+cli_auth_credentials_store = "file" is re-enforced on every codex sync.
+
+Comments, key order and formatting are preserved: the edit is a structural
+splice, not a rewrite, so untouched regions stay byte-identical. Running it
+twice writes nothing the second time.
+
+Examples:
+  caam shallow-profile sync-config alice
+  caam shallow-profile sync-config --all
+  caam shallow-profile sync-config --all --json`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runShallowProfileSyncConfig,
+}
+
+func init() {
+	shallowProfileSyncConfigCmd.Flags().Bool("all", false, "sync every shallow profile")
+	shallowProfileSyncConfigCmd.Flags().Bool("json", false, "output as JSON")
+}
+
+// shallowSyncConfigResult is one profile's outcome.
+type shallowSyncConfigResult struct {
+	Name     string   `json:"name"`
+	Provider string   `json:"provider,omitempty"`
+	Changed  []string `json:"changed"`
+	Error    string   `json:"error,omitempty"`
+}
+
+type shallowSyncConfigOutput struct {
+	Profiles []shallowSyncConfigResult `json:"profiles"`
+	Count    int                       `json:"count"`
+}
+
+func runShallowProfileSyncConfig(cmd *cobra.Command, args []string) error {
+	all, _ := cmd.Flags().GetBool("all")
+	jsonOut, _ := cmd.Flags().GetBool("json")
+
+	if all == (len(args) == 1) {
+		return fmt.Errorf("give exactly one of <name> or --all")
+	}
+
+	mgr, err := resolveShallowManager(cmd)
+	if err != nil {
+		return fmt.Errorf("init shallow manager: %w", err)
+	}
+
+	names := args
+	if all {
+		profiles, lerr := mgr.List()
+		if lerr != nil {
+			return fmt.Errorf("list shallow profiles: %w", lerr)
+		}
+		names = nil
+		for _, p := range profiles {
+			names = append(names, p.Name)
+		}
+		sort.Strings(names)
+	}
+
+	out := shallowSyncConfigOutput{Profiles: []shallowSyncConfigResult{}}
+	var firstErr error
+	for _, name := range names {
+		res := shallowSyncConfigResult{Name: name, Changed: []string{}}
+		provider, perr := mgr.ResolveProvider(name)
+		if perr != nil {
+			res.Error = perr.Error()
+			if firstErr == nil && !all {
+				firstErr = perr
+			}
+			out.Profiles = append(out.Profiles, res)
+			continue
+		}
+		res.Provider = provider
+
+		var changed []string
+		var serr error
+		switch shallow.NormalizeProvider(provider) {
+		case "claude":
+			changed, serr = mgr.SyncClaudeConfig(name)
+		case "codex":
+			changed, serr = mgr.SyncCodexConfig(name)
+		default:
+			// agy keeps no shared configuration file of its own yet.
+		}
+		if serr != nil {
+			res.Error = serr.Error()
+			if firstErr == nil && !all {
+				firstErr = serr
+			}
+		}
+		res.Changed = append(res.Changed, changed...)
+		out.Profiles = append(out.Profiles, res)
+	}
+	out.Count = len(out.Profiles)
+
+	if jsonOut {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		if eerr := enc.Encode(out); eerr != nil {
+			return eerr
+		}
+		return firstErr
+	}
+
+	for _, res := range out.Profiles {
+		switch {
+		case res.Error != "":
+			fmt.Fprintf(cmd.OutOrStdout(), "%s (%s): error: %s\n", res.Name, res.Provider, res.Error)
+		case len(res.Changed) == 0:
+			fmt.Fprintf(cmd.OutOrStdout(), "%s (%s): already in sync\n", res.Name, res.Provider)
+		default:
+			// Names only — a value could be a token, a header or a path.
+			fmt.Fprintf(cmd.OutOrStdout(), "%s (%s): refreshed %d setting%s: %s\n",
+				res.Name, res.Provider, len(res.Changed),
+				map[bool]string{true: "", false: "s"}[len(res.Changed) == 1],
+				strings.Join(res.Changed, ", "))
+		}
+	}
+	return firstErr
+}
+
+// mustString reads a string flag, returning "" when the flag is absent (test
+// command trees build a reduced flag set).
+func mustString(cmd *cobra.Command, name string) string {
+	v, _ := cmd.Flags().GetString(name)
+	return v
+}
+
+// shallowMissingProfileError is what a bare `caam shallow-spawn <typo>` gets.
+//
+// The whole hazard of creating on first use is that a mistyped name looks
+// exactly like a new identity, so the error carries the two things that tell
+// them apart: the closest existing profile, and the flag that would have meant
+// "yes, really make a new one".
+func shallowMissingProfileError(mgr *shallow.Manager, name string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "shallow profile %q does not exist", name)
+	if suggestion := nearestShallowProfile(mgr, name); suggestion != "" {
+		fmt.Fprintf(&b, "; did you mean %q?", suggestion)
+	}
+	fmt.Fprintf(&b, "\n  create it and start a session:  caam shallow-spawn %s --create [--tool claude|codex|agy]", name)
+	fmt.Fprintf(&b, "\n  or set it up explicitly:        caam shallow-profile create %s", name)
+	return fmt.Errorf("%s", b.String())
+}
+
+// nearestShallowProfile returns the existing profile name closest to want, or
+// "" when nothing is close enough to be worth suggesting. The threshold scales
+// with the name's length so short names do not attract unrelated suggestions.
+func nearestShallowProfile(mgr *shallow.Manager, want string) string {
+	profiles, err := mgr.List()
+	if err != nil || len(profiles) == 0 {
+		return ""
+	}
+	limit := 1 + len(want)/4
+	if limit > 3 {
+		limit = 3
+	}
+	best, bestDist := "", limit+1
+	for _, p := range profiles {
+		d := editDistance(strings.ToLower(want), strings.ToLower(p.Name))
+		if d < bestDist || (d == bestDist && p.Name < best) {
+			best, bestDist = p.Name, d
+		}
+	}
+	if bestDist > limit {
+		return ""
+	}
+	return best
+}
+
+// editDistance is the Levenshtein distance between a and b.
+func editDistance(a, b string) int {
+	ar, br := []rune(a), []rune(b)
+	prev := make([]int, len(br)+1)
+	cur := make([]int, len(br)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ar); i++ {
+		cur[0] = i
+		for j := 1; j <= len(br); j++ {
+			cost := 1
+			if ar[i-1] == br[j-1] {
+				cost = 0
+			}
+			cur[j] = min(min(cur[j-1]+1, prev[j]+1), prev[j-1]+cost)
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(br)]
+}
+
+// createShallowForSpawn provisions an EMPTY shallow profile for --create and
+// tells the user, on stderr, exactly what it did.
+//
+// Credentials are deliberately never seeded from the vault here. Two homes
+// sharing one refresh-token family invalidate each other (issue #19), so
+// copying credentials into a new lane is a decision that stays explicit
+// (`caam shallow-profile create --from-vault`). The first run of a
+// --create'd profile is therefore a login prompt, which is the point.
+func createShallowForSpawn(cmd *cobra.Command, mgr *shallow.Manager, name, tool string) error {
+	supported := false
+	for _, p := range shallow.SupportedProviders() {
+		if p == shallow.NormalizeProvider(tool) {
+			supported = true
+			break
+		}
+	}
+	if !supported {
+		return fmt.Errorf("unknown --tool %q (want one of: %s)", tool, strings.Join(shallow.SupportedProviders(), ", "))
+	}
+	if _, err := mgr.Create(name, shallow.CreateOptions{Provider: tool}); err != nil {
+		return fmt.Errorf("create shallow profile %q: %w", name, err)
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(),
+		"note: created shallow profile %q (%s) with empty credentials; sign in inside this session.\n"+
+			"      Credentials are never copied from the vault into a new lane — two homes sharing one\n"+
+			"      refresh-token family invalidate each other. Use `caam shallow-profile create %s\n"+
+			"      --from-vault %s/<profile>` if you meant to seed it from an existing account.\n",
+		name, tool, name, tool)
+	return nil
 }
 
 // shallowCodexDaemonCheck is the daemon detect/reload hook used by shallow-spawn.
@@ -612,19 +903,37 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("init shallow manager: %w", err)
 	}
 
+	wantTool := strings.ToLower(strings.TrimSpace(mustString(cmd, "tool")))
+	createMissing, _ := cmd.Flags().GetBool("create")
+
 	prof, err := mgr.Get(name)
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) {
+			// Creating on a bare `shallow-spawn <name>` would turn a typo into
+			// a brand-new empty profile plus a login prompt for the wrong
+			// identity, with the mistyped profile then lingering on disk. So
+			// creation is opt-in, and the error for the bare form does the
+			// helpful part instead: it names the closest existing profile and
+			// the flag that would have created this one.
+			if !createMissing {
+				return shallowMissingProfileError(mgr, name)
+			}
+			// --print-env stays a strict dry run: it must never create
+			// anything, whatever other flags are present.
+			if printEnv {
+				return fmt.Errorf("shallow profile %q does not exist; --print-env never creates one (run `caam shallow-spawn %s --create` first)", name, name)
+			}
+			if wantTool == "" {
+				wantTool = "claude"
+			}
+			if err := createShallowForSpawn(cmd, mgr, name, wantTool); err != nil {
+				return err
+			}
+			if prof, err = mgr.Get(name); err != nil {
+				return fmt.Errorf("load shallow profile after creating it: %w", err)
+			}
+		} else {
 			return fmt.Errorf("load shallow profile: %w", err)
-		}
-		// Create on first use. --print-env is a strict dry run, so it reports
-		// the missing profile instead of provisioning one behind the user's
-		// back; a real spawn provisions and continues.
-		if printEnv {
-			return fmt.Errorf("shallow profile %q does not exist; --print-env is a dry run and never creates one — run `caam shallow-spawn %s` (add --tool codex|agy for a non-claude layout) to create it and start the session", name, name)
-		}
-		if prof, err = createShallowProfileForSpawn(cmd, mgr, name); err != nil {
-			return err
 		}
 	}
 
@@ -637,14 +946,12 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	// --tool only chooses a layout for a profile we are creating. Naming an
-	// existing profile with a conflicting --tool is a mistake worth surfacing:
-	// silently ignoring it would look like the layout had been changed.
-	if cmd.Flags().Changed("tool") {
-		wanted, _ := cmd.Flags().GetString("tool")
-		if norm := shallow.NormalizeProvider(wanted); norm != shallow.NormalizeProvider(provider) {
-			return fmt.Errorf("--tool %q conflicts with existing shallow profile %q (provider: %s); --tool only applies when the profile is created on first use", wanted, name, provider)
-		}
+	// --tool names the layout to create; on a profile that already exists it
+	// can only ever be a mistake, so say so rather than silently ignoring it
+	// and spawning the wrong provider's CLI.
+	if wantTool != "" && shallow.NormalizeProvider(wantTool) != shallow.NormalizeProvider(provider) {
+		return fmt.Errorf("shallow profile %q is a %s profile; --tool %s does not apply (drop --tool, or create a separate profile with `caam shallow-profile create <name> --tool %s`)",
+			name, provider, wantTool, wantTool)
 	}
 	// Agent View policy (#49): disable Claude Code's cross-session background
 	// supervisor for shallow claude sessions unless the user opted back in with
@@ -678,6 +985,19 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		rest = []string{shallowSpawnHintBin(provider)}
 	}
 
+	// Double-spend guard: refuse to open a claude profile that is already the
+	// live account, unless the user insists with --force.
+	force, _ := cmd.Flags().GetBool("force")
+	if !force {
+		if label, conflict := shallowSpawnDoubleSpend(provider, prof.Path); conflict {
+			who := name
+			if label != "" {
+				who = fmt.Sprintf("%s (%s)", name, label)
+			}
+			return fmt.Errorf("%q is the account already active in your real HOME (~/.claude.json); running it here too would spend the same quota twice. Run %q directly in this terminal, or pass --force", who, shallowSpawnHintBin(provider))
+		}
+	}
+
 	// Skill-share repair (#56): user-installed skills (e.g. ~/.codex/skills
 	// populated by jsm) are workflow content, not identity state, but they can
 	// drift out of a shallow profile — the real skills dir may postdate profile
@@ -693,13 +1013,41 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 			len(created), map[bool]string{true: "y", false: "ies"}[len(created) == 1], name)
 	}
 
-	// Configuration follows the main lane: refresh this profile's .claude.json
-	// from the real HOME (everything but the profile's own identity and usage
-	// cache) so a setting changed in a plain `claude` session applies here
-	// too. Best-effort: a sync failure is reported but never blocks the spawn.
-	if shallow.NormalizeProvider(provider) == "claude" {
-		if serr := mgr.SyncClaudeConfig(name); serr != nil {
-			fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not sync Claude configuration into shallow profile %q: %v\n", name, serr)
+	// Shared-configuration refresh (#93): a claude profile's .claude.json is a
+	// real, private file because it holds the login identity, but it also
+	// carries the operator's preferences and per-project approvals, which
+	// silently diverge from the real HOME after creation. Copy the allowlisted
+	// shared keys from the real ~/.claude.json into the profile before exec so
+	// the main lane stays the source of truth for configuration; identity,
+	// usage caches and session state stay the profile's own. Best-effort: a
+	// failure warns and never blocks the spawn.
+	//
+	// Codex has the same problem in a sharper form (#103): its config.toml is
+	// copied once at creation and never reconciled, so a real-home MCP entry
+	// that switches transport leaves the profile with a stdio block beside a
+	// url and codex refuses to parse the file at all. Same policy, same
+	// opt-out; sections are replaced as units and the profile's own hook
+	// trust, project trust and dismissed notices are left alone.
+	if noSync, _ := cmd.Flags().GetBool("no-sync-config"); !noSync {
+		var (
+			changed  []string
+			serr     error
+			label    string
+			normProv = shallow.NormalizeProvider(provider)
+		)
+		switch normProv {
+		case "claude":
+			label = "Claude"
+			changed, serr = mgr.SyncClaudeConfig(name)
+		case "codex":
+			label = "Codex"
+			changed, serr = mgr.SyncCodexConfig(name)
+		}
+		if serr != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not refresh shared %s configuration in shallow profile %q: %v\n", label, name, serr)
+		} else if len(changed) > 0 {
+			fmt.Fprintf(cmd.ErrOrStderr(), "note: refreshed %d shared %s setting%s from your real HOME into shallow profile %q (--no-sync-config to skip)\n",
+				len(changed), label, map[bool]string{true: "", false: "s"}[len(changed) == 1], name)
 		}
 	}
 
@@ -761,37 +1109,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	return spawnExec(binPath, rest, envSlice)
 }
 
-// createShallowProfileForSpawn provisions the EMPTY shallow profile that
-// shallow-spawn creates on first use, using the same shallow.Manager.Create
-// path as `caam shallow-profile create <name> --tool <tool>` with no credential
-// source — the profile's private credential file is left empty so the first
-// session logs in as the account the user actually wants there.
-//
-// It deliberately offers no --from-vault equivalent. Seeding a shallow profile
-// from a vault snapshot duplicates one refresh-token family across two homes,
-// and Claude rotates the refresh token on use, so whichever side refreshes
-// second is logged out (issue #19). Copying a credential must stay an explicit
-// `shallow-profile create --from-vault` decision, never an implicit side effect
-// of opening a terminal.
-func createShallowProfileForSpawn(cmd *cobra.Command, mgr *shallow.Manager, name string) (*shallow.Profile, error) {
-	tool, _ := cmd.Flags().GetString("tool")
-	provider := shallow.NormalizeProvider(tool)
-	if _, err := mgr.Create(name, shallow.CreateOptions{Provider: provider}); err != nil {
-		return nil, fmt.Errorf("create shallow profile %q on first use: %w", name, err)
-	}
-	fmt.Fprintf(cmd.ErrOrStderr(),
-		"created shallow profile %q (empty, provider: %s): the first run will ask you to log in as that account\n",
-		name, provider)
-	prof, err := mgr.Get(name)
-	if err != nil {
-		return nil, fmt.Errorf("load shallow profile %q after creating it: %w", name, err)
-	}
-	return prof, nil
-}
-
 // shallowSpawnDoubleSpend reports whether spawning the shallow profile rooted
 // at profileHome would run the SAME account that is already active in the real
-// HOME — two live sessions drawing down one subscription's quota. It returns
+// HOME: two live sessions drawing down one subscription's quota. It returns
 // the profile's human-facing identity (email, else account uuid) alongside the
 // verdict so the refusal can name the account.
 //
@@ -800,13 +1120,11 @@ func createShallowProfileForSpawn(cmd *cobra.Command, mgr *shallow.Manager, name
 //
 // A conflict requires BOTH of:
 //
-//  1. The profile is actually logged in — its private .credentials.json holds
-//     a non-empty JSON object. This matters because a newly created shallow
-//     profile seeds its .claude.json from the real HOME (that is where its
-//     onboarding state comes from), so identity alone would flag every
-//     brand-new profile as a double spend on its very first, login-only run.
+//  1. The profile is actually logged in: its private .credentials.json holds
+//     a non-empty JSON object. A profile created empty has nothing to spend
+//     yet, whatever its .claude.json says, and its first run is a login.
 //  2. The profile's oauthAccount and the live ~/.claude.json's oauthAccount
-//     share an identity key — accountUuid, else emailAddress.
+//     share an identity key: accountUuid, else emailAddress.
 //
 // Either side missing an oauthAccount yields no conflict: an unknown identity
 // is never evidence of a match. The live path is resolved through

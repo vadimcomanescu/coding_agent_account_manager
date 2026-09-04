@@ -1,204 +1,175 @@
 package usage
 
 import (
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-// fixedNow is the reference "current time" for cached-usage tests. Windows that
-// reset before it have rolled; windows that reset after it are still counting.
-var fixedNow = time.Date(2026, 9, 1, 20, 0, 0, 0, time.UTC)
+// Issue #88 / PR #88: `caam limits --cached` reads the usage snapshot Claude
+// Code leaves in each account's own .claude.json, so the question "which
+// account still has headroom" can be answered offline. The whole value of the
+// feature depends on it being honest about staleness, so these tests pin the
+// two ways it could lie: inventing a 0% for an account with no snapshot, and
+// carrying a stale percentage past the window it describes.
 
-const fullCacheJSON = `{
-  "userID": "irrelevant",
+const cachedFixture = `{
+  "userID": "anon",
   "cachedUsageUtilization": {
-    "fetchedAtMs": 1788292800000,
-    "accountUuid": "0552fa96-40f9-4b38-a33a-0d5ac585167d",
+    "fetchedAtMs": 1756900000000,
+    "accountUuid": "11111111-2222-3333-4444-555555555555",
     "utilization": {
       "limits": [
-        {"kind": "session",       "percent": 53, "resets_at": "2026-09-01T22:50:00.110099+00:00", "scope": null},
-        {"kind": "weekly_all",    "percent": 11, "resets_at": "2026-09-04T06:00:00.110125+00:00", "scope": null},
-        {"kind": "weekly_scoped", "percent": 19, "resets_at": "2026-09-04T06:00:00.110393+00:00",
-         "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+        {"kind": "session", "group": "session", "percent": 53, "severity": "normal",
+         "resets_at": "2099-01-01T08:00:00Z", "is_active": true},
+        {"kind": "weekly_all", "group": "weekly", "percent": 11, "severity": "normal",
+         "resets_at": "2099-01-05T00:00:00Z"},
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 19, "severity": "normal",
+         "resets_at": "2099-01-05T00:00:00Z",
+         "scope": {"model": {"id": "claude-fable-5-1", "display_name": "Fable"}}}
       ]
     }
   }
 }`
 
-func TestParseCachedUsageFullSnapshot(t *testing.T) {
-	got, err := ParseCachedUsage([]byte(fullCacheJSON), fixedNow)
+func TestParseCachedClaudeUsage(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	info, err := ParseCachedClaudeUsage([]byte(cachedFixture), now)
 	if err != nil {
-		t.Fatalf("ParseCachedUsage: %v", err)
-	}
-	if got.AccountUUID != "0552fa96-40f9-4b38-a33a-0d5ac585167d" {
-		t.Errorf("AccountUUID = %q", got.AccountUUID)
-	}
-	wantFetched := time.UnixMilli(1788292800000)
-	if !got.FetchedAt.Equal(wantFetched) {
-		t.Errorf("FetchedAt = %v, want %v", got.FetchedAt, wantFetched)
-	}
-	if len(got.Windows) != 3 {
-		t.Fatalf("len(Windows) = %d, want 3", len(got.Windows))
+		t.Fatalf("ParseCachedClaudeUsage: %v", err)
 	}
 
-	session := got.Window(CachedKindSession)
-	if session == nil {
-		t.Fatal("no session window")
+	if info.Source != SourceCache {
+		t.Errorf("Source = %q, want %q", info.Source, SourceCache)
 	}
-	if session.Percent != 53 || session.Rolled {
-		t.Errorf("session = %+v, want 53%% and not rolled", session)
+	if info.AccountID != "11111111-2222-3333-4444-555555555555" {
+		t.Errorf("AccountID = %q", info.AccountID)
 	}
-	if session.Label != "5h" {
-		t.Errorf("session label = %q, want 5h", session.Label)
+	if want := time.UnixMilli(1756900000000); !info.FetchedAt.Equal(want) {
+		t.Errorf("FetchedAt = %v, want the snapshot's own timestamp %v", info.FetchedAt, want)
 	}
-	if session.ResetsAt == nil || !session.ResetsAt.Equal(time.Date(2026, 9, 1, 22, 50, 0, 110099000, time.UTC)) {
-		t.Errorf("session ResetsAt = %v", session.ResetsAt)
+	if info.PrimaryWindow == nil || info.PrimaryWindow.UsedPercent != 53 {
+		t.Errorf("PrimaryWindow = %+v, want 53%%", info.PrimaryWindow)
+	}
+	if info.SecondaryWindow == nil || info.SecondaryWindow.UsedPercent != 11 {
+		t.Errorf("SecondaryWindow = %+v, want 11%%", info.SecondaryWindow)
+	}
+	// The per-model allowance must land where the live fetcher puts it, so
+	// --model and the SCOPED column work identically offline.
+	scoped := info.ScopedLimit("fable")
+	if scoped == nil || scoped.UsedPercent != 19 || scoped.Label != "Fable" {
+		t.Errorf("ScopedLimit(fable) = %+v, want Fable at 19%%", scoped)
 	}
 
-	weekly := got.Window(CachedKindWeeklyAll)
-	if weekly == nil || weekly.Percent != 11 || weekly.Label != "weekly" {
-		t.Errorf("weekly = %+v, want 11%% labelled weekly", weekly)
+	// The snapshot's age is the caveat, so it must be reported, not implied.
+	age, ok := info.CacheAge(now)
+	if !ok {
+		t.Fatal("CacheAge reported unknown for a snapshot that carries a timestamp")
+	}
+	if want := now.Sub(time.UnixMilli(1756900000000)); age != want {
+		t.Errorf("CacheAge = %v, want %v", age, want)
 	}
 }
 
-func TestParseCachedUsageWeeklyScopedLabelIsModelDisplayName(t *testing.T) {
-	got, err := ParseCachedUsage([]byte(fullCacheJSON), fixedNow)
+// TestParseCachedClaudeUsageMarksRolledWindows: a window whose reset time has
+// passed emptied at that moment, so the recorded percentage is no longer true.
+// It reads 0 — but flagged, so a caller can say so rather than presenting it
+// as a measurement.
+func TestParseCachedClaudeUsageMarksRolledWindows(t *testing.T) {
+	body := `{"cachedUsageUtilization":{"fetchedAtMs":1756900000000,"accountUuid":"u",
+	  "utilization":{"limits":[
+	    {"kind":"session","group":"session","percent":88,"resets_at":"2020-01-01T00:00:00Z"},
+	    {"kind":"weekly_all","group":"weekly","percent":40,"resets_at":"2099-01-01T00:00:00Z"}]}}}`
+	info, err := ParseCachedClaudeUsage([]byte(body), time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC))
 	if err != nil {
-		t.Fatalf("ParseCachedUsage: %v", err)
+		t.Fatalf("ParseCachedClaudeUsage: %v", err)
 	}
-	scoped := got.Window(CachedKindWeeklyScoped)
-	if scoped == nil {
-		t.Fatal("no weekly_scoped window")
+	if info.PrimaryWindow == nil || !info.PrimaryWindow.Rolled {
+		t.Fatalf("PrimaryWindow = %+v, want Rolled", info.PrimaryWindow)
 	}
-	if scoped.Label != "Fable" {
-		t.Errorf("scoped label = %q, want the model display name Fable", scoped.Label)
+	if info.PrimaryWindow.UsedPercent != 0 || info.PrimaryWindow.Utilization != 0 {
+		t.Errorf("rolled window still reports %d%%, want 0", info.PrimaryWindow.UsedPercent)
 	}
-	if scoped.Percent != 19 {
-		t.Errorf("scoped percent = %d, want 19", scoped.Percent)
+	if info.SecondaryWindow == nil || info.SecondaryWindow.Rolled {
+		t.Errorf("SecondaryWindow = %+v, want not rolled", info.SecondaryWindow)
 	}
-	if got.ScopedLabel() != "Fable" {
-		t.Errorf("ScopedLabel() = %q, want Fable", got.ScopedLabel())
-	}
-}
-
-func TestParseCachedUsageRolledWindowReadsZero(t *testing.T) {
-	// resets_at is before now: the window rolled, so nothing has been used since.
-	const rolled = `{"cachedUsageUtilization": {"fetchedAtMs": 1788200000000, "accountUuid": "u",
-	  "utilization": {"limits": [
-	    {"kind": "session", "percent": 92, "resets_at": "2026-09-01T10:00:00+00:00", "scope": null}
-	  ]}}}`
-
-	got, err := ParseCachedUsage([]byte(rolled), fixedNow)
-	if err != nil {
-		t.Fatalf("ParseCachedUsage: %v", err)
-	}
-	session := got.Window(CachedKindSession)
-	if session == nil {
-		t.Fatal("no session window")
-	}
-	if session.Percent != 0 {
-		t.Errorf("percent = %d, want 0 for a window whose reset has passed", session.Percent)
-	}
-	if !session.Rolled {
-		t.Error("Rolled = false, want true for a window whose reset has passed")
+	if info.SecondaryWindow.UsedPercent != 40 {
+		t.Errorf("live window = %d%%, want 40", info.SecondaryWindow.UsedPercent)
 	}
 }
 
-func TestParseCachedUsageNullResetsAtAndAbsentPercent(t *testing.T) {
-	const partial = `{"cachedUsageUtilization": {"fetchedAtMs": 1788292800000, "accountUuid": "u",
-	  "utilization": {"limits": [
-	    {"kind": "session", "percent": 0, "resets_at": null, "scope": null},
-	    {"kind": "weekly_all", "resets_at": null, "scope": null}
-	  ]}}}`
+// TestParseCachedClaudeUsageNoSnapshot: absent, empty and legacy files are all
+// "no cached data", never 0% used. This is the whole difference between a
+// useful offline view and one that recommends switching to an account it knows
+// nothing about.
+func TestParseCachedClaudeUsageNoSnapshot(t *testing.T) {
+	now := time.Now()
+	for name, body := range map[string]string{
+		"no key":         `{"userID":"anon","theme":"dark"}`,
+		"null key":       `{"cachedUsageUtilization":null}`,
+		"empty limits":   `{"cachedUsageUtilization":{"fetchedAtMs":1,"utilization":{"limits":[]}}}`,
+		"no utilization": `{"cachedUsageUtilization":{"fetchedAtMs":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			info, err := ParseCachedClaudeUsage([]byte(body), now)
+			if err == nil {
+				t.Fatalf("want ErrNoCachedUsage, got %+v", info)
+			}
+			if err.Error() != ErrNoCachedUsage.Error() {
+				t.Fatalf("err = %v, want %v", err, ErrNoCachedUsage)
+			}
+		})
+	}
 
-	got, err := ParseCachedUsage([]byte(partial), fixedNow)
-	if err != nil {
-		t.Fatalf("ParseCachedUsage: %v", err)
-	}
-	session := got.Window(CachedKindSession)
-	if session == nil || session.ResetsAt != nil {
-		t.Errorf("session = %+v, want a nil ResetsAt", session)
-	}
-	if session.Rolled {
-		t.Error("a window with no reset time must not be reported as rolled")
-	}
-	weekly := got.Window(CachedKindWeeklyAll)
-	if weekly == nil || weekly.Percent != 0 {
-		t.Errorf("weekly = %+v, want percent 0 when the field is absent", weekly)
-	}
-	if got.ScopedLabel() != "" {
-		t.Errorf("ScopedLabel() = %q, want empty with no weekly_scoped window", got.ScopedLabel())
+	if _, err := ParseCachedClaudeUsage([]byte(`not json`), now); err == nil {
+		t.Error("malformed JSON should be an error, not silently empty")
 	}
 }
 
-func TestParseCachedUsageMissingKey(t *testing.T) {
-	_, err := ParseCachedUsage([]byte(`{"userID": "x", "projects": {}}`), fixedNow)
-	if !errors.Is(err, ErrNoCachedUsage) {
-		t.Fatalf("err = %v, want ErrNoCachedUsage", err)
-	}
-}
-
-func TestParseCachedUsageEmptyLimitsIsNoCache(t *testing.T) {
-	const empty = `{"cachedUsageUtilization": {"fetchedAtMs": 1788292800000, "utilization": {"limits": []}}}`
-	if _, err := ParseCachedUsage([]byte(empty), fixedNow); !errors.Is(err, ErrNoCachedUsage) {
-		t.Fatalf("err = %v, want ErrNoCachedUsage for an empty limits array", err)
-	}
-}
-
-func TestParseCachedUsageUnknownKindKeepsKindAsLabel(t *testing.T) {
-	const odd = `{"cachedUsageUtilization": {"fetchedAtMs": 1, "utilization": {"limits": [
-	  {"kind": "monthly_experiment", "percent": 7, "resets_at": null}]}}}`
-	got, err := ParseCachedUsage([]byte(odd), fixedNow)
-	if err != nil {
-		t.Fatalf("ParseCachedUsage: %v", err)
-	}
-	w := got.Window("monthly_experiment")
-	if w == nil || w.Label != "monthly_experiment" {
-		t.Errorf("window = %+v, want the raw kind as its label", w)
-	}
-}
-
-func TestParseCachedUsageInvalidJSON(t *testing.T) {
-	if _, err := ParseCachedUsage([]byte(`{not json`), fixedNow); err == nil {
-		t.Fatal("want an error for malformed JSON")
-	} else if errors.Is(err, ErrNoCachedUsage) {
-		t.Fatal("malformed JSON must not be reported as a missing cache")
-	}
-}
-
-func TestReadCachedUsage(t *testing.T) {
+func TestReadCachedClaudeUsage(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".claude.json")
-	if err := os.WriteFile(path, []byte(fullCacheJSON), 0o600); err != nil {
-		t.Fatalf("write: %v", err)
+	if err := os.WriteFile(path, []byte(cachedFixture), 0600); err != nil {
+		t.Fatal(err)
 	}
-
-	got, err := ReadCachedUsage(path, fixedNow)
+	info, err := ReadCachedClaudeUsage(path, time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC))
 	if err != nil {
-		t.Fatalf("ReadCachedUsage: %v", err)
+		t.Fatalf("ReadCachedClaudeUsage: %v", err)
 	}
-	if got.AccountUUID == "" || len(got.Windows) != 3 {
-		t.Errorf("got = %+v, want the parsed snapshot", got)
+	if info.PrimaryWindow == nil || info.PrimaryWindow.UsedPercent != 53 {
+		t.Errorf("PrimaryWindow = %+v", info.PrimaryWindow)
+	}
+
+	// A profile that has never been used has no file at all; that is the
+	// common case, and it must not read as an error the caller shows as a
+	// failure or as an idle account.
+	if _, err := ReadCachedClaudeUsage(filepath.Join(dir, "absent.json"), time.Now()); err == nil {
+		t.Error("missing file should report ErrNoCachedUsage")
+	} else if err.Error() == "" {
+		t.Error("empty error text")
 	}
 }
 
-func TestReadCachedUsageMissingFile(t *testing.T) {
-	_, err := ReadCachedUsage(filepath.Join(t.TempDir(), "absent.json"), fixedNow)
-	if !errors.Is(err, ErrNoCachedUsage) {
-		t.Fatalf("err = %v, want ErrNoCachedUsage for a missing file", err)
+// TestCacheAgeUnknownWithoutTimestamp: a snapshot with no fetchedAtMs has an
+// unknown age; reporting "0s ago" would be a fabrication.
+func TestCacheAgeUnknownWithoutTimestamp(t *testing.T) {
+	body := `{"cachedUsageUtilization":{"accountUuid":"u","utilization":{"limits":[
+	  {"kind":"session","group":"session","percent":5,"resets_at":"2099-01-01T00:00:00Z"}]}}}`
+	info, err := ParseCachedClaudeUsage([]byte(body), time.Now())
+	if err != nil {
+		t.Fatal(err)
 	}
-}
+	if !info.FetchedAt.IsZero() {
+		t.Errorf("FetchedAt = %v, want zero", info.FetchedAt)
+	}
+	if _, ok := info.CacheAge(time.Now()); ok {
+		t.Error("CacheAge reported a known age for a snapshot with no timestamp")
+	}
 
-func TestCachedUsageAge(t *testing.T) {
-	c := &CachedUsage{FetchedAt: fixedNow.Add(-90 * time.Minute)}
-	if got := c.Age(fixedNow); got != 90*time.Minute {
-		t.Errorf("Age = %v, want 90m", got)
-	}
-	var missing CachedUsage
-	if got := missing.Age(fixedNow); got != 0 {
-		t.Errorf("Age with no fetch time = %v, want 0", got)
+	// A live API row is never "cached", however old it is.
+	live := &UsageInfo{Source: SourceAPI, FetchedAt: time.Now().Add(-time.Hour)}
+	if _, ok := live.CacheAge(time.Now()); ok {
+		t.Error("CacheAge reported an age for a live row")
 	}
 }

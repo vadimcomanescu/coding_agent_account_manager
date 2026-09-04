@@ -66,10 +66,82 @@ type quotaRow struct {
 	// not active), and "shallow" or "shallow(<name>)" for a shallow profile
 	// (named when its name differs from Profile). One account can be in
 	// several lanes at once; its usage is one number regardless.
-	Lanes       []string             `json:"lanes"`
-	AccountUUID string               `json:"account_uuid"`
-	FetchedAt   *time.Time           `json:"fetched_at"`
-	Windows     []usage.CachedWindow `json:"windows"`
+	Lanes       []string      `json:"lanes"`
+	AccountUUID string        `json:"account_uuid"`
+	FetchedAt   *time.Time    `json:"fetched_at"`
+	Windows     []quotaWindow `json:"windows"`
+}
+
+// quotaWindow is one rate-limit window as the table renders it and --json
+// emits it: the snapshot's own kind, a short human label, a whole percentage,
+// and whether the window had already rolled over when it was read.
+type quotaWindow struct {
+	// Kind is Claude Code's name for the window: "session", "weekly_all", or
+	// "weekly_scoped".
+	Kind string `json:"kind"`
+
+	// Label is the human-facing name: "5h", "weekly", or, for a model-scoped
+	// weekly window, the model's display name (e.g. "Fable").
+	Label string `json:"label"`
+
+	// Percent is the share of the window consumed, 0-100. A rolled window
+	// reads 0 regardless of what the snapshot recorded.
+	Percent int `json:"percent"`
+
+	// ResetsAt is when the window rolls over; nil when the snapshot omits it.
+	ResetsAt *time.Time `json:"resets_at"`
+
+	// Rolled is true when ResetsAt had already passed, meaning the recorded
+	// percentage describes a window that has since emptied.
+	Rolled bool `json:"rolled"`
+}
+
+// quotaWindowsFromUsage flattens the cached UsageInfo the usage package
+// produces into the fixed order the table shows: the 5-hour session window,
+// the all-model weekly cap, then each model-scoped window by model name.
+func quotaWindowsFromUsage(info *usage.UsageInfo) []quotaWindow {
+	windows := []quotaWindow{}
+	if info == nil {
+		return windows
+	}
+	add := func(w *usage.UsageWindow, kind, label string) {
+		if w == nil {
+			return
+		}
+		if w.Kind != "" {
+			kind = w.Kind
+		}
+		if w.Label != "" {
+			label = w.Label
+		}
+		qw := quotaWindow{Kind: kind, Label: label, Percent: clampQuotaPercent(w.UsedPercent), Rolled: w.Rolled}
+		if !w.ResetsAt.IsZero() {
+			resets := w.ResetsAt
+			qw.ResetsAt = &resets
+		}
+		windows = append(windows, qw)
+	}
+	add(info.PrimaryWindow, usage.LimitKindSession, "5h")
+	add(info.SecondaryWindow, usage.LimitKindWeeklyAll, "weekly")
+	models := make([]string, 0, len(info.ModelWindows))
+	for name := range info.ModelWindows {
+		models = append(models, name)
+	}
+	sort.Strings(models)
+	for _, name := range models {
+		add(info.ModelWindows[name], usage.LimitKindWeeklyScoped, name)
+	}
+	return windows
+}
+
+func clampQuotaPercent(p int) int {
+	if p < 0 {
+		return 0
+	}
+	if p > 100 {
+		return 100
+	}
+	return p
 }
 
 // quotaScan describes where to look for cached usage. Every path is injected
@@ -337,7 +409,7 @@ func buildQuotaRow(scan quotaScan, name, shallowHome, path, source string, activ
 		Profile: name,
 		Source:  source,
 		Active:  active,
-		Windows: []usage.CachedWindow{},
+		Windows: []quotaWindow{},
 	}
 
 	var id *identity.Identity
@@ -348,17 +420,17 @@ func buildQuotaRow(scan quotaScan, name, shallowHome, path, source string, activ
 
 	// A missing, older, or corrupt .claude.json all mean the same thing to the
 	// reader: this profile has nothing to report yet.
-	cached, err := usage.ReadCachedUsage(path, scan.now)
+	cached, err := usage.ReadCachedClaudeUsage(path, scan.now)
 	if err != nil {
 		return row
 	}
 
-	row.AccountUUID = cached.AccountUUID
+	row.AccountUUID = cached.AccountID
 	if !cached.FetchedAt.IsZero() {
 		fetched := cached.FetchedAt
 		row.FetchedAt = &fetched
 	}
-	row.Windows = cached.Windows
+	row.Windows = quotaWindowsFromUsage(cached)
 	return row
 }
 
@@ -440,9 +512,9 @@ func renderQuotaTable(w io.Writer, rows []quotaRow, now time.Time, color bool) e
 
 		snapshot := row.Source != quotaSourceLive
 		cells := []quotaBarCell{
-			quotaCell(row.Windows, usage.CachedKindSession, snapshot),
-			quotaCell(row.Windows, usage.CachedKindWeeklyAll, snapshot),
-			quotaCell(row.Windows, usage.CachedKindWeeklyScoped, snapshot),
+			quotaCell(row.Windows, usage.LimitKindSession, snapshot),
+			quotaCell(row.Windows, usage.LimitKindWeeklyAll, snapshot),
+			quotaCell(row.Windows, usage.LimitKindWeeklyScoped, snapshot),
 		}
 		for _, c := range cells {
 			if c.Percent >= 0 {
@@ -528,7 +600,7 @@ type quotaBarCell struct {
 // quotaCell renders one window as a bar plus its percentage. Figures from a
 // frozen snapshot are prefixed with "~": they are as of the AS OF column, not
 // as of now.
-func quotaCell(windows []usage.CachedWindow, kind string, snapshot bool) quotaBarCell {
+func quotaCell(windows []quotaWindow, kind string, snapshot bool) quotaBarCell {
 	for _, w := range windows {
 		if w.Kind != kind {
 			continue
@@ -547,9 +619,9 @@ func quotaCell(windows []usage.CachedWindow, kind string, snapshot bool) quotaBa
 
 // quotaResetsCell shows when the weekly window rolls over: the deadline that
 // actually shapes a week of work.
-func quotaResetsCell(windows []usage.CachedWindow) string {
+func quotaResetsCell(windows []quotaWindow) string {
 	for _, w := range windows {
-		if w.Kind == usage.CachedKindWeeklyAll && w.ResetsAt != nil {
+		if w.Kind == usage.LimitKindWeeklyAll && w.ResetsAt != nil {
 			return w.ResetsAt.Local().Format("Mon Jan 2 15:04")
 		}
 	}
@@ -572,7 +644,7 @@ func quotaAsOfCell(row quotaRow, now time.Time) string {
 func quotaScopedTitle(rows []quotaRow) string {
 	for _, row := range rows {
 		for _, w := range row.Windows {
-			if w.Kind == usage.CachedKindWeeklyScoped && w.Label != "" && w.Label != usage.CachedKindWeeklyScoped {
+			if w.Kind == usage.LimitKindWeeklyScoped && w.Label != "" && w.Label != usage.LimitKindWeeklyScoped {
 				return w.Label
 			}
 		}

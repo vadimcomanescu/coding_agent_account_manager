@@ -18,8 +18,10 @@
 //	  .credentials.lock            (real file — empty, prevents Claude from
 //	                                touching the symlinked .claude folder above)
 //	  projects/, todos/, ...       (symlinks to ~/.claude/projects, etc.)
-//	.claude.json                   (real file — copy of the user's settings;
-//	                                Claude rewrites this in-place during runtime)
+//	.claude.json                   (real file — the user's settings minus the
+//	                                account-bound keys; Claude rewrites this
+//	                                in-place at runtime; shared preferences are
+//	                                refreshed on spawn — see claude_config.go)
 //	.bashrc, .gitconfig, .ssh, ... (symlinks to ~/.bashrc, etc.)
 //
 // Why some HOME entries must be real:
@@ -605,9 +607,14 @@ func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts Creat
 	return nil
 }
 
-// writeClaudeJSON writes <home>/.claude.json. Prefer an explicit source; fall
-// back to the user's real ~/.claude.json (automatic onboarding); otherwise emit
-// a minimal skeleton. (Claude rewrites this file in place at runtime.)
+// writeClaudeJSON writes <home>/.claude.json. An explicit source (a vault
+// snapshot or --from-claude-json) is copied verbatim — its identity belongs
+// to the credentials it came with. Otherwise the user's real ~/.claude.json
+// is used as the seed (automatic onboarding: preferences, theme, project
+// approvals) with the account-bound keys stripped, so the new profile never
+// reports the real HOME's identity or usage as its own (issue #92; policy in
+// claude_config.go). With no real file either, a minimal skeleton is written.
+// (Claude rewrites this file in place at runtime.)
 func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 	claudeJSONPath := filepath.Join(home, ".claude.json")
 	if opts.SourceClaudeJSON != "" {
@@ -617,17 +624,12 @@ func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 		return nil
 	}
 	realClaudeJSON := filepath.Join(m.realHome, ".claude.json")
-	if data, err := os.ReadFile(realClaudeJSON); err == nil {
-		// The real file carries the real account's identity and usage cache.
-		// A profile created empty is going to log in as a different account,
-		// so those keys are dropped: kept, they would make the new profile
-		// look like the real account to every reader (status, quota, the
-		// double-spend guard) until its first login rewrites them.
-		seeded, serr := stripClaudeIdentity(data)
+	if _, err := os.Stat(realClaudeJSON); err == nil {
+		seed, serr := seedClaudeJSONFromRealHome(realClaudeJSON)
 		if serr != nil {
 			return fmt.Errorf("seed .claude.json from real HOME: %w", serr)
 		}
-		if werr := writeFileAtomic(claudeJSONPath, seeded, 0o600); werr != nil {
+		if werr := writeFileAtomic(claudeJSONPath, seed, 0o600); werr != nil {
 			return fmt.Errorf("seed .claude.json from real HOME: %w", werr)
 		}
 		return nil
@@ -636,102 +638,6 @@ func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 		return fmt.Errorf("write skeleton .claude.json: %w", err)
 	}
 	return nil
-}
-
-// claudeIdentityKeys are the top-level .claude.json keys that describe which
-// account the file belongs to and what that account has consumed. Everything
-// else in the file is configuration and onboarding state worth inheriting.
-var claudeIdentityKeys = []string{"oauthAccount", "userID", "cachedUsageUtilization"}
-
-// stripClaudeIdentity returns the .claude.json bytes with the account
-// identity and usage cache removed.
-func stripClaudeIdentity(data []byte) ([]byte, error) {
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(data, &root); err != nil {
-		return nil, fmt.Errorf("parse .claude.json: %w", err)
-	}
-	for _, k := range claudeIdentityKeys {
-		delete(root, k)
-	}
-	out, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	return append(out, '\n'), nil
-}
-
-// SyncClaudeConfig refreshes a claude shallow profile's .claude.json from the
-// real HOME's, so configuration made in the main lane (theme, editor mode,
-// notification channel, global MCP servers, per-project trust and tool
-// approvals) reaches every shallow session on its next spawn. The real HOME
-// is the source of truth for everything except what makes the profile its
-// own identity: oauthAccount, userID and cachedUsageUtilization stay as the
-// profile has them. Per-project state is merged: the real HOME's entry wins
-// for a project both sides know, a project only the shallow session has seen
-// is kept. A profile with no .claude.json yet is seeded the same way.
-func (m *Manager) SyncClaudeConfig(name string) error {
-	prof, err := m.Get(name)
-	if err != nil {
-		return err
-	}
-	realData, err := os.ReadFile(filepath.Join(m.realHome, ".claude.json"))
-	if err != nil {
-		return nil // nothing to inherit from
-	}
-	var real map[string]json.RawMessage
-	if err := json.Unmarshal(realData, &real); err != nil {
-		return fmt.Errorf("parse real .claude.json: %w", err)
-	}
-	shallowPath := filepath.Join(prof.Path, ".claude.json")
-	own := map[string]json.RawMessage{}
-	if data, err := os.ReadFile(shallowPath); err == nil {
-		if err := json.Unmarshal(data, &own); err != nil {
-			return fmt.Errorf("parse shallow .claude.json: %w", err)
-		}
-	}
-	merged := make(map[string]json.RawMessage, len(real)+len(claudeIdentityKeys))
-	for k, v := range real {
-		merged[k] = v
-	}
-	for _, k := range claudeIdentityKeys {
-		if v, ok := own[k]; ok {
-			merged[k] = v
-		} else {
-			delete(merged, k)
-		}
-	}
-	if projects, err := mergeClaudeProjects(own["projects"], real["projects"]); err == nil && projects != nil {
-		merged["projects"] = projects
-	}
-	out, err := json.MarshalIndent(merged, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(shallowPath, append(out, '\n'), 0o600)
-}
-
-// mergeClaudeProjects overlays the real HOME's per-project entries onto the
-// shallow profile's. Either side may be absent.
-func mergeClaudeProjects(own, real json.RawMessage) (json.RawMessage, error) {
-	if own == nil && real == nil {
-		return nil, nil
-	}
-	merged := map[string]json.RawMessage{}
-	if own != nil {
-		if err := json.Unmarshal(own, &merged); err != nil {
-			return nil, err
-		}
-	}
-	if real != nil {
-		var r map[string]json.RawMessage
-		if err := json.Unmarshal(real, &r); err != nil {
-			return nil, err
-		}
-		for k, v := range r {
-			merged[k] = v
-		}
-	}
-	return json.Marshal(merged)
 }
 
 // ensureClaudeOnboarding merges the minimum non-secret readiness marker
