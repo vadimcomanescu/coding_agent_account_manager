@@ -162,11 +162,14 @@ caam shallow-spawn alice     # open claude as "alice" in THIS terminal.
 caam shallow-spawn alice --create   # first time only: creates the profile (empty) and the session logs you in.
 caam status                  # which account each tool is on right now
 caam next claude             # rotate the MAIN lane (your real ~/) to the next account
+caam quota                   # cached usage per account, every lane, no network
 ```
 
 `caam shallow-spawn <name>` with no `-- <cmd>` section runs that profile's own provider CLI (`claude`, `codex`, or `agy`). An unknown name is an error; pass `--create` to provision it, and `--tool codex|agy` to pick a non-claude layout. Profiles created this way start **empty** on purpose: caam never copies a credential out of the vault on spawn, because two homes sharing one refresh-token family log each other out as soon as Claude rotates the token (issue #19). When you deliberately want a copy, ask for it: `caam shallow-profile create <name> --from-vault <tool>/<profile>`.
 
 **Double-spend rule.** caam refuses to open a shallow `claude` profile that is logged in as the account *already active* in your real `~/.claude.json` — two live sessions would draw down one subscription's quota. Run `claude` directly for that account, or pass `--force`. The check is skipped when either side has no `oauthAccount` recorded (nothing to compare), and for `codex`/`agy`, which keep no comparable account identity on disk.
+
+**PATH.** The shallow HOME's `.local/bin` (a symlink to the real one) is put first on `PATH`, so Claude Code's native-install diagnostic stays quiet under a shallow HOME.
 
 ```bash
 # Stage credentials in caam's vault first (one-time per account).
@@ -321,23 +324,6 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 
 > **Note:** `caam shallow-profile` does not (yet) call any reverse-engineered Anthropic endpoints to display per-account live usage data. That's a separate concern tracked in the original report (issue #16) and intentionally deferred.
 
-
-### Daily flow (fork)
-
-```bash
-caam shallow-spawn alice            # open Claude as that profile, in this terminal
-caam shallow-spawn alice --create --tool codex
-caam next claude                    # rotate the main lane (~/.claude); plain `claude` sessions follow
-caam quota                          # usage per account, all lanes, no network
-caam shallow-profile list           # LOGIN column shows who each profile is right now
-```
-
-- **Create with `--create`.** An unknown name is an error; `--create` provisions it as an empty profile and the first session logs in. Credentials are never copied from the vault (two homes sharing one refresh-token family invalidate each other, #19). Empty profiles inherit configuration from the real HOME but not its identity or usage cache.
-- **Double-spend guard.** Spawning a profile that is logged in as the account already active in `~/.claude` is refused, since both sessions would draw on one quota; `--force` overrides.
-- **PATH.** The shallow HOME's `.local/bin` (a symlink to the real one) is put first on `PATH`, so Claude Code's "native install is not on PATH" diagnostic stays quiet under a shallow HOME.
-
-**Configuration follows the main lane.** Every `shallow-spawn` refreshes the profile's shared Claude preferences and per-project approvals from your real `~/.claude.json` and, for codex, reconciles `config.toml`; the profile keeps its own login identity and usage cache. `--no-sync-config` skips it, `caam shallow-profile sync-config` runs it on demand. `~/.claude/settings.json` is shared directly through the symlink farm.
-
 ---
 
 ## Supported Tools
@@ -349,7 +335,6 @@ caam shallow-profile list           # LOGIN column shows who each profile is rig
 | **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
 | **Grok Build** (xAI) | OAuth/OIDC: `~/.grok/auth.json` (+ `~/.grok/config.toml`); respects `GROK_HOME` | `grok login` (browser OIDC) |
-
 
 ### Claude Code (Claude Max)
 
