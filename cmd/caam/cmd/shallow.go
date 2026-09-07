@@ -586,19 +586,12 @@ Examples:
   caam shallow-spawn alice -- claude --print "explain this codebase"
   caam shallow-spawn alice -- bash -c 'echo $HOME'
   caam shallow-spawn alice --no-sync-config   # keep this profile's own theme etc.
-  caam shallow-spawn alice --force             # open it even if alice is the live account
   caam shallow-spawn codex-bob --reload-daemon -- codex
   caam shallow-spawn codex-bob --effort xhigh -- codex --model gpt-5.6-sol
 
 Use 'caam shallow-spawn <name> --print-env' to print the environment that
 WOULD be applied without executing anything (useful for shell wrappers). It is
-a strict dry run: it never creates a missing profile and the double-spend
-guard does not apply to it.
-
-The double-spend guard refuses to open a claude profile that is logged in as
-the account already active in your real HOME (~/.claude.json): two live
-sessions would draw down one subscription's quota. Run that account's CLI
-directly instead, or pass --force to open it anyway.
+a strict dry run: it never creates a missing profile.
 
 --reload-daemon (codex only) mirrors 'caam activate/next': after the on-disk
 auth swap it SIGTERMs any running codex app-server/mcp-server daemon so the
@@ -623,7 +616,6 @@ func init() {
 	shallowSpawnCmd.Flags().Bool("no-sync-config", false, "for claude: do not refresh shared preferences (theme, editor mode, notification channel, user/project MCP servers, project trust and tool approvals) in the profile's .claude.json from your real ~/.claude.json before exec")
 	shallowSpawnCmd.Flags().Bool("create", false, "create the shallow profile (with EMPTY credentials) if it does not exist yet, then start the session; without this a name that does not exist is an error, so a typo cannot silently become a new identity")
 	shallowSpawnCmd.Flags().String("tool", "", "provider layout to use with --create: claude (default), codex, or agy. On an existing profile of a different provider it is an error, not a no-op.")
-	shallowSpawnCmd.Flags().Bool("force", false, "spawn even when this profile is the Claude account already active in your real HOME (double-spend guard override)")
 	shallowSpawnCmd.Flags().Bool("allow-agent-view", false, "for claude: keep Claude Code's Agent View / background supervisor enabled instead of injecting CLAUDE_CODE_DISABLE_AGENT_VIEW=1 (opts back into Agent View, accepting that its cross-session supervisor daemon can bypass per-identity auth isolation — see issue #49)")
 }
 
@@ -985,19 +977,6 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		rest = []string{shallowSpawnHintBin(provider)}
 	}
 
-	// Double-spend guard: refuse to open a claude profile that is already the
-	// live account, unless the user insists with --force.
-	force, _ := cmd.Flags().GetBool("force")
-	if !force {
-		if label, conflict := shallowSpawnDoubleSpend(provider, prof.Path); conflict {
-			who := name
-			if label != "" {
-				who = fmt.Sprintf("%s (%s)", name, label)
-			}
-			return fmt.Errorf("%q is the account already active in your real HOME (~/.claude.json); running it here too would spend the same quota twice. Run %q directly in this terminal, or pass --force", who, shallowSpawnHintBin(provider))
-		}
-	}
-
 	// Skill-share repair (#56): user-installed skills (e.g. ~/.codex/skills
 	// populated by jsm) are workflow content, not identity state, but they can
 	// drift out of a shallow profile — the real skills dir may postdate profile
@@ -1107,42 +1086,6 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	// On Unix, exec the target so signals/exit propagate naturally and we
 	// don't add a stray caam process to the tree.
 	return spawnExec(binPath, rest, envSlice)
-}
-
-// shallowSpawnDoubleSpend reports whether spawning the shallow profile rooted
-// at profileHome would run the SAME account that is already active in the real
-// HOME: two live sessions drawing down one subscription's quota. It returns
-// the profile's human-facing identity (email, else account uuid) alongside the
-// verdict so the refusal can name the account.
-//
-// Claude only: codex and agy keep no account identity next to their
-// credentials, so there is nothing to compare and we never invent one.
-//
-// A conflict requires BOTH of:
-//
-//  1. The profile is actually logged in: its private .credentials.json holds
-//     a non-empty JSON object. A profile created empty has nothing to spend
-//     yet, whatever its .claude.json says, and its first run is a login.
-//  2. The profile's oauthAccount and the live ~/.claude.json's oauthAccount
-//     share an identity key: accountUuid, else emailAddress.
-//
-// Either side missing an oauthAccount yields no conflict: an unknown identity
-// is never evidence of a match. The live path is resolved through
-// authfile.ClaudeAuthFiles() so this agrees with every other caam command
-// about which file holds the live identity.
-func shallowSpawnDoubleSpend(provider, profileHome string) (label string, conflict bool) {
-	if shallow.NormalizeProvider(provider) != "claude" {
-		return "", false
-	}
-	if !shallowCredentialPresent(filepath.Join(profileHome, ".claude", ".credentials.json")) {
-		return "", false
-	}
-	profileKeys := authfile.ClaudeIdentityKeysFromFile(filepath.Join(profileHome, ".claude.json"))
-	liveKeys := authfile.ClaudeLiveIdentityKeys(authfile.ClaudeAuthFiles())
-	if !authfile.IdentityKeysIntersect(profileKeys, liveKeys) {
-		return "", false
-	}
-	return authfile.ClaudeIdentityLabel(profileKeys), true
 }
 
 // prependShallowLocalBin puts <home>/.local/bin first on PATH when that

@@ -167,8 +167,6 @@ caam quota                   # cached usage per account, every lane, no network
 
 `caam shallow-spawn <name>` with no `-- <cmd>` section runs that profile's own provider CLI (`claude`, `codex`, or `agy`). An unknown name is an error; pass `--create` to provision it, and `--tool codex|agy` to pick a non-claude layout. Profiles created this way start **empty** on purpose: caam never copies a credential out of the vault on spawn, because two homes sharing one refresh-token family log each other out as soon as Claude rotates the token (issue #19). When you deliberately want a copy, ask for it: `caam shallow-profile create <name> --from-vault <tool>/<profile>`.
 
-**Double-spend rule.** caam refuses to open a shallow `claude` profile that is logged in as the account *already active* in your real `~/.claude.json` — two live sessions would draw down one subscription's quota. Run `claude` directly for that account, or pass `--force`. The check is skipped when either side has no `oauthAccount` recorded (nothing to compare), and for `codex`/`agy`, which keep no comparable account identity on disk.
-
 **PATH.** The shallow HOME's `.local/bin` (a symlink to the real one) is put first on `PATH`, so Claude Code's native-install diagnostic stays quiet under a shallow HOME.
 
 ```bash
