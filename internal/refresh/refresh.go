@@ -22,6 +22,10 @@ const maxErrorBodySize = 64 * 1024 // 64KB
 // DefaultRefreshThreshold is the time before expiry to trigger a refresh.
 const DefaultRefreshThreshold = 10 * time.Minute
 
+// errSkipProvider marks a provider that has no refresh to perform, so the
+// orchestration returns success without touching the vault.
+var errSkipProvider = errors.New("no refresh for provider")
+
 // ShouldRefresh determines if a profile needs refreshing.
 func ShouldRefresh(h *health.ProfileHealth, threshold time.Duration) bool {
 	if h == nil || h.TokenExpiresAt.IsZero() {
@@ -32,8 +36,10 @@ func ShouldRefresh(h *health.ProfileHealth, threshold time.Duration) bool {
 		threshold = DefaultRefreshThreshold
 	}
 
-	ttl := time.Until(h.TokenExpiresAt)
-	return ttl > 0 && ttl < threshold
+	// An already-expired token is still renewable: the refresh token outlives
+	// the access token it mints. Skipping it here abandoned the profile for
+	// good, because nothing else in the daemon ever retried it.
+	return time.Until(h.TokenExpiresAt) < threshold
 }
 
 // RefreshProfile orchestrates the refresh for a specific provider/profile.
@@ -44,6 +50,17 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 	// IMPORTANT: Capture a snapshot first, then verify it matches the target profile.
 	// This avoids a race where the active profile changes between ActiveProfile()
 	// and the snapshot read, which could otherwise overwrite a newly-activated profile.
+	// Codex rotates refresh tokens outside caam: the Codex CLI refreshes the
+	// file it runs against, leaving the vault snapshot holding a consumed
+	// token. Adopt the newest copy of this account before reading a token from
+	// the vault, and do it before the snapshot below so the freshly minted
+	// token still propagates back to the live files.
+	if provider == "codex" {
+		if _, err := ReconcileCodexVault(vault, profile); err != nil {
+			return fmt.Errorf("reconcile vault: %w", err)
+		}
+	}
+
 	isActive := false
 	var preRefreshState map[string][]byte
 
@@ -57,19 +74,35 @@ func RefreshProfile(ctx context.Context, provider, profile string, vault *authfi
 
 	vaultPath := vault.ProfilePath(provider, profile)
 
-	var err error
-	switch provider {
-	case "claude":
-		err = refreshClaude(ctx, vaultPath)
-	case "codex":
-		err = refreshCodex(ctx, vaultPath)
-	case "gemini":
-		err = refreshGemini(ctx, provider, profile, store, vaultPath)
-	case "opencode", "cursor":
-		// Token refresh not yet supported for these providers
+	attempt := func() error {
+		switch provider {
+		case "claude":
+			return refreshClaude(ctx, vaultPath)
+		case "codex":
+			return refreshCodex(ctx, vault, profile, vaultPath)
+		case "gemini":
+			return refreshGemini(ctx, provider, profile, store, vaultPath)
+		case "opencode", "cursor":
+			// Token refresh not yet supported for these providers
+			return errSkipProvider
+		default:
+			return &UnsupportedError{Provider: provider, Reason: "provider not supported"}
+		}
+	}
+
+	err := attempt()
+	if errors.Is(err, errSkipProvider) {
 		return nil
-	default:
-		return &UnsupportedError{Provider: provider, Reason: "provider not supported"}
+	}
+
+	// A reuse rejection means someone else rotated this token, possibly while
+	// our own request was in flight. Adopt whatever they wrote and try once
+	// more before asking the user to re-authenticate.
+	if err != nil && errors.Is(err, ErrRefreshTokenReused) && provider == "codex" {
+		adopted, rErr := ReconcileCodexVault(vault, profile)
+		if rErr == nil && adopted {
+			err = attempt()
+		}
 	}
 
 	if err != nil {
@@ -113,7 +146,7 @@ func refreshClaude(ctx context.Context, vaultPath string) error {
 	}
 }
 
-func refreshCodex(ctx context.Context, vaultPath string) error {
+func refreshCodex(ctx context.Context, vault *authfile.Vault, profile, vaultPath string) error {
 	authPath := filepath.Join(vaultPath, "auth.json")
 
 	refreshToken, err := getRefreshTokenFromJSON(authPath)
@@ -121,8 +154,19 @@ func refreshCodex(ctx context.Context, vaultPath string) error {
 		return fmt.Errorf("read refresh token: %w", err)
 	}
 
+	// Never present a token the provider already rejected as consumed: reuse
+	// detection can revoke the whole family, including a live session that
+	// still works. The record is dropped as soon as the vault holds a
+	// different token.
+	if isQuarantined(vault, profile, refreshToken) {
+		return ErrRefreshTokenReused
+	}
+
 	resp, err := RefreshCodexToken(ctx, refreshToken)
 	if err != nil {
+		if errors.Is(err, ErrRefreshTokenReused) {
+			markQuarantine(vault, profile, refreshToken)
+		}
 		return fmt.Errorf("refresh api: %w", err)
 	}
 

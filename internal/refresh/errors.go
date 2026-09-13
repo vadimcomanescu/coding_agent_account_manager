@@ -21,7 +21,9 @@ var ErrUnsupported = errors.New("refresh unsupported")
 // restored after a newer refresh already consumed the token, or the Codex CLI
 // refreshing tokens in the background while CAAM holds an older copy.
 //
-// The only recovery is to re-authenticate: 'caam login codex <profile>'.
+// Recovery is tried before this surfaces: RefreshProfile adopts the freshest
+// copy of the account on disk and refreshes again. Reaching the user means no
+// such copy exists, and 'caam login codex <profile>' is the remaining step.
 var ErrRefreshTokenReused = errors.New("refresh token reused")
 
 // UnsupportedError is returned when refresh cannot be performed for a provider
@@ -63,7 +65,8 @@ func (e *RefreshTokenReusedError) Error() string {
 	loginCmd := fmt.Sprintf("caam login %s %s", e.Provider, e.Profile)
 	return fmt.Sprintf(
 		"%s/%s: refresh token has already been used (refresh_token_reused). "+
-			"Another process (Codex CLI or a parallel CAAM refresh) consumed the token. "+
+			"Another process (Codex CLI or a parallel CAAM refresh) consumed the token, "+
+			"and no fresher copy of this account was found on disk. "+
 			"Re-authenticate with: %s",
 		e.Provider, e.Profile, loginCmd)
 }

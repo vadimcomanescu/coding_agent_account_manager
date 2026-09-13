@@ -57,13 +57,14 @@ func TestShouldRefresh_Expiring(t *testing.T) {
 }
 
 func TestShouldRefresh_AlreadyExpired(t *testing.T) {
-	// Token already expired - should return false (ttl <= 0)
+	// Token already expired - still renewable, because the refresh token
+	// outlives the access token it mints.
 	h := &health.ProfileHealth{
 		TokenExpiresAt: time.Now().Add(-5 * time.Minute),
 	}
 	result := ShouldRefresh(h, 10*time.Minute)
-	if result {
-		t.Errorf("ShouldRefresh with expired token = true, want false")
+	if !result {
+		t.Errorf("ShouldRefresh with expired token = false, want true")
 	}
 }
 
