@@ -167,7 +167,7 @@ func (u *UsageInfo) AvailabilityScore() int {
 // An empty model means "unknown", and every scoped window is then taken into
 // account at its worst.
 func (u *UsageInfo) AvailabilityScoreForModel(model string) int {
-	if u == nil || u.Error != "" {
+	if u == nil || u.Error != "" || u.isSpentForModel(model) {
 		return 0
 	}
 
@@ -194,6 +194,28 @@ func (u *UsageInfo) AvailabilityScoreForModel(model string) int {
 		return 0
 	}
 	return int(score)
+}
+
+// isSpentForModel reports whether a window that constrains work on model is at
+// its cap and has not reset: such an account can run nothing until it does, so
+// it is no candidate however idle its other windows are. A spent model-scoped
+// window counts only when the model is known, since other work still runs. An
+// account with credits keeps working past a window.
+func (u *UsageInfo) isSpentForModel(model string) bool {
+	if u.Credits != nil && (u.Credits.Unlimited || u.Credits.HasCredits) {
+		return false
+	}
+	windows := []*UsageWindow{u.PrimaryWindow, u.SecondaryWindow}
+	if model != "" {
+		windows = append(windows, u.premiumWindows(model)...)
+	}
+	now := time.Now()
+	for _, w := range windows {
+		if w != nil && windowUtilization(w) >= 1 && (w.ResetsAt.IsZero() || w.ResetsAt.After(now)) {
+			return true
+		}
+	}
+	return false
 }
 
 // premiumWindows returns the per-model windows that constrain work on model —

@@ -395,6 +395,50 @@ func TestCachedRowsAreNotOfferedAsBest(t *testing.T) {
 	}
 }
 
+// TestSpentAccountIsNotOfferedAsBest: when every account is past the
+// threshold, the fallback names none rather than one whose weekly window is
+// spent, which a caller would start work under only to see it refused.
+func TestSpentAccountIsNotOfferedAsBest(t *testing.T) {
+	rows := []usage.ProfileUsage{
+		{Provider: "claude", ProfileName: "spent", Usage: &usage.UsageInfo{
+			Provider: "claude", FetchedAt: time.Now(),
+			PrimaryWindow:   &usage.UsageWindow{Utilization: 0},
+			SecondaryWindow: &usage.UsageWindow{Utilization: 1, ResetsAt: time.Now().Add(10 * time.Hour)},
+		}},
+	}
+	var b strings.Builder
+	if err := renderBestProfile(&b, "json", rows, 0.8, ""); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(b.String()) != "null" {
+		t.Errorf("best profile = %q, want null", b.String())
+	}
+}
+
+// TestBestRanksRowsItself: 2026-10-12, `caam limits claude --source shallow
+// --best --format json` named the alphabetically first account, whose weekly
+// window was spent, over one with room, because those rows arrive unsorted.
+func TestBestRanksRowsItself(t *testing.T) {
+	rows := []usage.ProfileUsage{
+		{Provider: "claude", ProfileName: "a-spent", Usage: &usage.UsageInfo{
+			Provider: "claude", FetchedAt: time.Now(),
+			SecondaryWindow: &usage.UsageWindow{Utilization: 1, ResetsAt: time.Now().Add(10 * time.Hour)},
+		}},
+		{Provider: "claude", ProfileName: "b-room", Usage: &usage.UsageInfo{
+			Provider: "claude", FetchedAt: time.Now(),
+			PrimaryWindow:   &usage.UsageWindow{Utilization: 0.22},
+			SecondaryWindow: &usage.UsageWindow{Utilization: 0.97, ResetsAt: time.Now().Add(50 * time.Hour)},
+		}},
+	}
+	var b strings.Builder
+	if err := renderBestProfile(&b, "json", rows, 0.8, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(b.String(), `"profile_name": "b-room"`) {
+		t.Errorf("best profile = %q, want b-room", b.String())
+	}
+}
+
 func itoaMillis(t time.Time) string {
 	return strconv.FormatInt(t.UnixMilli(), 10)
 }

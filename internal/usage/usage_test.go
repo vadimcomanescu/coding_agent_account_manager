@@ -45,7 +45,33 @@ func TestUsageInfo_AvailabilityScore(t *testing.T) {
 			info: &UsageInfo{
 				PrimaryWindow: &UsageWindow{Utilization: 1.0},
 			},
-			expected: 50, // 100 - 50*1.0 = 50
+			expected: 0, // a spent window runs nothing until it resets
+		},
+		{
+			// 2026-10-12: an idle account whose weekly window was spent scored 75
+			// and beat one at 19% and 96% with room left (66), so caam limits
+			// --best named an account that could run nothing.
+			name: "weekly window spent, primary idle",
+			info: &UsageInfo{
+				PrimaryWindow:   &UsageWindow{Utilization: 0},
+				SecondaryWindow: &UsageWindow{Utilization: 1.0, ResetsAt: time.Now().Add(10 * time.Hour)},
+			},
+			expected: 0,
+		},
+		{
+			name: "weekly window at 100% whose reset has passed",
+			info: &UsageInfo{
+				SecondaryWindow: &UsageWindow{Utilization: 1.0, ResetsAt: time.Now().Add(-time.Minute)},
+			},
+			expected: 75,
+		},
+		{
+			name: "spent window with credits left",
+			info: &UsageInfo{
+				PrimaryWindow: &UsageWindow{Utilization: 1.0},
+				Credits:       &CreditInfo{HasCredits: true},
+			},
+			expected: 50,
 		},
 		{
 			name: "all windows at 50%",

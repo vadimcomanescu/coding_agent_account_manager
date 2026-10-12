@@ -533,6 +533,12 @@ func formatBurnRate(tokensPerHour float64) string {
 }
 
 func renderBestProfile(w io.Writer, format string, results []usage.ProfileUsage, threshold float64, model string) error {
+	// Ranked here, since a caller's rows can arrive in profile-name order (a
+	// JSON read of shallow profiles is never sorted), and the first row is
+	// the fallback below.
+	results = append([]usage.ProfileUsage(nil), results...)
+	sortResultsForModel(results, model)
+
 	// Filter to profiles that are available
 	var available []usage.ProfileUsage
 	for _, r := range results {
@@ -542,8 +548,10 @@ func renderBestProfile(w io.Writer, format string, results []usage.ProfileUsage,
 	}
 
 	if len(available) == 0 {
-		// Fall back to best score even if above threshold
-		if len(results) > 0 && results[0].Usage != nil && results[0].Usage.Error == "" {
+		// Fall back to best score even if above threshold, but never to an
+		// account with a spent window: it can run nothing.
+		if len(results) > 0 && results[0].Usage != nil && results[0].Usage.Error == "" &&
+			results[0].Usage.AvailabilityScoreForModel(model) > 0 {
 			available = results[:1]
 		}
 	}
