@@ -1,0 +1,196 @@
+# Save an isolated Claude login to the vault
+
+`caam backup claude <new-vault-name> --from-profile <isolated-name>` saves a
+registered isolated OAuth login as a **new vault entry**, without clearing,
+activating, or refreshing the currently active Claude login. Agents using that
+live login may keep running. This is the bridge requested in issue #125.
+
+`caam profile backup claude <isolated-name> [--as <new-vault-name>]` uses the same
+locked source capture and atomic vault publication. There is no second store or
+separate credential-import implementation behind these two interfaces.
+
+## Workflow
+
+```sh
+caam profile add claude second
+caam exec claude second
+# Inside the isolated Claude session: /login, then /exit.
+
+caam backup claude second-snapshot --from-profile second
+# Equivalent:
+# caam profile backup claude second --as second-snapshot
+```
+
+The destination is `vault/claude/second-snapshot/`. The source profile remains
+in the isolated store, unchanged. No credential files or `meta.json` need to be
+assembled manually. The destination name may equal the isolated source name
+provided it is not already in the vault; the normal listing can then show it
+as `vault+iso`. With `caam profile backup`, the source name is the default vault
+name when `--as` is omitted.
+
+Only when you intend to change the live account, activate the saved entry:
+
+```sh
+caam activate claude second-snapshot
+```
+
+Activation uses the normal vault switch/restore path. The source paths recorded
+in metadata are provenance, **not** restore destinations.
+
+## Which files are saved?
+
+The authoritative source is the registered profile's selected Claude config
+directory. Existing authentication in `xdg_config/claude-code/` takes precedence,
+as it does for `caam exec`. If XDG has no credential cache or alternate-auth
+settings, a legacy-only login under `home/.claude/` can also be saved. No migration
+or manual file copying is needed. An empty, malformed, expired, or incomplete
+XDG credential still selects XDG and cannot be rescued by a legacy login.
+
+XDG precedence does not resolve two different accounts. As with `caam exec`,
+if both layouts contain authentication and their known account IDs conflict,
+backup fails before vault preparation. A helper or environment credential can
+make the legacy layout participate in this check even without a token file.
+Identity-only legacy state is not a login and does not block a valid XDG account.
+Matching or unknown IDs never authorize copying legacy files into an XDG
+snapshot. Resolve a conflicting source explicitly; backup does not repair or
+overwrite either account, and its error does not print the IDs or credentials.
+
+The snapshot includes `.credentials.json`, `.claude.json`, and, when present,
+`settings.json` and `auth.json`, from that one source. For a legacy login,
+`home/.claude/.claude.json` takes precedence; only when it is absent does
+`home/.claude.json` supply the account state. A malformed nested file never falls
+back to the home-level copy. Identity-only XDG state and shared XDG workflow
+settings are not mixed into a legacy snapshot. Neither source uses the host's
+login, Desktop cache, or keychain. Source symlinks remain unsupported.
+
+Vault metadata records `source_config_dir` and the actual `original_paths`,
+including a home-level legacy state file when used. These remain provenance,
+not activation destinations; activation uses the ordinary live fileset.
+
+A complete OAuth credential (access and refresh tokens) and an account identity
+in `.claude.json` are required. Thus a credentials-only `caam auth import` profile
+with a stub `.claude.json` is not silently treated as a completed login. Finish
+`/login` in the isolated profile before saving it. The registered profile must
+also explicitly select `auth_mode: oauth`. An API-key, unknown-mode, or
+mode-less profile is rejected before its credential files are read, even if
+it retains a complete OAuth cache from an earlier login. Create and authenticate
+an OAuth profile rather than relabeling another mode's cached credentials.
+
+The captured `settings.json` and `.claude.json` must also select that stored
+OAuth login. A helper, another API key/token, a named Anthropic profile,
+federation settings, an enabled cloud-provider selector, a config-directory or
+API-endpoint override, custom authentication headers, or a non-subscription
+`forceLoginMethod` causes the import to fail before vault preparation. These
+settings can override a complete cached OAuth login even when the registered
+profile still says `auth_mode: oauth`. Relevant selectors must have the expected
+string types; malformed or ambiguous selections fail closed. The importer never
+executes helpers, prints their values, refreshes tokens, or silently strips the
+settings to manufacture a different login.
+
+Ordinary workflow settings and other providers' environment variables remain
+unchanged. Empty overrides and explicitly disabled cloud switches (`0`,
+`false`, `no`, or `off`, case-insensitively) are allowed. Environment selector
+names are checked case-insensitively so a snapshot cannot select a different
+account when moved to Windows. These checks concern the saved profile files,
+not external project/managed policy or the caller's ambient credentials.
+
+The normal vault snapshot engine validates credentials and settings, checks
+conflicting identity evidence, generates identity metadata, and writes private
+files. The importer records the actual isolated source paths and publishes the
+entire prepared snapshot atomically. Credential and settings read limits match
+the existing vault backup limits. Normal activation retains its existing
+account-settings policy rather than blindly replacing shared host settings.
+
+## Failure and concurrency behavior
+
+Existing vault names are never overwritten, even when the destination is an
+empty directory or appears during preparation. Choose another positional vault
+name (or use `--as` with `caam profile backup`); there is deliberately no
+force-overwrite option for isolated imports. This prevents an old isolated copy
+from replacing a vault credential that has since rotated.
+
+An explicitly empty or whitespace-only `--from-profile` is an error, not a
+request to fall back to the live login. Unsupported tools and invalid source
+or destination names also fail without probing the live account.
+
+Missing required files, malformed JSON, incomplete credentials, conflicting
+account identity, symlinked source files/directories, redirected profile metadata,
+and a locked isolated session fail before publication. The isolated session must
+be stopped, but unrelated live Claude sessions do not need to stop. A stale lock
+must be resolved explicitly through the normal profile-lock workflow; these
+commands do not remove it.
+
+The profile store holds its cross-process mutation lock throughout capture and
+publication. The importer also checks source file identities and bytes, absent
+optional files, profile metadata, directory identities, and the isolated session
+lock again before publication. Legacy imports also guard the absent XDG
+credentials/directories and the absent nested legacy state that selected their
+source. An XDG login or nested state appearing during preparation aborts the
+import rather than publishing an account no longer selected for execution.
+XDG imports likewise capture the legacy layout as a read-only guard, including
+absent directories/files and the home-level state fallback. A legacy login,
+identity, helper, or directory change during preparation also aborts publication.
+Legacy guard files are never exported into the selected XDG vault snapshot.
+An observed login, token-refresh, or directory
+change causes an error with no new vault entry. Existing source credentials and
+vault entries are left intact. Native writers that bypass CAAM's locking still
+require a quiescent isolated source: finish login/refresh before taking its
+snapshot.
+
+## OAuth refresh warning
+
+A snapshot is **not a second independent login**. The isolated copy and vault
+copy initially contain the same OAuth grant. Refreshing either can make the
+other copy stale or invalidate its refresh token. Neither command exchanges or
+refreshes tokens, including for validation, or promises to keep the two copies
+synchronized.
+
+After saving, keep the isolated session stopped while using the vault copy.
+Do not resume the old isolated copy after the vault/live account has refreshed;
+authenticate independently for concurrent use. To capture a later deliberately
+completed isolated login, use another new vault name. For ordinary switching,
+continue using `caam activate`, whose normal preservation logic handles outgoing
+live credentials.
+
+## Automation and command distinctions
+
+```sh
+caam backup claude second-snapshot --from-profile second --json
+# Equivalent:
+caam profile backup claude second --as second-snapshot --json
+```
+
+Both isolated interfaces emit the same JSON fields: `success`, `tool`, `profile`,
+`source_profile`, the resulting vault `path`, and refresh warnings. Runtime
+failures return a nonzero status with one JSON `error` result, without appending
+Cobra usage or duplicate stderr errors; credentials are never printed. They
+bypass startup token warnings and data migration so saving an isolated account
+does not incidentally probe or mirror the live keychain.
+
+`caam backup` **without** `--from-profile` retains its normal native-login backup
+behavior. `caam auth import` creates an isolated profile, not a vault entry.
+`caam backup --from-profile` and `caam profile backup` create vault entries from
+existing isolated Claude logins. They currently support Claude OAuth profiles
+only.
+
+## Publication and storage errors
+
+On Unix, the isolated importer flushes every prepared credential/settings file,
+metadata, and the prepared directory before publishing. For a newly created
+vault, it also flushes each new destination directory and the existing ancestor
+that contains it. Source-generation checks run again after these potentially
+slow flushes. Publication still uses the existing atomic no-replace rename, then
+flushes the destination directory before reporting success.
+
+A preparation/flush failure before the rename publishes no new entry. An error
+from the final directory flush is different: the complete snapshot has already
+been published and is retained. The command returns a nonzero exit status and
+reports its path; JSON includes `success: false`, `published: true`, `path`, and
+`error`. Inspect that entry before retrying. Do not automatically delete it or
+retry under another name, since another process may already be using it. Normal
+successful isolated imports also include `published: true`.
+
+These flushes use the filesystem's durability facilities, not an independent
+backup device or a guarantee against failing hardware. Windows retains its
+existing atomic no-replace publication and writer-side file flushes; the Unix
+directory-flush protocol does not add a Windows power-loss guarantee.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -159,8 +160,15 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Initialize dependencies
-	vaultInst := authfile.NewVault(authfile.DefaultVaultPath())
-	healthStoreInst := health.NewStorage(health.DefaultHealthPath())
+	vaultInst := vault
+	if vaultInst == nil {
+		vaultInst = authfile.NewVault(authfile.DefaultVaultPath())
+	}
+	healthStoreInst := healthStore
+	if healthStoreInst == nil {
+		healthStoreInst = health.NewStorage(filepath.Join(filepath.Dir(vaultInst.BasePath()), "health.json"))
+	}
+	healthStoreInst.SetVaultPath(vaultInst.BasePath())
 
 	// List profiles
 	profiles, err := vaultInst.List(provider)
@@ -212,15 +220,23 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	var usageMap map[string]*usage.UsageInfo
 
 	if !noFetch && (provider == "claude" || provider == "codex") {
-		credentials, err := usage.LoadProfileCredentials(authfile.DefaultVaultPath(), provider)
+		// Keep a failed requested read distinct from --no-fetch. An empty map
+		// must not disable quota checks and recommend an unmeasured account.
+		usageMap = make(map[string]*usage.UsageInfo)
+		credentials, err := usage.LoadProfileCredentials(vaultInst.BasePath(), provider)
 		if err == nil && len(credentials) > 0 {
+			selectedCredentials := make(map[string]string, len(userProfiles))
+			for _, name := range userProfiles {
+				if token := credentials[name]; token != "" {
+					selectedCredentials[name] = token
+				}
+			}
 			fetchCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
 			fetcher := usage.NewMultiProfileFetcher()
-			usageResults = fetcher.FetchAllProfiles(fetchCtx, provider, credentials)
+			usageResults = fetcher.FetchAllProfiles(fetchCtx, provider, selectedCredentials)
 
-			usageMap = make(map[string]*usage.UsageInfo)
 			for _, r := range usageResults {
 				if r.Usage != nil {
 					usageMap[r.ProfileName] = r.Usage
@@ -236,10 +252,11 @@ func runPrecheckCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	selector := rotation.NewSelector(algorithm, healthStoreInst, db)
+	selector.SetVaultPath(vaultInst.BasePath())
 	applyRotationPolicy(selector, spmCfg, policyOverride)
 
-	// Set usage data for smart selection
-	if len(usageMap) > 0 {
+	// A requested quota read constrains every selection algorithm.
+	if usageMap != nil {
 		rotationUsage := make(map[string]*rotation.UsageInfo)
 		for name, info := range usageMap {
 			rotationUsage[name] = toRotationUsageInfo(name, info, model)
@@ -302,9 +319,21 @@ func buildPrecheckResult(
 	now := time.Now()
 	var totalUsage int
 	var usageCount int
+	engine := prediction.NewPredictionEngine(prediction.WithModel(model))
+	var predictions []*prediction.Prediction
 
 	// Process each profile
 	for _, profileName := range profiles {
+		var pred *prediction.Prediction
+		if usageMap != nil {
+			// Keep every monitored profile, including missing measurements and
+			// known quota without a burn rate. Dropping either makes an "all
+			// profiles" warning describe only the forecastable subset.
+			pred = engine.Predict(context.Background(), usageMap[profileName])
+			pred.Profile = profileName
+			pred.Provider = provider
+			predictions = append(predictions, pred)
+		}
 		rec := ProfileRecommendation{
 			Name:       profileName,
 			PoolStatus: "unknown",
@@ -312,7 +341,7 @@ func buildPrecheckResult(
 
 		// Get usage data
 		if usageMap != nil {
-			if info, ok := usageMap[profileName]; ok && info != nil {
+			if info, ok := usageMap[profileName]; ok && info.NumericQuotaKnown() {
 				rec.AvailScore = info.AvailabilityScoreForModel(model)
 				if scoped := info.ScopedLimit(model); scoped != nil {
 					rec.ScopedLimit = formatScopedLimit(scoped)
@@ -329,15 +358,21 @@ func buildPrecheckResult(
 						})
 					}
 				}
-				if info.PrimaryWindow != nil {
-					rec.UsagePercent = info.PrimaryWindow.UsedPercent
+				general := info.PrimaryWindow
+				if general == nil {
+					general = info.SecondaryWindow
+				}
+				if general != nil && !general.Unmeasured && !general.Rolled {
+					rec.UsagePercent = max(general.UsedPercent, int(general.Utilization*100))
 					totalUsage += rec.UsagePercent
 					usageCount++
 				}
-				if info.TimeToDepletion() > 0 {
-					rec.TimeToDepletion = formatDurationShort(info.TimeToDepletion())
-				}
 			}
+		}
+		// An unscoped or stale estimate on the input row is not a forecast
+		// for this session's model. Only use the validated prediction above.
+		if pred != nil && pred.IsValid() && pred.TimeToDepletion > 0 {
+			rec.TimeToDepletion = formatDurationShort(pred.TimeToDepletion)
 		}
 
 		// Get health status
@@ -361,6 +396,15 @@ func buildPrecheckResult(
 						rec.TokenExpiry = "expired"
 					}
 				}
+				signals := health.CredentialSignals(h, health.DefaultHealthConfig())
+				if signals.LoginRequired != nil && *signals.LoginRequired {
+					result.Alerts = append(result.Alerts, PrecheckAlert{
+						Type: "login_required", Profile: profileName, Urgency: "critical",
+						Message: "Credential requires a new login before it can be used",
+						Action:  health.FormatRecommendation(provider, profileName, h),
+					})
+					continue // Never advertise an unusable account as a ready backup.
+				}
 			}
 		}
 
@@ -383,6 +427,21 @@ func buildPrecheckResult(
 					summary.CooldownCount++
 					continue // Don't add to backups
 				}
+			}
+		}
+
+		// Selection can be nil when every usable account is in cooldown. Check
+		// quota independently so a failed or spent account cannot then acquire
+		// the default zero score and be advertised as a ready backup.
+		if usageMap != nil {
+			data := map[string]*rotation.UsageInfo{profileName: toRotationUsageInfo(profileName, usageMap[profileName], model)}
+			if _, err := rotation.QuotaCandidates(provider, []string{profileName}, data); err != nil {
+				result.Alerts = append(result.Alerts, PrecheckAlert{
+					Type: "quota_unavailable", Profile: profileName, Urgency: "high",
+					Message: "No measured available quota",
+					Action:  "refresh usage data or choose a profile with available quota",
+				})
+				continue
 			}
 		}
 
@@ -425,22 +484,7 @@ func buildPrecheckResult(
 	result.Summary = summary
 
 	// Generate alerts using prediction package
-	if len(usageMap) > 0 {
-		// Convert usage map to predictions
-		var usageInfos []*usage.UsageInfo
-		for _, info := range usageMap {
-			usageInfos = append(usageInfos, info)
-		}
-
-		engine := prediction.NewPredictionEngine()
-		var predictions []*prediction.Prediction
-		for _, info := range usageInfos {
-			pred := engine.Predict(context.Background(), info)
-			if pred != nil && pred.Error == "" {
-				predictions = append(predictions, pred)
-			}
-		}
-
+	if len(predictions) > 0 {
 		alertOpts := prediction.DefaultAlertOptions()
 		alerts := prediction.GenerateAlerts(predictions, alertOpts)
 		for _, a := range alerts {

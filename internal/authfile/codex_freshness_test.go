@@ -214,6 +214,156 @@ func TestCodexRestoreFreshnessGuard(t *testing.T) {
 	})
 }
 
+func TestCodexRestoreDoesNotAttributeUnusedOAuthFreshness(t *testing.T) {
+	old := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct{ name, liveKey, targetKey string }{
+		{"oauth-to-key", "", "synthetic-target-key"},
+		{"key-to-oauth", "synthetic-live-key", ""},
+		{"different-key", "synthetic-live-key", "synthetic-target-key"},
+		{"same-key", "synthetic-same-key", "synthetic-same-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			live := []byte(selectedSwitchFiles(t, "codex", tc.liveKey, "shared@example.test", old.Add(time.Hour))["auth.json"])
+			target := []byte(selectedSwitchFiles(t, "codex", tc.targetKey, "shared@example.test", old)["auth.json"])
+			v, fs, livePath := setupCodexRestore(t, target, live)
+			if CodexLiveIsNewer(livePath, v.BackupPath("codex", "acct", "auth.json")) {
+				t.Fatal("unused OAuth timestamps activated the renewal/replay guard")
+			}
+			if err := v.Restore(fs, "acct"); err != nil {
+				t.Fatal(err)
+			}
+			if got := readBytes(t, livePath); string(got) != string(target) {
+				t.Fatal("restore did not select the requested credential")
+			}
+		})
+	}
+}
+
+func TestCodexRestoreFreshnessRequiresConsistentWorkspace(t *testing.T) {
+	type identity struct {
+		accountID       string
+		jwtAccountID    string
+		accessAccountID string
+		accessSubject   string
+	}
+	makeAuth := func(t *testing.T, account identity, issued time.Time) []byte {
+		t.Helper()
+		makeJWT := func(workspace, subject string) string {
+			claims := map[string]interface{}{
+				"email": "shared@example.com",
+				"sub":   subject,
+				"iat":   issued.Unix(),
+			}
+			if workspace != "" {
+				claims["https://api.openai.com/auth"] = map[string]interface{}{
+					"chatgpt_account_id": workspace,
+				}
+			}
+			payload, err := json.Marshal(claims)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+		}
+		accessWorkspace := account.jwtAccountID
+		if account.accessAccountID != "" {
+			accessWorkspace = account.accessAccountID
+		}
+		accessSubject := "shared-subject"
+		if account.accessSubject != "" {
+			accessSubject = account.accessSubject
+		}
+		tokens := map[string]interface{}{
+			"id_token":      makeJWT(account.jwtAccountID, "shared-subject"),
+			"access_token":  makeJWT(accessWorkspace, accessSubject),
+			"refresh_token": "rt-" + issued.Format("150405"),
+		}
+		if account.accountID != "" {
+			tokens["account_id"] = account.accountID
+		}
+		data, err := json.Marshal(map[string]interface{}{
+			"tokens":       tokens,
+			"last_refresh": issued.Format(time.RFC3339),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	for _, tc := range []struct {
+		name         string
+		snapshot     identity
+		live         identity
+		wantKeepLive bool
+	}{
+		{
+			name:         "same workspace keeps newer live tokens",
+			snapshot:     identity{accountID: "workspace-a", jwtAccountID: "workspace-a"},
+			live:         identity{accountID: "workspace-a", jwtAccountID: "workspace-a"},
+			wantKeepLive: true,
+		},
+		{
+			name:     "different explicit workspaces despite shared subject and email",
+			snapshot: identity{accountID: "workspace-a"},
+			live:     identity{accountID: "workspace-b"},
+		},
+		{
+			name:     "different JWT workspaces despite shared subject and email",
+			snapshot: identity{jwtAccountID: "workspace-a"},
+			live:     identity{jwtAccountID: "workspace-b"},
+		},
+		{
+			name:     "live workspace missing",
+			snapshot: identity{accountID: "workspace-a", jwtAccountID: "workspace-a"},
+		},
+		{
+			name: "snapshot workspace missing",
+			live: identity{accountID: "workspace-a", jwtAccountID: "workspace-a"},
+		},
+		{
+			name:     "live explicit workspace disagrees with its JWT",
+			snapshot: identity{accountID: "workspace-a", jwtAccountID: "workspace-a"},
+			live:     identity{accountID: "workspace-a", jwtAccountID: "workspace-b"},
+		},
+		{
+			name:     "live ID and access tokens disagree on workspace",
+			snapshot: identity{jwtAccountID: "workspace-a"},
+			live:     identity{jwtAccountID: "workspace-a", accessAccountID: "workspace-b"},
+		},
+		{
+			name:     "live ID and access tokens disagree on subject",
+			snapshot: identity{jwtAccountID: "workspace-a"},
+			live:     identity{jwtAccountID: "workspace-a", accessSubject: "another-subject"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			older := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+			snapshot := makeAuth(t, tc.snapshot, older)
+			live := makeAuth(t, tc.live, older.Add(time.Hour))
+			v, fs, livePath := setupCodexRestore(t, snapshot, live)
+			snapshotPath := v.BackupPath("codex", "acct", "auth.json")
+
+			if got := CodexLiveIsNewer(livePath, snapshotPath); got != tc.wantKeepLive {
+				t.Errorf("CodexLiveIsNewer() = %v, want %v", got, tc.wantKeepLive)
+			}
+			if err := v.Restore(fs, "acct"); err != nil {
+				t.Fatalf("Restore() error = %v", err)
+			}
+			want := snapshot
+			if tc.wantKeepLive {
+				want = live
+			}
+			if got := readBytes(t, livePath); string(got) != string(want) {
+				t.Fatal("Restore retained the wrong account or token generation")
+			}
+			if got := readBytes(t, snapshotPath); string(got) != string(snapshot) {
+				t.Fatal("Restore changed the saved profile")
+			}
+		})
+	}
+}
+
 func TestCodexFreshness(t *testing.T) {
 	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 

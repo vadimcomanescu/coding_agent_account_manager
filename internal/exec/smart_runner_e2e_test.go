@@ -152,6 +152,7 @@ func TestSmartRunner_E2E(t *testing.T) {
 
 	opts := SmartRunnerOptions{
 		HandoffConfig: &cfg,
+		RetryConfig:   smartRetryPolicy(3, 0),
 		Vault:         vault,
 		DB:            db,
 		Rotation:      selector,
@@ -210,11 +211,34 @@ func TestSmartRunner_E2E(t *testing.T) {
 	}
 	assert.True(t, foundSwitch, "Did not notify about switch")
 
+	// The rate limit and the switch are part of the activity history.
+	limited, err := db.GetEvents("gemini", "active", time.Now().Add(-1*time.Hour), 10)
+	require.NoError(t, err)
+	foundLimit := false
+	for _, e := range limited {
+		if e.Type == caamdb.EventError && e.Details["reason"] == "rate_limit" {
+			foundLimit = true
+		}
+	}
+	assert.True(t, foundLimit, "rate limit not logged for the limited profile: %+v", limited)
+	switched, err := db.GetEvents("gemini", "backup", time.Now().Add(-1*time.Hour), 10)
+	require.NoError(t, err)
+	require.NotEmpty(t, switched)
+	assert.Equal(t, caamdb.EventSwitch, switched[0].Type)
+	assert.Equal(t, "active", switched[0].Details["from"])
+
 	// Check DB for Activation Event
+	// The profile also has the later rate-limit event, so look for the
+	// activation rather than assuming it is the newest.
 	activations, err := db.GetEvents("gemini", "active", time.Now().Add(-1*time.Hour), 10)
 	require.NoError(t, err)
-	assert.NotEmpty(t, activations, "Should have logged activation event")
-	assert.Equal(t, caamdb.EventActivate, activations[0].Type)
+	foundActivate := false
+	for _, e := range activations {
+		if e.Type == caamdb.EventActivate {
+			foundActivate = true
+		}
+	}
+	assert.True(t, foundActivate, "Should have logged activation event: %+v", activations)
 
 	// Check DB for Wrap Session
 	sessions, err := db.GetWrapSessions("gemini", time.Now().Add(-1*time.Hour), 10)

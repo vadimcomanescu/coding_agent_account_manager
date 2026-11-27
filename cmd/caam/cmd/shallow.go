@@ -8,11 +8,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	caamexec "github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
+	providerapi "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/spf13/cobra"
 )
@@ -23,7 +25,7 @@ import (
 //
 // "Shallow" because each profile shares everything with the user's real HOME
 // EXCEPT the auth-bearing files (.claude/.credentials.json + .credentials.lock,
-// .claude.json). See internal/shallow for the layout rationale.
+// .claude/settings.json, .claude.json). See internal/shallow for the layout rationale.
 
 // resolveShallowManager returns a shallow.Manager rooted at the path implied by
 // (in priority order): --base flag, $CAAM_SHALLOW_HOMES_DIR, $CAAM_HOME/shallow-homes,
@@ -54,6 +56,7 @@ Layout under ~/orch-homes/<name>/ (claude shown):
 
   .claude/.credentials.json       (real file — per-identity OAuth tokens)
   .claude/.credentials.lock       (real file — per-identity flock target)
+  .claude/settings.json           (real file — shared policy, private auth helpers)
   .claude.json                    (real file — Claude rewrites this on each run)
   .claude/projects, .claude/todos (symlinks → ~/.claude/projects, etc.)
   .bashrc, .gitconfig, .ssh, ...  (symlinks → ~/.bashrc, etc.)
@@ -295,6 +298,9 @@ func resolveVaultProvider(spec string) (provider, primary string, extras map[str
 		if st := filepath.Join(dir, ".claude.json"); fileIsRegular(st) {
 			claudeState = st
 		}
+		if settings := filepath.Join(dir, "settings.json"); fileIsRegular(settings) {
+			extras = map[string]string{".claude/settings.json": settings}
+		}
 	case "codex":
 		primary = filepath.Join(dir, "auth.json")
 		if _, err := os.Stat(primary); err != nil {
@@ -374,7 +380,7 @@ func shallowLoginState(mgr *shallow.Manager, name, home string) (provider string
 	}
 	loggedIn = shallowCredentialPresent(credPath)
 	if loggedIn && shallow.NormalizeProvider(provider) == "claude" {
-		identity = authfile.ClaudeIdentityLabel(authfile.ClaudeIdentityKeysFromFile(filepath.Join(home, ".claude.json")))
+		identity = authfile.ClaudeLoginLabel(filepath.Join(home, ".claude.json"))
 	}
 	return provider, loggedIn, identity
 }
@@ -553,15 +559,18 @@ to run anything else under the profile instead.
 Each spawn also backfills missing symlinks for user-installed skills
 (~/.claude/skills, ~/.codex/skills, ~/.gemini/skills) into the shallow
 profile, so spawned sessions see the same skill library as direct ones.
-Auth files stay real and private; nothing else is copied or overwritten.
+Auth files and mixed policy/auth configuration stay real and private.
 
 Each spawn additionally refreshes the SHARED configuration of the profile
 from your real HOME — the main lane is the source of truth for configuration:
 
-  claude  .claude.json preferences (theme, editor mode, notification channel),
+  claude  .claude/settings.json workflow policy, plus .claude.json preferences
+          (theme, editor mode, notification channel),
           user-scope mcpServers, and per-project trust / allowedTools / MCP
-          settings. Identity (oauthAccount), usage cache and session state are
-          never touched.
+          settings. Removed shared rules and approvals are removed here too.
+          Auth helpers, credential environment, identity (oauthAccount), usage
+          cache and session state stay private to the profile. The
+          claude_settings policy in caam's config controls sharing.
   codex   .codex/config.toml root settings and whole tables ([mcp_servers.*],
           [features], [skills], [hooks], [model_providers.*]). Each MCP server
           is replaced as one unit, so a stale command/args pair cannot survive
@@ -570,7 +579,9 @@ from your real HOME — the main lane is the source of truth for configuration:
           and cli_auth_credentials_store = "file" is re-enforced.
 
 Pass --no-sync-config to skip it, or run it on demand with
-'caam shallow-profile sync-config <name>'.
+'caam shallow-profile sync-config <name>'. Claude preparation errors stop the
+launch. Old links to shared Claude settings are made private even with
+--no-sync-config; --print-env remains read-only.
 
 An unknown name is an ERROR, not a new profile: a typo would otherwise become
 a fresh empty identity and a login prompt for the wrong account. The error
@@ -589,9 +600,14 @@ Examples:
   caam shallow-spawn codex-bob --reload-daemon -- codex
   caam shallow-spawn codex-bob --effort xhigh -- codex --model gpt-5.6-sol
 
-Use 'caam shallow-spawn <name> --print-env' to print the environment that
-WOULD be applied without executing anything (useful for shell wrappers). It is
-a strict dry run: it never creates a missing profile.
+Use 'caam shallow-spawn <name> --print-env' to print POSIX shell unset/export
+commands for the complete launch environment, including credential removals.
+Use --json for a data-only object with set/unset fields.
+Exporting never executes a child, repairs a profile, or refreshes shared policy.
+Unsafe Claude configuration must be repaired by a normal spawn before export.
+On shell-mode errors, stdout contains a failing command ('false') so eval cannot
+silently succeed with the parent identity. Check the command's exit status:
+  env_script=$(caam shallow-spawn alice --print-env) && eval "$env_script"
 
 --reload-daemon (codex only) mirrors 'caam activate/next': after the on-disk
 auth swap it SIGTERMs any running codex app-server/mcp-server daemon so the
@@ -603,20 +619,48 @@ codex command. Codex has no '--effort' CLI flag (that spelling is a Claude-ism);
 its knob is the config key 'model_reasoning_effort', so caam translates
 '--effort xhigh' into '-c model_reasoning_effort=xhigh' injected right after
 the codex binary (issue #63). Like --reload-daemon it is a shallow-spawn flag:
-place it BEFORE '--'; it errors when the spawned command is not codex.`,
-	Args: cobra.MinimumNArgs(1),
+place it BEFORE '--'; it errors when the spawned command is not codex.
+
+--claude-oauth-token-fd N explicitly authorizes a setup token for this launch
+only. On Unix, pass a dedicated inherited read descriptor numbered 3 or higher
+(for example, an anonymous pipe from your secret manager). CAAM consumes and
+closes it before executing Claude, preserving stdin for the session. The input
+must be one nonempty token of at most 16 KiB, optionally ending in LF or CRLF;
+the producer must close its write end. Pipe reads time out after five seconds.
+The token is placed only in this child's CLAUDE_CODE_OAUTH_TOKEN environment;
+CAAM never saves it, prints it, or adds it to command-line arguments.
+
+This flag requires a Claude profile and a direct claude command (the default
+or a path whose basename is claude). Shell/env wrappers, other providers, and
+--print-env are rejected. Native Windows handles are not Unix descriptors;
+this option is unsupported there (use CAAM inside WSL). Ambient OAuth tokens
+remain filtered, including from nested shallow launches for other providers.`,
+	Args: func(cmd *cobra.Command, args []string) error {
+		if err := cobra.MinimumNArgs(1)(cmd, args); err != nil {
+			if isEnvironmentExport(cmd) {
+				emitEvalFailure(cmd)
+			}
+			return err
+		}
+		return nil
+	},
 	RunE: runShallowSpawn,
 }
 
 func init() {
+	shallowSpawnCmd.SetFlagErrorFunc(environmentFlagError)
 	shallowSpawnCmd.Flags().String("base", "", "shallow profiles base dir")
-	shallowSpawnCmd.Flags().Bool("print-env", false, "print HOME=... assignments and exit (no exec)")
+	shallowSpawnCmd.Flags().Bool("print-env", false, "print safely quoted shell unset/export commands without changing the profile or executing a child")
+	shallowSpawnCmd.Flags().Bool("json", false, "with --print-env: print data-only environment changes with set and unset fields")
 	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 	shallowSpawnCmd.Flags().String("effort", "", "for codex: model reasoning effort (e.g. minimal|low|medium|high|xhigh), injected as '-c model_reasoning_effort=<effort>' since codex has no --effort flag")
-	shallowSpawnCmd.Flags().Bool("no-sync-config", false, "for claude: do not refresh shared preferences (theme, editor mode, notification channel, user/project MCP servers, project trust and tool approvals) in the profile's .claude.json from your real ~/.claude.json before exec")
+	shallowSpawnCmd.Flags().Bool("no-sync-config", false, "skip shared Claude/Codex policy refresh before exec; Claude settings must still be valid and private")
 	shallowSpawnCmd.Flags().Bool("create", false, "create the shallow profile (with EMPTY credentials) if it does not exist yet, then start the session; without this a name that does not exist is an error, so a typo cannot silently become a new identity")
 	shallowSpawnCmd.Flags().String("tool", "", "provider layout to use with --create: claude (default), codex, or agy. On an existing profile of a different provider it is an error, not a no-op.")
 	shallowSpawnCmd.Flags().Bool("allow-agent-view", false, "for claude: keep Claude Code's Agent View / background supervisor enabled instead of injecting CLAUDE_CODE_DISABLE_AGENT_VIEW=1 (opts back into Agent View, accepting that its cross-session supervisor daemon can bypass per-identity auth isolation — see issue #49)")
+	// Parse the descriptor ourselves: pflag's integer errors quote the supplied
+	// value, which could expose a token accidentally pasted in place of an FD.
+	shallowSpawnCmd.Flags().String("claude-oauth-token-fd", "", "for a direct Claude launch on Unix: consume a setup token from inherited read descriptor N (>=3), without storing or printing it")
 }
 
 // shallowProfileSyncConfigCmd reconciles a shallow profile's shared
@@ -637,9 +681,12 @@ block, after which codex refuses to parse its config at all
 
 What is refreshed, per provider:
 
-  claude (<home>/.claude.json)
-      preferences (theme, editor mode, notification channel, autoUpdates …),
-      user-scope mcpServers, and per-project trust / allowedTools / MCP settings
+  claude (<home>/.claude/settings.json and <home>/.claude.json)
+      workflow policy, preferences (theme, editor mode, notification channel,
+      autoUpdates …), user-scope mcpServers, and per-project trust / allowedTools
+      / MCP settings. Removed shared policy is removed from the profile too.
+      claude_settings.mode = "per-profile" skips shared policy refresh;
+      profile_keys and shared_env_keys customize the boundary.
 
   codex (<home>/.codex/config.toml)
       root settings (model, reasoning effort, personality, notify, …) and whole
@@ -649,17 +696,18 @@ What is refreshed, per provider:
 
 What is never touched:
 
-  claude   oauthAccount, usage caches, prompt history, per-project session state
+  claude   account helpers, credential environment, oauthAccount, usage caches,
+           prompt history, per-project session state
   codex    [hooks.state.*] (hook trust), [projects.*] (workspace trust),
            [notice.*] (dismissed notices), and auth.json
-  both     the profile's credentials, and any setting the real HOME does not
-           define — nothing is deleted
+  both     the profile's credentials
 
+Codex-only settings absent from the real HOME are retained, and
 cli_auth_credentials_store = "file" is re-enforced on every codex sync.
 
-Comments, key order and formatting are preserved: the edit is a structural
-splice, not a rewrite, so untouched regions stay byte-identical. Running it
-twice writes nothing the second time.
+Codex comments, key order and formatting are preserved by structural edits.
+Claude uses private JSON files. Running either sync twice writes nothing the
+second time. Malformed Claude policy blocks launch rather than being skipped.
 
 Examples:
   caam shallow-profile sync-config alice
@@ -885,10 +933,45 @@ func createShallowForSpawn(cmd *cobra.Command, mgr *shallow.Manager, name, tool 
 // unlike the host-wide activate/next path.
 var shallowCodexDaemonCheck = checkCodexDaemonScoped
 
-func runShallowSpawn(cmd *cobra.Command, args []string) error {
+func runShallowSpawn(cmd *cobra.Command, args []string) (runErr error) {
 	name := args[0]
 	rest := args[1:]
 	printEnv, _ := cmd.Flags().GetBool("print-env")
+	defer func() {
+		if printEnv && runErr != nil {
+			emitEvalFailure(cmd)
+		}
+	}()
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	if jsonOutput {
+		cmd.SilenceUsage = true
+		if !printEnv {
+			return fmt.Errorf("--json requires --print-env")
+		}
+	}
+	explicitToken := cmd.Flags().Changed("claude-oauth-token-fd")
+	tokenFD := -1
+	if explicitToken {
+		cmd.SilenceUsage = true
+		if printEnv {
+			return fmt.Errorf("--claude-oauth-token-fd cannot be combined with --print-env")
+		}
+		if !shallowTokenFDSupported {
+			return fmt.Errorf("--claude-oauth-token-fd requires Unix file descriptors; on Windows, run CAAM inside WSL")
+		}
+		rawFD, _ := cmd.Flags().GetString("claude-oauth-token-fd")
+		var err error
+		tokenFD, err = parseShallowTokenFD(rawFD)
+		if err != nil {
+			return err
+		}
+		// Authorize only the direct Claude invocation, never a generic shell or
+		// another provider running under a Claude HOME. Do this before --create
+		// can provision anything or a descriptor can be consumed.
+		if len(rest) > 0 && filepath.Base(rest[0]) != "claude" {
+			return fmt.Errorf("--claude-oauth-token-fd requires a direct claude command; shell wrappers and other commands are not supported")
+		}
+	}
 
 	mgr, err := resolveShallowManager(cmd)
 	if err != nil {
@@ -897,6 +980,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 
 	wantTool := strings.ToLower(strings.TrimSpace(mustString(cmd, "tool")))
 	createMissing, _ := cmd.Flags().GetBool("create")
+	if explicitToken && wantTool != "" && shallow.NormalizeProvider(wantTool) != "claude" {
+		return fmt.Errorf("--claude-oauth-token-fd requires a Claude shallow profile")
+	}
 
 	prof, err := mgr.Get(name)
 	if err != nil {
@@ -938,6 +1024,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if explicitToken && shallow.NormalizeProvider(provider) != "claude" {
+		return fmt.Errorf("--claude-oauth-token-fd requires a Claude shallow profile")
+	}
 	// --tool names the layout to create; on a profile that already exists it
 	// can only ever be a mistake, so say so rather than silently ignoring it
 	// and spawning the wrong provider's CLI.
@@ -952,29 +1041,44 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	allowAgentView, _ := cmd.Flags().GetBool("allow-agent-view")
 	_, disableAgentViewSet := os.LookupEnv("CLAUDE_CODE_DISABLE_AGENT_VIEW")
 	set, scrub := shallow.SpawnEnv(provider, prof.Path, name, allowAgentView, disableAgentViewSet)
+	// Apply one credential policy to both direct launches and shell exports.
+	// Inherited credentials and home/vault overrides cannot substitute the
+	// parent account for the selected shallow profile.
+	changes := providerapi.CredentialEnvironment(shallow.NormalizeProvider(provider), providerapi.AuthModeOAuth, set)
+	changes.Unset = append(changes.Unset, scrub...)
+	changes.Set["PATH"] = prependShallowLocalBin(os.Getenv("PATH"), prof.Path)
 
 	if printEnv {
-		// Print the variables that WOULD be set, as clean KEY=VALUE lines, with
-		// HOME and SHALLOW_PROFILE first for stable output and the rest sorted.
-		fmt.Fprintf(cmd.OutOrStdout(), "HOME=%s\n", set["HOME"])
-		fmt.Fprintf(cmd.OutOrStdout(), "SHALLOW_PROFILE=%s\n", set["SHALLOW_PROFILE"])
-		extra := make([]string, 0, len(set))
-		for k := range set {
-			if k == "HOME" || k == "SHALLOW_PROFILE" {
-				continue
+		// Exporting an unsafe HOME would let wrappers bypass normal spawn's
+		// repair guard. Inspect without modifying the profile or printing a
+		// partial environment; legacy layouts still require a normal spawn.
+		if shallow.NormalizeProvider(provider) == "claude" {
+			if err := mgr.ValidateClaudeKeychainBoundary(name); err != nil {
+				cmd.SilenceUsage = true
+				return fmt.Errorf("cannot use --print-env for %q: %w", name, err)
 			}
-			extra = append(extra, k)
+			if err := mgr.ValidateClaudeConfigBoundary(name); err != nil {
+				return fmt.Errorf("cannot use --print-env for %q: %w", name, err)
+			}
 		}
-		sort.Strings(extra)
-		for _, k := range extra {
-			fmt.Fprintf(cmd.OutOrStdout(), "%s=%s\n", k, set[k])
+		if jsonOutput {
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(changes)
 		}
-		return nil
+		return writeEnvironmentChanges(cmd.OutOrStdout(), changes, "export", false)
 	}
 
 	// Short form: no '-- <cmd>' means "open this profile's own provider CLI".
 	if len(rest) == 0 {
 		rest = []string{shallowSpawnHintBin(provider)}
+	}
+
+	// SECURITY (#130): upgrade legacy macOS Claude HOME layouts and fail
+	// closed on unsafe Keychain paths before any child process can start.
+	// This guard is mandatory even with --no-sync-config.
+	if shallow.NormalizeProvider(provider) == "claude" {
+		if err := mgr.RepairClaudeKeychainBoundary(name); err != nil {
+			return fmt.Errorf("prepare isolated Claude Keychain boundary for %q: %w", name, err)
+		}
 	}
 
 	// Skill-share repair (#56): user-installed skills (e.g. ~/.codex/skills
@@ -992,14 +1096,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 			len(created), map[bool]string{true: "y", false: "ies"}[len(created) == 1], name)
 	}
 
-	// Shared-configuration refresh (#93): a claude profile's .claude.json is a
-	// real, private file because it holds the login identity, but it also
-	// carries the operator's preferences and per-project approvals, which
-	// silently diverge from the real HOME after creation. Copy the allowlisted
-	// shared keys from the real ~/.claude.json into the profile before exec so
-	// the main lane stays the source of truth for configuration; identity,
-	// usage caches and session state stay the profile's own. Best-effort: a
-	// failure warns and never blocks the spawn.
+	// Refresh shared Claude settings and allowlisted legacy preferences before
+	// exec, while keeping account helpers and runtime state private. Invalid
+	// policy or a shared auth-bearing settings link must never reach the CLI.
 	//
 	// Codex has the same problem in a sharper form (#103): its config.toml is
 	// copied once at creation and never reconciled, so a real-home MCP entry
@@ -1023,10 +1122,17 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 			changed, serr = mgr.SyncCodexConfig(name)
 		}
 		if serr != nil {
+			if normProv == "claude" {
+				return fmt.Errorf("prepare Claude shallow profile %q: %w", name, serr)
+			}
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: could not refresh shared %s configuration in shallow profile %q: %v\n", label, name, serr)
 		} else if len(changed) > 0 {
 			fmt.Fprintf(cmd.ErrOrStderr(), "note: refreshed %d shared %s setting%s from your real HOME into shallow profile %q (--no-sync-config to skip)\n",
 				len(changed), label, map[bool]string{true: "", false: "s"}[len(changed) == 1], name)
+		}
+	} else if shallow.NormalizeProvider(provider) == "claude" {
+		if err := mgr.EnsureClaudeSettingsPrivate(name); err != nil {
+			return fmt.Errorf("prepare private Claude settings in %q: %w", name, err)
 		}
 	}
 
@@ -1061,31 +1167,51 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("lookup %q: %w", rest[0], err)
 	}
 
-	// Build environment: inherit, then apply the provider's overrides and scrub
-	// any inherited variables that could leak the real identity back in.
-	envMap := make(map[string]string, len(os.Environ())+len(set))
-	for _, e := range os.Environ() {
-		idx := strings.IndexByte(e, '=')
-		if idx <= 0 {
-			continue
+	var explicit map[string]string
+	if explicitToken {
+		// Read only after profile/command validation and preparation succeed.
+		// The reader closes the descriptor on every path BEFORE syscall.Exec:
+		// deferred cleanup alone cannot run when exec replaces this process.
+		token, err := readShallowClaudeOAuthToken(cmd.Context(), tokenFD)
+		if err != nil {
+			return err
 		}
-		envMap[e[:idx]] = e[idx+1:]
+		explicit = map[string]string{"CLAUDE_CODE_OAUTH_TOKEN": token}
 	}
-	for k, v := range set {
-		envMap[k] = v
-	}
-	for _, k := range scrub {
-		delete(envMap, k)
-	}
-	envMap["PATH"] = prependShallowLocalBin(envMap["PATH"], prof.Path)
-	envSlice := make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		envSlice = append(envSlice, k+"="+v)
-	}
+	envSlice := providerapi.MergeEnvironment(os.Environ(), changes, explicit)
 
-	// On Unix, exec the target so signals/exit propagate naturally and we
-	// don't add a stray caam process to the tree.
-	return spawnExec(binPath, rest, envSlice)
+	// On Unix, exec the target so signals/exit propagate naturally without a
+	// stray caam process; on Windows, run as a child process and propagate its
+	// exit code without Cobra usage noise.
+	err = spawnExec(binPath, rest, envSlice)
+	var exitErr *caamexec.ExitCodeError
+	if errors.As(err, &exitErr) {
+		cmd.SilenceUsage = true
+		cmd.SilenceErrors = true
+	}
+	return err
+}
+
+// parseShallowTokenFD deliberately never quotes input in errors. The flag
+// contains a descriptor number, not a credential, but a mistaken token paste
+// must not be repeated into diagnostics or logs.
+func parseShallowTokenFD(raw string) (int, error) {
+	invalid := func() (int, error) {
+		return -1, fmt.Errorf("--claude-oauth-token-fd requires a decimal file descriptor between 3 and 2147483647; pass the token through that descriptor, not as a flag value")
+	}
+	if raw == "" {
+		return invalid()
+	}
+	for _, c := range raw {
+		if c < '0' || c > '9' {
+			return invalid()
+		}
+	}
+	fd, err := strconv.ParseUint(raw, 10, 31)
+	if err != nil || fd < 3 {
+		return invalid()
+	}
+	return int(fd), nil
 }
 
 // prependShallowLocalBin puts <home>/.local/bin first on PATH when that
@@ -1142,8 +1268,6 @@ func injectCodexEffort(argv []string, effort string) ([]string, error) {
 	return out, nil
 }
 
-// spawnExec replaces the current process image with the target on Unix.
-// Wrapped in a function so tests can inject a fake.
-var spawnExec = func(binPath string, args []string, env []string) error {
-	return syscall.Exec(binPath, args, env)
-}
+// spawnExec launches the target command (syscall.Exec on Unix; child process
+// execution on Windows). Wrapped in a function so tests can inject a fake.
+var spawnExec = defaultSpawnExec

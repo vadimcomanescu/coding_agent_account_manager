@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,11 +18,12 @@ import (
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/wrap"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 // getWd allows mocking os.Getwd in tests
@@ -32,37 +34,45 @@ var runCmd = &cobra.Command{
 	Use:   "run <tool> [-- args...]",
 	Short: "Run AI CLI with automatic account switching",
 	Long: `Wraps AI CLI execution with transparent rate limit detection and automatic
-profile switching. This is the "zero friction" mode - just use caam run instead
-of calling the CLI directly.
+profile switching. Headless commands use bounded retries when they fail with
+a rate limit. Interactive commands retain their native terminal handling.
 
-When a rate limit is detected:
+When a headless command fails with a rate limit:
 1. The current profile is put into cooldown
 2. The next best profile is automatically selected
-3. The command is re-executed seamlessly
+3. After the configured backoff, the command is re-executed with the same input
 
-Use --precheck for proactive switching:
+Retry settings come from config.json's wrap section, then per-provider overrides,
+then explicit CLI flags. --max-retries 0 disables retries. An observable
+Retry-After header sets a minimum wait. Successful commands and other failures
+are not retried. A retry repeats the command; any completed work remains.
+
+Use --precheck for proactive switching and quota-aware recovery:
   When enabled, caam checks real-time usage levels BEFORE running and
   automatically switches to a healthier profile if current usage is near
-  the limit. This prevents rate limit errors before they happen.
+  the limit. The explicit initial account remains advisory when quota is
+  unknown or no replacement is below the proactive threshold.
+  Supported for claude, codex, grok and cursor. Automatic retries and supported
+  interactive handoffs require fresh, measured quota with headroom. The chosen
+  backup is checked again after backoff, before changing accounts. Weekly and
+  applicable model limits remain binding when no session limit is reported.
 
 Examples:
-  caam run claude -- "explain this code"
-  caam run codex -- --model gpt-5 "write tests"
-  caam run gemini -- "summarize this file"
+  caam run claude -- -p "explain this code"
+  caam run codex -- exec "write tests"
+  caam run gemini -- -p "summarize this file"
 
   # Proactive switching (checks usage before running)
-  caam run claude --precheck -- "explain this code"
+  caam run claude --precheck -- -p "explain this code"
 
-  # Interactive mode (no auto-retry on rate limit)
+  # Interactive mode (no command replay)
   caam run claude
 
 For shell integration, add an alias:
   alias claude='caam run claude --precheck --'
 
-Then you can just use:
-  claude "explain this code"
-
-And rate limits will be handled automatically!`,
+Then use native headless arguments when command retries are wanted:
+  claude -p "explain this code"`,
 	Args:               cobra.MinimumNArgs(1),
 	DisableFlagParsing: false,
 	RunE:               runWrap,
@@ -70,13 +80,17 @@ And rate limits will be handled automatically!`,
 
 func init() {
 	rootCmd.AddCommand(runCmd)
-	runCmd.Flags().Int("max-retries", 1, "maximum retry attempts on rate limit (0 = no retries)")
-	runCmd.Flags().Duration("cooldown", 60*time.Minute, "cooldown duration after rate limit")
-	runCmd.Flags().Bool("quiet", false, "suppress profile switch notifications")
-	runCmd.Flags().String("algorithm", "smart", "rotation algorithm (smart, round_robin, random)")
-	runCmd.Flags().String("policy", "", "rotation policy: availability (default), drain (prefer soonest-resetting usable quota)")
-	runCmd.Flags().Bool("precheck", false, "check usage levels before running and switch if near limit")
-	runCmd.Flags().Float64("precheck-threshold", 0.8, "usage threshold for precheck switching (0-1)")
+	addRunFlags(runCmd)
+}
+
+func addRunFlags(cmd *cobra.Command) {
+	cmd.Flags().Int("max-retries", config.DefaultWrapConfig().MaxRetries, "maximum retries or interactive handoffs on rate limit (0 = none; overrides wrap config)")
+	cmd.Flags().Duration("cooldown", 60*time.Minute, "cooldown duration after rate limit")
+	cmd.Flags().Bool("quiet", false, "suppress profile switch notifications")
+	cmd.Flags().String("algorithm", "smart", "rotation algorithm (smart, round_robin, random)")
+	cmd.Flags().String("policy", "", "rotation policy: availability (default), drain (prefer soonest-resetting usable quota)")
+	cmd.Flags().Bool("precheck", false, "check usage before running and enforce quota during automatic recovery")
+	cmd.Flags().Float64("precheck-threshold", 0.8, "usage threshold for the initial proactive switch (0-1)")
 }
 
 func runWrap(cmd *cobra.Command, args []string) error {
@@ -90,6 +104,15 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	if _, ok := tools[tool]; !ok {
 		return fmt.Errorf("unknown tool: %s (supported: %s)", tool, supportedToolsList())
 	}
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	// Parse CLI args (everything after the tool name)
 	var cliArgs []string
@@ -100,7 +123,11 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	// Get flags
 	quiet, _ := cmd.Flags().GetBool("quiet")
 	algorithmStr, _ := cmd.Flags().GetString("algorithm")
-	cooldownDur, _ := cmd.Flags().GetDuration("cooldown")
+	retryConfig, err := loadRunRetryConfig(cmd, tool)
+	if err != nil {
+		return err
+	}
+	cooldownDur := retryConfig.CooldownDuration.Duration()
 
 	// Parse algorithm
 	var algorithm rotation.Algorithm
@@ -133,18 +160,14 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	db, err := getDB()
 	if err != nil {
 		// Non-fatal: cooldowns won't be recorded but execution can continue
-		fmt.Fprintf(os.Stderr, "Warning: database unavailable, cooldowns will not be recorded\n")
+		fmt.Fprintf(cmd.ErrOrStderr(), "Warning: database unavailable, cooldowns will not be recorded\n")
 		db = nil
 	}
-
-	// Initialize health storage
-	healthStore := health.NewStorage("")
 
 	// Load global config
 	spmCfg, err := config.LoadSPMConfig()
 	if err != nil {
-		// Non-fatal: use defaults
-		spmCfg = config.DefaultSPMConfig()
+		return fmt.Errorf("load run settings: %w", err)
 	}
 
 	// CLI --policy overrides the configured rotation policy
@@ -161,15 +184,18 @@ func runWrap(cmd *cobra.Command, args []string) error {
 	// Precheck: switch profile if near limit before running
 	precheck, _ := cmd.Flags().GetBool("precheck")
 	precheckThreshold, _ := cmd.Flags().GetFloat64("precheck-threshold")
-	if precheck && (tool == "claude" || tool == "codex") {
-		if switched := runPrecheck(tool, precheckThreshold, quiet, db, algorithm, spmCfg, modelFromArgs(cliArgs)); switched && !quiet {
-			fmt.Fprintf(os.Stderr, "caam: switched profile before running (usage was near limit)\n")
+	if precheck && isLimitsProvider(tool) {
+		if switched := runPrecheck(ctx, tool, precheckThreshold, quiet, db, algorithm, spmCfg, modelFromArgs(cliArgs)); switched && !quiet {
+			fmt.Fprintf(cmd.ErrOrStderr(), "caam: switched profile before running (usage was near limit)\n")
 		}
 	} else if precheck {
 		// Loud fallback (issue #79): usage prechecking needs real-time limit
-		// support, which exists for claude and codex only. Say so — on stderr,
-		// even in quiet mode — instead of silently ignoring the flag.
-		fmt.Fprintf(os.Stderr, "caam: --precheck is not supported for %q (real-time limits are implemented for claude and codex only); running without a usage precheck\n", tool)
+		// support. Say so — on stderr, even in quiet mode — instead of
+		// silently ignoring the flag.
+		fmt.Fprintf(cmd.ErrOrStderr(), "caam: --precheck is not supported for %q (real-time limits are implemented for %s); running without a usage precheck\n", tool, strings.Join(limitsProviders, ", "))
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Initialize AuthPool (if enabled in config)
@@ -182,7 +208,12 @@ func runWrap(cmd *cobra.Command, args []string) error {
 
 	// Initialize Rotation Selector
 	selector := rotation.NewSelector(algorithm, healthStore, db)
+	bindRotationVault(selector)
 	applyRotationPolicy(selector, spmCfg, "")
+	var beforeSelection func(context.Context, []string) error
+	if precheck && isLimitsProvider(tool) {
+		beforeSelection = newRunQuotaRefresher(vault.BasePath(), tool, modelFromArgs(cliArgs), selector)
+	}
 
 	// Initialize Runner
 	if runner == nil {
@@ -190,11 +221,14 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		runner = exec.NewRunner(registry)
 	}
 
-	// Initialize Notifier
-	var notifier notify.Notifier
+	// Initialize Notifier: account switches reach the terminal (unless
+	// --quiet) and the configured desktop/webhook channels, which matter
+	// most when the session is running in a window the user isn't watching.
+	channels := notifierChannels{External: true}
 	if !quiet {
-		notifier = notify.NewTerminalNotifier(os.Stderr, true)
+		channels.Terminal = cmd.ErrOrStderr()
 	}
+	notifier := configuredNotifier(spmCfg, channels)
 
 	// Create SmartRunner
 	opts := exec.SmartRunnerOptions{
@@ -205,6 +239,8 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		AuthPool:         pool,
 		Rotation:         selector,
 		CooldownDuration: cooldownDur,
+		RetryConfig:      &retryConfig,
+		BeforeSelection:  beforeSelection,
 	}
 	smartRunner := exec.NewSmartRunner(runner, opts)
 
@@ -216,12 +252,60 @@ func runWrap(cmd *cobra.Command, args []string) error {
 
 	// Get active profile
 	fileSet := tools[tool]()
-	activeProfileName, _ := vault.ActiveProfile(fileSet)
+	activeProfileName, err := vault.CurrentProfile(fileSet)
+	if err != nil {
+		return fmt.Errorf("read current auth: %w", err)
+	}
+	stdin := cmd.InOrStdin()
+	stdinTerminal := runInputIsTerminal(stdin)
+	if runUsesHeadless(tool, cliArgs, stdinTerminal) {
+		if stdinTerminal {
+			// Native batch forms take their prompt from arguments or redirected
+			// input. Do not wait for or attempt to replay terminal keystrokes.
+			stdin = strings.NewReader("")
+		}
+		switchOptions := switchOptionsFromConfig(spmCfg)
+		wrapConfig := wrap.Config{
+			Provider:          tool,
+			Args:              cliArgs,
+			WorkDir:           cwd,
+			MaxRetries:        retryConfig.MaxRetries,
+			InitialDelay:      retryConfig.InitialDelay.Duration(),
+			MaxDelay:          retryConfig.MaxDelay.Duration(),
+			BackoffMultiplier: retryConfig.BackoffMultiplier,
+			Jitter:            retryConfig.Jitter,
+			CooldownDuration:  cooldownDur,
+			NotifyOnSwitch:    !quiet,
+			Algorithm:         algorithm,
+			InitialProfile:    activeProfileName,
+			Selector:          selector,
+			BeforeSelection:   beforeSelection,
+			SwitchOptions:     &switchOptions,
+			Bin:               prov.DefaultBin(),
+			Stdin:             stdin,
+			ReplayStdin:       !stdinTerminal && runInputReplayable(stdin),
+			Stdout:            cmd.OutOrStdout(),
+			Stderr:            cmd.ErrOrStderr(),
+		}
+		result := wrap.NewWrapper(vault, db, healthStore, wrapConfig).Run(ctx)
+		if result.Err != nil {
+			return result.Err
+		}
+		if result.ExitCode != 0 {
+			return &exec.ExitCodeError{Code: result.ExitCode}
+		}
+		return nil
+	}
 	if activeProfileName == "" {
 		// If no active profile, try to select one
 		profiles, err := vault.List(tool)
 		if err != nil || len(profiles) == 0 {
 			return fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
+		}
+		if beforeSelection != nil {
+			if err := beforeSelection(ctx, profiles); err != nil {
+				return fmt.Errorf("check initial profile quota: %w", err)
+			}
 		}
 		res, err := selector.Select(tool, profiles, "")
 		if err != nil {
@@ -231,13 +315,22 @@ func runWrap(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("no profile selected for %s", tool)
 		}
 		activeProfileName = res.Selected
-		// Restore it
-		if err := vault.Restore(fileSet, activeProfileName); err != nil {
+		switched, err := vault.Switch(fileSet, activeProfileName, switchOptionsFromConfig(spmCfg))
+		if err != nil {
 			return fmt.Errorf("activate profile: %w", err)
 		}
+		if !quiet {
+			printSwitchPreservation(os.Stderr, tool, switched)
+		}
+	}
+	if err := checkInteractiveRunCredential(ctx, fileSet, activeProfileName, selector); err != nil {
+		return err
 	}
 
 	// Load profile object
+	if profileStore == nil {
+		profileStore = profile.NewStore(profile.DefaultStorePath())
+	}
 	prof, err := profileStore.Load(tool, activeProfileName)
 	if err != nil {
 		// If profile object doesn't exist (only in vault), create a transient one.
@@ -272,38 +365,193 @@ func runWrap(cmd *cobra.Command, args []string) error {
 		UseGlobalEnv: true, // Force global environment for vault-based switching
 	}
 
-	// Handle signals - use cmd.Context() for proper context propagation
-	ctx, cancel := context.WithCancel(cmd.Context())
-	defer cancel()
+	return smartRunner.Run(ctx, runOptions)
+}
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		select {
-		case <-sigChan:
-			cancel()
-		case <-ctx.Done():
-			// Context cancelled, goroutine can exit cleanly
+// Refresh evidence at automatic selection boundaries, including after backoff.
+// Constructing the hook leaves the explicit first attempt advisory. Once called,
+// even an empty or failed read must keep quota checks enabled: nil would opt out.
+func newRunQuotaRefresher(vaultDir, tool, model string, selector *rotation.Selector) func(context.Context, []string) error {
+	fetcher := usage.NewMultiProfileFetcher()
+	return func(ctx context.Context, candidates []string) error {
+		selector.SetUsageData(make(map[string]*rotation.UsageInfo))
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-	}()
-
-	err = smartRunner.Run(ctx, runOptions)
-
-	// Stop signal handling and allow the signal goroutine to exit
-	signal.Stop(sigChan)
-	cancel() // Ensure goroutine exits via ctx.Done() path
-
-	// Handle exit code
-	var exitErr *exec.ExitCodeError
-	if errors.As(err, &exitErr) {
-		// Clean up before exiting - os.Exit() bypasses defers
-		if db != nil {
-			db.Close()
+		if len(candidates) == 0 {
+			return nil
 		}
-		os.Exit(exitErr.Code)
+		credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
+		if err != nil {
+			return fmt.Errorf("load %s quota credentials: %w", tool, err)
+		}
+		selected := make(map[string]string, len(candidates))
+		for _, name := range candidates {
+			if token := credentials[name]; token != "" && !authfile.IsSystemProfile(name) {
+				selected[name] = token
+			}
+		}
+		queryCtx, cancel := context.WithTimeout(ctx, runQuotaTimeout(tool))
+		defer cancel()
+		results := fetcher.FetchAllProfiles(queryCtx, tool, selected)
+		// Never mutate the map already installed in the selector. Publish the
+		// complete new snapshot once all bounded reads have returned.
+		measured := make(map[string]*rotation.UsageInfo, len(results))
+		for _, result := range results {
+			if result.Usage != nil {
+				measured[result.ProfileName] = toRotationUsageInfo(result.ProfileName, result.Usage, model)
+			}
+		}
+		selector.SetUsageData(measured)
+		return ctx.Err()
 	}
+}
 
-	return err
+func runQuotaTimeout(tool string) time.Duration {
+	if tool == "grok" || tool == "cursor" {
+		return 30 * time.Second // Native billing probes have their own 25s bound.
+	}
+	return 15 * time.Second
+}
+
+// A recognized owner is not necessarily a usable credential. Global execution
+// deliberately skips isolated-profile preflight, so check the actual live grant
+// before loading/locking a profile or giving it to the native CLI. In particular,
+// Cursor may discard a hard-expired browser session when it tries to use it.
+func checkInteractiveRunCredential(ctx context.Context, fileSet authfile.AuthFileSet, name string, selector *rotation.Selector) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	store := healthStore
+	if store == nil {
+		store = health.NewStorage(filepath.Join(filepath.Dir(vault.BasePath()), "health.json"))
+		store.SetVaultPath(vault.BasePath())
+	}
+	ph, err := store.GetProfile(fileSet.Tool, name)
+	if err != nil {
+		return fmt.Errorf("read active credential health: %w", err)
+	}
+	if ph == nil {
+		ph = &health.ProfileHealth{}
+	}
+	// Keep provider-verification evidence, but discard every property derived
+	// from the saved grant. The CLI will use live auth, which may have rotated
+	// since backup or belong to a newly authenticated grant of the same account.
+	applyExpiryInfo(ph, &health.ExpiryInfo{})
+	info, err := health.ParseLiveExpiry(fileSet)
+	if err != nil && !errors.Is(err, health.ErrNoExpiry) && !errors.Is(err, health.ErrNoAuthFile) {
+		return fmt.Errorf("read live %s credential: %w", fileSet.Tool, err)
+	}
+	if info != nil {
+		applyExpiryInfo(ph, info)
+	}
+	selector.SetProfileHealth(map[string]*health.ProfileHealth{name: ph})
+	// Later handoffs must hydrate their own saved credentials normally.
+	defer selector.SetProfileHealth(nil)
+	result, err := selector.Select(fileSet.Tool, []string{name}, "")
+	if err != nil {
+		return fmt.Errorf("active %s profile %q cannot launch: %w", fileSet.Tool, name, err)
+	}
+	if result == nil || result.Selected != name {
+		return fmt.Errorf("active %s profile %q is not available for launch", fileSet.Tool, name)
+	}
+	return ctx.Err()
+}
+
+// loadRunRetryConfig applies explicit flags last. Changed is essential: the
+// displayed flag default must not erase a global or per-provider setting.
+func loadRunRetryConfig(cmd *cobra.Command, tool string) (config.WrapConfig, error) {
+	global, err := config.Load()
+	if err != nil {
+		return config.WrapConfig{}, fmt.Errorf("load retry settings: %w", err)
+	}
+	result := global.Wrap.ForProvider(tool)
+	if cmd.Flags().Changed("max-retries") {
+		result.MaxRetries, err = cmd.Flags().GetInt("max-retries")
+		if err != nil {
+			return result, err
+		}
+	}
+	if cmd.Flags().Changed("cooldown") {
+		duration, flagErr := cmd.Flags().GetDuration("cooldown")
+		if flagErr != nil {
+			return result, flagErr
+		}
+		result.CooldownDuration = config.Duration(duration)
+	}
+	if err := result.Validate(); err != nil {
+		return result, fmt.Errorf("invalid retry settings for %s: %w", tool, err)
+	}
+	return result, nil
+}
+
+func runInputIsTerminal(input io.Reader) bool {
+	file, ok := input.(interface{ Fd() uintptr })
+	return ok && term.IsTerminal(int(file.Fd()))
+}
+
+// runInputReplayable reports whether non-terminal stdin is known to be finite:
+// an in-memory reader or a regular file. Only that input is spooled for replay
+// on retry. A pipe may never close (ssh without -n, a harness that keeps its
+// end open, streaming input), so it is passed through as in v0.1.22 instead of
+// being read to EOF before the CLI starts (#120).
+func runInputReplayable(input io.Reader) bool {
+	file, ok := input.(*os.File)
+	if !ok {
+		return true
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	if info.Mode().IsRegular() {
+		return true
+	}
+	// /dev/null is finite too (systemd, ssh -n, `< /dev/null`); replaying its
+	// zero bytes keeps rate-limit retries working.
+	null, err := os.Stat(os.DevNull)
+	return err == nil && os.SameFile(info, null)
+}
+
+// runUsesHeadless recognizes native batch forms even when launched from a
+// terminal. Without a terminal, commands use pipes instead of a nested PTY.
+// Native arguments are never rewritten or given additional permissions.
+func runUsesHeadless(tool string, args []string, stdinTerminal bool) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if tool == "gemini" && (arg == "-i" || arg == "--prompt-interactive" || strings.HasPrefix(arg, "--prompt-interactive=")) {
+			return false
+		}
+	}
+	if !stdinTerminal {
+		return true
+	}
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		switch tool {
+		case "claude", "cursor":
+			if arg == "-p" || arg == "--print" || arg == "--print=true" {
+				return true
+			}
+		case "gemini":
+			if arg == "-p" || arg == "--prompt" || strings.HasPrefix(arg, "--prompt=") {
+				return true
+			}
+		}
+	}
+	if len(args) > 0 {
+		switch tool {
+		case "codex":
+			return args[0] == "exec" || args[0] == "e" || args[0] == "review"
+		case "opencode":
+			return args[0] == "run"
+		}
+	}
+	return false
 }
 
 // runPrecheck checks current usage levels and switches profile if near limit.
@@ -313,43 +561,58 @@ func runWrap(cmd *cobra.Command, args []string) error {
 // arguments, so a spent per-model quota counts as "near limit" even when the
 // account's general windows are idle (issue #97); "" means unknown, and then
 // every model-scoped quota counts.
-func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algorithm rotation.Algorithm, spmCfg *config.SPMConfig, model string) bool {
+func runPrecheck(ctx context.Context, tool string, threshold float64, quiet bool, db *caamdb.DB, algorithm rotation.Algorithm, spmCfg *config.SPMConfig, model string) bool {
 	// Get current profile's access token
 	vaultDir := authfile.DefaultVaultPath()
+	if vault != nil {
+		vaultDir = vault.BasePath()
+	}
 
 	// Get the currently active profile
 	fileSet := tools[tool]()
-	currentProfile, _ := vault.ActiveProfile(fileSet)
+	currentProfile, err := vault.CurrentProfile(fileSet)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "caam: precheck could not read current %s auth: %v\n", tool, err)
+		return false
+	}
 	if currentProfile == "" {
 		return false // No active profile
 	}
 
 	// Load credentials for current profile
 	credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
-	if err != nil || len(credentials) == 0 {
-		return false
-	}
-
 	token, ok := credentials[currentProfile]
-	if !ok {
+	if err != nil || !ok {
+		fmt.Fprintf(os.Stderr, "caam: precheck found no readable %s credential for %s; running without switching\n", tool, currentProfile)
 		return false
 	}
 
-	// Fetch current usage
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Fetch current usage. A Grok billing read starts the grok CLI, which
+	// its own reader bounds at 25s; keep that within reach.
+	timeout := runQuotaTimeout(tool)
+	queryCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	fetcher := usage.NewMultiProfileFetcher()
-	results := fetcher.FetchAllProfiles(ctx, tool, map[string]string{currentProfile: token})
+	results := fetcher.FetchAllProfiles(queryCtx, tool, map[string]string{currentProfile: token})
 
 	if len(results) == 0 || results[0].Usage == nil {
+		fmt.Fprintf(os.Stderr, "caam: precheck could not read %s/%s quota; running without switching\n", tool, currentProfile)
 		return false
 	}
 
 	currentUsage := results[0].Usage
 
-	// Check if near limit
-	if !currentUsage.IsNearLimitForModel(threshold, model) {
+	nearLimit, measured := precheckNearLimit(tool, currentUsage, threshold, model)
+	if !measured {
+		// Unknown is neither "near limit" nor "fine". Keep the current
+		// account (the historical behaviour) but say so, rather than letting
+		// the flag look like it checked something.
+		fmt.Fprintf(os.Stderr, "caam: precheck could not measure %s/%s quota (status %s); running without switching\n",
+			tool, currentProfile, precheckQuotaStatus(currentUsage))
+		return false
+	}
+	if !nearLimit {
 		return false // All good, no switch needed
 	}
 
@@ -362,40 +625,102 @@ func runPrecheck(tool string, threshold float64, quiet bool, db *caamdb.DB, algo
 	// Find best alternative using usage-aware selection
 	allCredentials, err := usage.LoadProfileCredentials(vaultDir, tool)
 	if err != nil || len(allCredentials) == 0 {
+		fmt.Fprintf(os.Stderr, "caam: precheck could not read alternative %s credentials; running without switching\n", tool)
 		return false
 	}
+	selectedCredentials := make(map[string]string, len(allProfiles))
+	for _, name := range allProfiles {
+		if token := allCredentials[name]; token != "" && !authfile.IsSystemProfile(name) {
+			selectedCredentials[name] = token
+		}
+	}
 
-	// Fetch usage for all profiles
-	allResults := fetcher.FetchAllProfiles(ctx, tool, allCredentials)
+	// Fetch usage for all profiles, on a fresh deadline: the read above may
+	// have used most of the first one.
+	allCtx, allCancel := context.WithTimeout(ctx, timeout)
+	defer allCancel()
+	allResults := fetcher.FetchAllProfiles(allCtx, tool, selectedCredentials)
 
 	// Convert to rotation.UsageInfo format
 	usageData := make(map[string]*rotation.UsageInfo)
+	rawUsage := make(map[string]*usage.UsageInfo)
 	for _, r := range allResults {
 		if r.Usage == nil {
 			continue
 		}
 		usageData[r.ProfileName] = toRotationUsageInfo(r.ProfileName, r.Usage, model)
+		rawUsage[r.ProfileName] = r.Usage
+	}
+
+	// A switch may only land on another account whose quota was
+	// measured, is not spent, and is itself below the precheck threshold;
+	// the selector's scoring alone would still pick an unknown one. If
+	// nothing qualifies, stay put and say so.
+	eligible, _ := rotation.QuotaCandidates(tool, allProfiles, usageData)
+	candidates := make([]string, 0, len(eligible))
+	for _, name := range eligible {
+		if name == currentProfile {
+			continue
+		}
+		if near, measured := precheckNearLimit(tool, rawUsage[name], threshold, model); near || !measured {
+			continue
+		}
+		candidates = append(candidates, name)
+	}
+	if len(candidates) == 0 {
+		fmt.Fprintf(os.Stderr, "caam: %s/%s is near its quota limit, but no other %s profile has measured quota below the precheck threshold; not switching\n",
+			tool, currentProfile, tool)
+		return false
 	}
 
 	// Use rotation selector with usage data
-	selector := rotation.NewSelector(algorithm, nil, db)
+	selector := rotation.NewSelector(algorithm, healthStore, db)
+	bindRotationVault(selector)
 	applyRotationPolicy(selector, spmCfg, "")
 	selector.SetUsageData(usageData)
 
-	result, err := selector.Select(tool, allProfiles, currentProfile)
-	if err != nil || result.Selected == currentProfile {
+	result, err := selector.Select(tool, candidates, currentProfile)
+	if err != nil || result == nil || result.Selected == "" || result.Selected == currentProfile {
 		return false // Couldn't find better alternative
 	}
 
 	// Switch to the better profile
-	if err := vault.Restore(fileSet, result.Selected); err != nil {
+	if ctx.Err() != nil {
+		return false
+	}
+	switched, err := vault.Switch(fileSet, result.Selected, switchOptionsFromConfig(spmCfg))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "caam: precheck could not switch %s to %s: %v\n", tool, result.Selected, err)
 		return false
 	}
 
 	if !quiet {
+		printSwitchPreservation(os.Stderr, tool, switched)
 		fmt.Fprintf(os.Stderr, "caam: precheck switched %s/%s -> %s/%s\n",
 			tool, currentProfile, tool, result.Selected)
 	}
 
 	return true
+}
+
+// precheckNearLimit decides whether the account about to run is near its
+// limit. Unmeasured quota is neither near the limit nor known to be fine.
+// A reported Grok/Cursor limit stage is exhaustion even without a percentage.
+func precheckNearLimit(tool string, u *usage.UsageInfo, threshold float64, model string) (nearLimit, measured bool) {
+	if u != nil && (tool == "grok" || tool == "cursor") && u.LimitStage != "" {
+		return true, true
+	}
+	if !u.NumericQuotaKnown() {
+		return false, false
+	}
+	return u.IsNearLimitForModel(threshold, model), true
+}
+
+// precheckQuotaStatus names a quota row's state for a notice without
+// repeating provider error text, which can carry credential material.
+func precheckQuotaStatus(u *usage.UsageInfo) string {
+	if u == nil || u.QuotaStatus == "" {
+		return usage.QuotaUnavailable
+	}
+	return u.QuotaStatus
 }

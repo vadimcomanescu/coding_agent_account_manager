@@ -76,7 +76,7 @@ func (c *Checker) CheckAll(ctx context.Context) []Warning {
 	var warnings []Warning
 
 	// Check vault profiles (auth file swapping)
-	for _, tool := range []string{"codex", "claude", "gemini"} {
+	for _, tool := range []string{"codex", "claude", "gemini", "cursor"} {
 		profiles, err := c.vault.List(tool)
 		if err != nil {
 			continue
@@ -103,6 +103,7 @@ func (c *Checker) CheckActive(ctx context.Context) []Warning {
 		"codex":  authfile.CodexAuthFiles,
 		"claude": authfile.ClaudeAuthFiles,
 		"gemini": authfile.GeminiAuthFiles,
+		"cursor": authfile.CursorAuthFiles,
 	}
 
 	for tool, getFileSet := range tools {
@@ -115,6 +116,26 @@ func (c *Checker) CheckActive(ctx context.Context) []Warning {
 
 		// Find active profile
 		activeProfile, err := c.vault.ActiveProfile(fileSet)
+		if tool == "cursor" {
+			// Cursor's current session can differ from a vault snapshot after
+			// a fresh login, or may never have been backed up. Always inspect
+			// the live auth file at the platform-aware location; the profile
+			// match only supplies a name for the warning and login command.
+			if err != nil {
+				activeProfile = ""
+			}
+			for _, spec := range fileSet.Files {
+				if filepath.Base(spec.Path) != "auth.json" {
+					continue
+				}
+				expInfo, err := health.ParseCursorExpiry(spec.Path)
+				if err == nil {
+					warnings = append(warnings, c.expiryWarnings(tool, activeProfile, expInfo, time.Now())...)
+				}
+				break
+			}
+			continue
+		}
 		if err != nil || activeProfile == "" {
 			continue
 		}
@@ -146,12 +167,24 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
-	case "opencode", "cursor":
+	case "cursor":
+		expInfo, err = health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
+	case "opencode":
 		// No token expiry parsing for these providers yet
 		return warnings
 	}
 
-	if err != nil || expInfo == nil || expInfo.ExpiresAt.IsZero() {
+	if err != nil {
+		return warnings
+	}
+	return c.expiryWarnings(tool, profileName, expInfo, time.Now())
+}
+
+// expiryWarnings applies the same expiry policy to vault and live credentials.
+// An empty profile name denotes a live login that has no matching vault entry.
+func (c *Checker) expiryWarnings(tool, profileName string, expInfo *health.ExpiryInfo, now time.Time) []Warning {
+	var warnings []Warning
+	if expInfo == nil || expInfo.ExpiresAt.IsZero() {
 		return warnings
 	}
 
@@ -164,7 +197,29 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 	}
 
 	// Check expiry
-	remaining := time.Until(expInfo.ExpiresAt)
+	remaining := expInfo.ExpiresAt.Sub(now)
+	warningThreshold := c.WarningThreshold
+	if !expInfo.Renewable && expInfo.ReloginWarningLead > warningThreshold {
+		warningThreshold = expInfo.ReloginWarningLead
+	}
+	action := fmt.Sprintf("caam refresh %s %s", tool, profileName)
+	if !expInfo.Renewable {
+		action = fmt.Sprintf("caam login %s %s", tool, profileName)
+		if tool == "cursor" {
+			if profileName == "" {
+				action = "cursor-agent login"
+			} else {
+				action = health.CursorReloginInstructions(profileName)
+			}
+		}
+	}
+	noun := "Token"
+	if tool == "cursor" && !expInfo.Renewable {
+		noun = "Session"
+	}
+	if profileName == "" {
+		profileName = "active"
+	}
 
 	if remaining <= 0 {
 		// Token expired. A credential that carries a refresh token is not a
@@ -178,15 +233,15 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 				Tool:    tool,
 				Profile: profileName,
 				Message: "Access token lapsed (renewable)",
-				Action:  fmt.Sprintf("caam refresh %s %s", tool, profileName),
+				Action:  action,
 			})
 		} else {
 			warnings = append(warnings, Warning{
 				Level:   LevelCritical,
 				Tool:    tool,
 				Profile: profileName,
-				Message: "Token EXPIRED",
-				Action:  fmt.Sprintf("caam login %s %s", tool, profileName),
+				Message: noun + " EXPIRED",
+				Action:  action,
 			})
 		}
 	} else if remaining <= c.CriticalThreshold {
@@ -195,17 +250,17 @@ func (c *Checker) checkVaultProfile(ctx context.Context, tool, profileName strin
 			Level:   LevelCritical,
 			Tool:    tool,
 			Profile: profileName,
-			Message: fmt.Sprintf("Token expires in %s", formatDuration(remaining)),
-			Action:  fmt.Sprintf("caam refresh %s %s", tool, profileName),
+			Message: fmt.Sprintf("%s expires in %s", noun, formatDuration(remaining)),
+			Action:  action,
 		})
-	} else if remaining <= c.WarningThreshold {
+	} else if remaining <= warningThreshold {
 		// Expires within warning threshold
 		warnings = append(warnings, Warning{
 			Level:   LevelWarning,
 			Tool:    tool,
 			Profile: profileName,
-			Message: fmt.Sprintf("Token expires in %s", formatDuration(remaining)),
-			Action:  fmt.Sprintf("caam refresh %s %s", tool, profileName),
+			Message: fmt.Sprintf("%s expires in %s", noun, formatDuration(remaining)),
+			Action:  action,
 		})
 	}
 
@@ -274,7 +329,11 @@ func Print(w io.Writer, warnings []Warning, noColor bool) bool {
 
 		fmt.Fprintf(w, "%s%s Warning: %s/%s: %s%s\n", colorStart, prefix, warn.Tool, warn.Profile, warn.Message, colorEnd)
 		if warn.Action != "" {
-			fmt.Fprintf(w, "    Run: %s\n", warn.Action)
+			if warn.Tool == "cursor" {
+				fmt.Fprintf(w, "    %s\n", warn.Action)
+			} else {
+				fmt.Fprintf(w, "    Run: %s\n", warn.Action)
+			}
 		}
 	}
 

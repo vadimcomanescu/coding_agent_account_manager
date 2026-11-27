@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -126,6 +127,7 @@ type weztermPane struct {
 type weztermTarget struct {
 	Pane   weztermPane
 	Reason string
+	Text   string // the pane's screen when it was scanned
 }
 
 var (
@@ -180,7 +182,8 @@ func runWeztermLoginAll(cmd *cobra.Command, args []string) error {
 	var targets []weztermTarget
 	for _, pane := range panes {
 		if all {
-			targets = append(targets, weztermTarget{Pane: pane, Reason: "all"})
+			text, _ := weztermGetTextFunc(pane.ID)
+			targets = append(targets, weztermTarget{Pane: pane, Reason: "all", Text: text})
 			continue
 		}
 		text, err := weztermGetTextFunc(pane.ID)
@@ -195,7 +198,7 @@ func runWeztermLoginAll(cmd *cobra.Command, args []string) error {
 			logger.Debug("pane scan", "pane_id", pane.ID, "title", pane.Title, "matched", match.Matched, "reason", match.Reason, "tool", tool)
 		}
 		if match.Matched {
-			targets = append(targets, weztermTarget{Pane: pane, Reason: match.Reason})
+			targets = append(targets, weztermTarget{Pane: pane, Reason: match.Reason, Text: text})
 		}
 	}
 
@@ -225,15 +228,25 @@ func runWeztermLoginAll(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	payload := "/login\n"
-	if subscription {
-		payload += "1\n"
-	}
-
 	successCount := 0
 	failCount := 0
 	for _, target := range targets {
-		if err := weztermSendTextFunc(target.Pane.ID, payload); err != nil {
+		keys := []string{"/login\n"}
+		if tool == "claude" {
+			// Closes Claude Code's usage-limit menu, whose Enter can buy
+			// extra usage, and empties the prompt line first.
+			keys = coordinator.LoginKeys(cleanWeztermText(target.Text))
+		}
+		err := sendWeztermKeys(target.Pane.ID, keys)
+		// The "1" choosing the subscription login is sent separately: the
+		// login menu has to be on screen before it arrives. It goes without
+		// Enter, which Claude Code's menu does not need and which would reach
+		// the OAuth code prompt that replaces it.
+		if err == nil && subscription {
+			time.Sleep(loginMenuSettle)
+			err = weztermSendTextFunc(target.Pane.ID, "1")
+		}
+		if err != nil {
 			failCount++
 			fmt.Fprintf(cmd.ErrOrStderr(), "pane %d: %v\n", target.Pane.ID, err)
 			continue
@@ -371,7 +384,8 @@ var (
 		regexp.MustCompile(`(?i)google\s+ai`),
 	}
 	rateLimitMarkers = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)you'?ve hit your limit`),
+		regexp.MustCompile(`(?i)you['’]?ve hit your (?:[\w'’-]+ ){0,4}?limit`),
+		regexp.MustCompile(`(?i)you['’]?re out of usage credits`),
 		regexp.MustCompile(`(?i)usage limit`),
 		regexp.MustCompile(`(?i)rate limit`),
 		regexp.MustCompile(`(?i)too many requests`),
@@ -558,8 +572,30 @@ func weztermGetText(paneID int) (string, error) {
 	return string(out), nil
 }
 
+// loginMenuSettle is the pause between /login and choosing a login method.
+var loginMenuSettle = time.Second
+
+// weztermKeyGap is the pause between keys typed one at a time.
+var weztermKeyGap = coordinator.KeyGap
+
+// sendWeztermKeys types keys into a pane one at a time (see
+// coordinator.LoginKeys).
+func sendWeztermKeys(paneID int, keys []string) error {
+	for i, key := range keys {
+		if i > 0 {
+			time.Sleep(weztermKeyGap)
+		}
+		if err := weztermSendTextFunc(paneID, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// weztermSendText types text into a pane; a trailing newline presses Enter
+// (see coordinator.TypedText).
 func weztermSendText(paneID int, text string) error {
-	cmd := exec.Command("wezterm", "cli", "send-text", "--pane-id", strconv.Itoa(paneID), "--no-paste", text)
+	cmd := exec.Command("wezterm", "cli", "send-text", "--pane-id", strconv.Itoa(paneID), "--no-paste", coordinator.TypedText(text))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -651,6 +687,36 @@ type RecoverPaneState struct {
 	Error       string
 	LastAction  time.Time
 	Cooldown    time.Duration
+	// PressEnter is set when a resuming pane shows Claude Code's "Press
+	// Enter to continue" after login; text typed there is dropped.
+	PressEnter bool
+	// LoginKeys start /login in a rate-limited pane, as its screen requires
+	// (see coordinator.LoginKeys).
+	LoginKeys []string
+}
+
+// loginKeys returns the keys that start /login in the pane.
+func (r *RecoverPaneState) loginKeys() []string {
+	if len(r.LoginKeys) == 0 {
+		return coordinator.LoginKeys("")
+	}
+	return r.LoginKeys
+}
+
+// recoverContinueSettle is the pause after dismissing the post-login screen
+// before the resume prompt is typed.
+var recoverContinueSettle = 1500 * time.Millisecond
+
+// sendResumePrompt types the resume prompt into a resuming pane, first
+// dismissing the post-login screen when one is showing.
+func sendResumePrompt(s *RecoverPaneState, prompt string) error {
+	if s.PressEnter {
+		if err := weztermSendTextFunc(s.Pane.ID, "\n"); err != nil {
+			return err
+		}
+		time.Sleep(recoverContinueSettle)
+	}
+	return sendWeztermKeys(s.Pane.ID, coordinator.PromptKeys(prompt))
 }
 
 // IsOnCooldown returns true if the pane is still on cooldown from last action.
@@ -661,59 +727,31 @@ func (r *RecoverPaneState) IsOnCooldown() bool {
 	return time.Since(r.LastAction) < r.Cooldown
 }
 
-// Recovery state detection patterns (using coordinator patterns).
-var recoverPatterns = struct {
-	RateLimit    *regexp.Regexp
-	SelectMethod *regexp.Regexp
-	OAuthURL     *regexp.Regexp
-	PastePrompt  *regexp.Regexp
-	LoginSuccess *regexp.Regexp
-	LoginFailed  *regexp.Regexp
-}{
-	RateLimit:    regexp.MustCompile(`(?i)you'?ve hit your limit.*resets`),
-	SelectMethod: regexp.MustCompile(`(?i)select login method:`),
-	OAuthURL:     regexp.MustCompile(`https://claude\.ai/oauth/authorize\?[^\s]+`),
-	PastePrompt:  regexp.MustCompile(`(?i)paste code here if prompted`),
-	LoginSuccess: regexp.MustCompile(`(?i)(logged in as|successfully authenticated|welcome back)`),
-	LoginFailed:  regexp.MustCompile(`(?i)(login failed|authentication error|invalid code|expired|error signing)`),
-}
-
-// detectRecoverState analyzes pane output and returns the recovery state.
+// detectRecoverState analyzes pane output and returns the recovery state,
+// the reason, and the OAuth URL when one is shown. It shares the distributed
+// coordinator's detection, where the most recent message in the scrollback
+// decides.
 func detectRecoverState(text string) (RecoverState, string, string) {
-	normalized := normalizeWeztermText(text)
-
-	// Check for login success first (highest priority)
-	if recoverPatterns.LoginSuccess.MatchString(normalized) {
+	// Line breaks matter: banners are matched at the start of a line, and only
+	// the bottom of the screen tells whether a session is working.
+	state, meta := coordinator.DetectState(cleanWeztermText(text))
+	switch state {
+	case coordinator.StateResuming:
 		return RecoverResuming, "login_success", ""
-	}
-
-	// Check for login failure
-	if recoverPatterns.LoginFailed.MatchString(normalized) {
+	case coordinator.StateFailed:
 		return RecoverFailed, "login_failed", ""
-	}
-
-	// Check for OAuth URL
-	if url := recoverPatterns.OAuthURL.FindString(normalized); url != "" {
-		return RecoverAwaitingURL, "oauth_url", url
-	}
-
-	// Check for paste prompt (URL was shown)
-	if recoverPatterns.PastePrompt.MatchString(normalized) {
-		url := recoverPatterns.OAuthURL.FindString(normalized)
-		return RecoverAwaitingURL, "paste_prompt", url
-	}
-
-	// Check for method selection prompt
-	if recoverPatterns.SelectMethod.MatchString(normalized) {
+	case coordinator.StateAwaitingURL:
+		if url := meta["oauth_url"]; url != "" {
+			return RecoverAwaitingURL, "oauth_url", url
+		}
+		return RecoverAwaitingURL, "paste_prompt", ""
+	case coordinator.StateAwaitingMethodSelect:
 		return RecoverAwaitingSelect, "select_method", ""
-	}
-
-	// Check for rate limit
-	if recoverPatterns.RateLimit.MatchString(normalized) {
+	case coordinator.StateRateLimited:
 		return RecoverRateLimited, "rate_limit", ""
+	default:
+		return RecoverIdle, "", ""
 	}
-
-	return RecoverIdle, "", ""
 }
 
 func runWeztermRecover(cmd *cobra.Command, args []string) error {
@@ -796,6 +834,12 @@ func scanRecoverStates(logger *slog.Logger) ([]*RecoverPaneState, error) {
 			State:       state,
 			MatchReason: reason,
 			OAuthURL:    url,
+		}
+		switch state {
+		case RecoverResuming:
+			ps.PressEnter = coordinator.Patterns.PressEnter.MatchString(normalizeWeztermText(text))
+		case RecoverRateLimited:
+			ps.LoginKeys = coordinator.LoginKeys(cleanWeztermText(text))
 		}
 
 		if match.Matched && ps.MatchReason == "" {
@@ -951,19 +995,20 @@ func runAutoRecover(cmd *cobra.Command, states []*RecoverPaneState, yes bool, re
 		var err error
 		switch s.State {
 		case RecoverRateLimited:
-			err = weztermSendTextFunc(s.Pane.ID, "/login\n")
+			err = sendWeztermKeys(s.Pane.ID, s.loginKeys())
 			if err == nil && logger != nil {
 				logger.Debug("injected /login", "pane_id", s.Pane.ID)
 			}
 		case RecoverAwaitingSelect:
 			time.Sleep(200 * time.Millisecond)
-			err = weztermSendTextFunc(s.Pane.ID, "1\n")
+			// The digit alone: Claude Code's menu acts on it at once.
+			err = weztermSendTextFunc(s.Pane.ID, "1")
 			if err == nil && logger != nil {
 				logger.Debug("injected subscription select", "pane_id", s.Pane.ID)
 			}
 		case RecoverResuming:
 			time.Sleep(500 * time.Millisecond)
-			err = weztermSendTextFunc(s.Pane.ID, resumePrompt)
+			err = sendResumePrompt(s, resumePrompt)
 			if err == nil && logger != nil {
 				logger.Debug("injected resume prompt", "pane_id", s.Pane.ID)
 			}
@@ -1028,12 +1073,12 @@ func runInteractiveRecover(cmd *cobra.Command, states []*RecoverPaneState, resum
 
 		case 'l', 'L':
 			fmt.Fprintln(cmd.OutOrStdout(), "\nInjecting /login to rate-limited panes...")
-			injectToState(cmd, states, RecoverRateLimited, "/login\n", logger)
+			injectToState(cmd, states, RecoverRateLimited, "", logger)
 
 		case 's', 'S':
 			fmt.Fprintln(cmd.OutOrStdout(), "\nSelecting subscription on awaiting panes...")
 			time.Sleep(200 * time.Millisecond)
-			injectToState(cmd, states, RecoverAwaitingSelect, "1\n", logger)
+			injectToState(cmd, states, RecoverAwaitingSelect, "1", logger)
 
 		case 'p', 'P':
 			fmt.Fprintln(cmd.OutOrStdout(), "\nInjecting resume prompt to resuming panes...")
@@ -1066,7 +1111,14 @@ func injectToState(cmd *cobra.Command, states []*RecoverPaneState, targetState R
 		if s.State != targetState {
 			continue
 		}
-		if err := weztermSendTextFunc(s.Pane.ID, text); err != nil {
+		send := func() error { return weztermSendTextFunc(s.Pane.ID, text) }
+		switch targetState {
+		case RecoverRateLimited:
+			send = func() error { return sendWeztermKeys(s.Pane.ID, s.loginKeys()) }
+		case RecoverResuming:
+			send = func() error { return sendResumePrompt(s, text) }
+		}
+		if err := send(); err != nil {
 			fmt.Fprintf(cmd.ErrOrStderr(), "  pane %d: FAILED - %v\n", s.Pane.ID, err)
 		} else {
 			fmt.Fprintf(cmd.OutOrStdout(), "  pane %d: OK\n", s.Pane.ID)

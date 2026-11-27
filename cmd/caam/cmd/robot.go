@@ -2,19 +2,29 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/prediction"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 	"github.com/spf13/cobra"
 )
@@ -76,7 +86,8 @@ type RobotStatusSummary struct {
 	ActiveProfiles     int  `json:"active_profiles"`
 	HealthyProfiles    int  `json:"healthy_profiles"`
 	CooldownProfiles   int  `json:"cooldown_profiles"`
-	ExpiringSoon       int  `json:"expiring_soon"` // < 24h
+	ExpiringSoon       int  `json:"expiring_soon"` // within 24h or the session's longer warning window
+	ReloginSoon        int  `json:"relogin_soon"`  // non-renewable sessions inside their warning window
 	AllProfilesBlocked bool `json:"all_profiles_blocked"`
 }
 
@@ -109,6 +120,9 @@ type RobotHealthInfo struct {
 	ExpiresAt    string `json:"expires_at,omitempty"`
 	ExpiresIn    string `json:"expires_in,omitempty"` // human-readable
 	ErrorCount1h int    `json:"error_count_1h"`
+	health.Signals
+	Renewable          bool          `json:"renewable"`
+	ReloginWarningLead time.Duration `json:"relogin_warning_lead,omitempty"`
 }
 
 // RobotCooldown contains cooldown information.
@@ -130,12 +144,16 @@ type RobotAuthPath struct {
 
 // RobotCoordinator contains coordinator status.
 type RobotCoordinator struct {
-	Name    string `json:"name"`
-	URL     string `json:"url"`
-	Healthy bool   `json:"healthy"`
-	Latency int64  `json:"latency_ms,omitempty"`
-	Error   string `json:"error,omitempty"`
-	Pending int    `json:"pending_auth_requests"`
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	Transport string `json:"transport"`
+	Source    string `json:"source"` // local (this host's coordinator) or agent (auth-agent config)
+	Healthy   bool   `json:"healthy"`
+	Latency   int64  `json:"latency_ms,omitempty"`
+	Backend   string `json:"backend,omitempty"`
+	Panes     int    `json:"panes"`
+	Error     string `json:"error,omitempty"`
+	Pending   int    `json:"pending_auth_requests"`
 }
 
 // RobotNextData contains recommended next action.
@@ -158,12 +176,16 @@ type RobotNextProfile struct {
 
 // RobotActResult is the result of an action.
 type RobotActResult struct {
-	Action     string `json:"action"`
-	Provider   string `json:"provider"`
-	Profile    string `json:"profile"`
-	OldProfile string `json:"old_profile,omitempty"`
-	Success    bool   `json:"success"`
-	Message    string `json:"message"`
+	Action               string   `json:"action"`
+	Provider             string   `json:"provider"`
+	Profile              string   `json:"profile"`
+	OldProfile           string   `json:"old_profile,omitempty"`
+	AutoBackup           string   `json:"auto_backup,omitempty"`
+	ResnapshottedProfile string   `json:"resnapshotted_profile,omitempty"`
+	KeptLive             bool     `json:"kept_live,omitempty"`
+	Warnings             []string `json:"warnings,omitempty"`
+	Success              bool     `json:"success"`
+	Message              string   `json:"message"`
 }
 
 var robotCmd = &cobra.Command{
@@ -293,16 +315,15 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 	includeCoords, _ := cmd.Flags().GetBool("include-coordinators")
 
 	// Determine which providers to check
-	providersToCheck := []string{"codex", "claude", "gemini", "opencode", "cursor"}
+	providersToCheck := supportedTools()
 	if len(args) > 0 {
 		providerFilter = strings.ToLower(args[0])
 	}
 	if providerFilter != "" {
-		validProviders := map[string]bool{"codex": true, "claude": true, "gemini": true, "opencode": true, "cursor": true}
-		if !validProviders[providerFilter] {
+		if _, ok := tools[providerFilter]; !ok {
 			return robotError(cmd, "status", "INVALID_PROVIDER",
 				fmt.Sprintf("unknown provider: %s", providerFilter),
-				"valid providers: codex, claude, gemini, opencode, cursor",
+				"valid providers: "+supportedToolsList(),
 				[]string{"caam robot status claude", "caam robot status codex", "caam robot status gemini"})
 		}
 		providersToCheck = []string{providerFilter}
@@ -334,6 +355,9 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 			data.Summary.ActiveProfiles++
 		}
 		for _, p := range provInfo.Profiles {
+			if p.System {
+				continue
+			}
 			isHealthy := p.Health.Status == "healthy"
 			inCooldown := p.Cooldown != nil && p.Cooldown.Active
 
@@ -343,16 +367,26 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 			if inCooldown {
 				data.Summary.CooldownProfiles++
 			}
-			// Count profiles that are usable (healthy AND not in cooldown)
-			if isHealthy && !inCooldown {
+			// Unknown expiry on a real credential is not proof that the pool is
+			// blocked. Preserve its unknown signal while counting it as a
+			// possible launch candidate, as next and precheck do.
+			usable := !inCooldown && (p.Health.LaunchUsable == nil || *p.Health.LaunchUsable)
+			if usable {
 				usableProfiles++
 			}
-			if p.Health.ExpiresAt != "" {
+			if p.Health.ExpiresAt != "" && !p.Health.Renewable {
 				if exp, err := time.Parse(time.RFC3339, p.Health.ExpiresAt); err == nil {
-					if time.Until(exp) < 24*time.Hour {
+					remaining := time.Until(exp)
+					if remaining <= max(24*time.Hour, p.Health.ReloginWarningLead) {
 						data.Summary.ExpiringSoon++
 					}
+					if remaining > 0 && p.Health.ReloginWarningLead > 0 && remaining <= p.Health.ReloginWarningLead {
+						data.Summary.ReloginSoon++
+					}
 				}
+			}
+			if p.Recommendation != "" && p.Recommendation != "ready to activate" {
+				suggestions = append(suggestions, p.Recommendation)
 			}
 		}
 	}
@@ -365,7 +399,10 @@ func runRobotStatus(cmd *cobra.Command, args []string) error {
 
 	// Add suggestions based on status
 	if data.Summary.ExpiringSoon > 0 {
-		suggestions = append(suggestions, fmt.Sprintf("%d profile(s) expiring within 24h. Consider refreshing tokens.", data.Summary.ExpiringSoon))
+		suggestions = append(suggestions, fmt.Sprintf("%d non-renewable profile(s) are inside their expiry warning window or have expired; log in again.", data.Summary.ExpiringSoon))
+	}
+	if data.Summary.ReloginSoon > 0 {
+		suggestions = append(suggestions, fmt.Sprintf("%d session profile(s) need a new login before expiry; see each profile's recommendation.", data.Summary.ReloginSoon))
 	}
 
 	// Check coordinators if requested
@@ -451,35 +488,46 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 	// Get health info. For the active profile the live auth location is the
 	// profile's real credential, so its expiry supersedes any stale vault
 	// snapshot (PR #82).
-	ph, id := getProfileHealthWithIdentity(tool, profileName)
-	if pInfo.Active {
+	ph, credentialErr := readVaultProfileHealth(tool, profileName)
+	id := getVaultIdentity(tool, profileName)
+	applyIdentityToHealth(tool, profileName, ph, id)
+	applyActiveCooldown(tool, profileName, ph)
+	if pInfo.Active && credentialErr == nil {
 		applyLiveExpiry(tool, ph)
 	}
 	status := health.CalculateStatus(ph)
-
-	pInfo.Health = RobotHealthInfo{
-		Status:       status.String(),
-		ErrorCount1h: ph.ErrorCount1h,
+	if credentialErr != nil {
+		status = health.StatusCritical
 	}
 
-	if !compact {
-		if !ph.TokenExpiresAt.IsZero() {
-			pInfo.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
-			remaining := time.Until(ph.TokenExpiresAt)
-			if remaining > 0 {
-				pInfo.Health.ExpiresIn = robotFormatDuration(remaining)
-			} else {
-				pInfo.Health.ExpiresIn = "expired"
-				if !ph.RateLimited(time.Now()) {
-					pInfo.Health.Reason = "token expired"
-				}
+	pInfo.Health = RobotHealthInfo{
+		Status:             status.String(),
+		ErrorCount1h:       ph.ErrorCount1h,
+		Signals:            health.CredentialSignals(ph, health.DefaultHealthConfig()),
+		Renewable:          ph.CredentialRenewable(),
+		ReloginWarningLead: ph.ReloginWarningLead,
+	}
+
+	if !ph.TokenExpiresAt.IsZero() {
+		pInfo.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+		remaining := time.Until(ph.TokenExpiresAt)
+		if remaining > 0 {
+			pInfo.Health.ExpiresIn = robotFormatDuration(remaining)
+		} else {
+			pInfo.Health.ExpiresIn = "expired"
+			if !ph.CredentialRenewable() && !ph.RateLimited(time.Now()) {
+				pInfo.Health.Reason = "token expired"
 			}
 		}
+	}
 
-		// Set reason based on status
-		if status == health.StatusWarning || status == health.StatusCritical {
-			pInfo.Health.Reason = getHealthReason(ph, status)
-		}
+	// Compact output still carries the reason needed to act on its verdict.
+	if status == health.StatusWarning || status == health.StatusCritical {
+		pInfo.Health.Reason = getHealthReason(ph, status)
+	}
+	if credentialErr != nil {
+		pInfo.Health.Reason = credentialErr.Error()
+		pInfo.Health.Signals = invalidCredentialSignals()
 	}
 
 	// Get identity info
@@ -511,7 +559,14 @@ func buildProfileInfo(tool, profileName, activeProfile string, db *caamdb.DB, co
 
 	// Generate recommendation (unless compact)
 	if !compact {
-		pInfo.Recommendation = generateRecommendation(pInfo)
+		if credentialErr != nil {
+			pInfo.Recommendation = fmt.Sprintf("log in with %s, then run 'caam backup %s %s' to save the credentials", tool, tool, profileName)
+		} else {
+			pInfo.Recommendation = health.FormatRecommendation(tool, profileName, ph)
+		}
+		if pInfo.Recommendation == "" {
+			pInfo.Recommendation = generateRecommendation(pInfo)
+		}
 	}
 
 	return pInfo
@@ -525,19 +580,46 @@ func getHealthReason(ph *health.ProfileHealth, status health.HealthStatus) strin
 	// be reported as a token problem: the recorded expiry may be a stale
 	// vault snapshot, and the cap clears on its own timer (PR #82).
 	if now := time.Now(); ph.RateLimited(now) {
-		return fmt.Sprintf("rate limited (resets in %s)", robotFormatDuration(ph.RateLimitedUntil.Sub(now)))
+		reason := fmt.Sprintf("rate limited (resets in %s)", robotFormatDuration(ph.RateLimitedUntil.Sub(now)))
+		// A known non-renewable session deadline still needs action: a
+		// cooldown resetting cannot restore an expired Cursor login.
+		if !ph.CredentialRenewable() && ph.ReloginWarningLead > 0 && !ph.TokenExpiresAt.IsZero() && ph.TokenExpiresAt.Sub(now) <= ph.ReloginWarningLead {
+			if !ph.TokenExpiresAt.After(now) {
+				return reason + "; session expired; login required"
+			}
+			return reason + "; session expiring soon; login required before expiry"
+		}
+		return reason
 	}
 
 	if status == health.StatusCritical {
-		if !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= 0 {
+		// The provider refused this credential (issue #108); its expiry
+		// may still look days away, so say what actually has to happen.
+		if ph.ProviderRejected() {
+			reason := "provider rejected credential"
+			if ph.ProviderRejection != "" {
+				reason += " (" + ph.ProviderRejection + ")"
+			}
+			return reason + "; login required"
+		}
+		if !ph.CredentialRenewable() && !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) <= 0 {
+			if ph.ReloginWarningLead > 0 {
+				return "session expired; login required"
+			}
 			return "token expired"
 		}
 		if ph.ErrorCount1h >= cfg.ErrorCountCritical {
 			return fmt.Sprintf("high error rate (%d errors in 1h)", ph.ErrorCount1h)
 		}
+		if !ph.CredentialRenewable() && !ph.TokenExpiresAt.IsZero() && ph.ReloginWarningLead > 0 && time.Until(ph.TokenExpiresAt) <= ph.ReloginWarningLead {
+			return "session expiring soon; login required before expiry"
+		}
 	}
 	if status == health.StatusWarning {
-		if !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) < 24*time.Hour {
+		if !ph.CredentialRenewable() && !ph.TokenExpiresAt.IsZero() && ph.ReloginWarningLead > 0 && time.Until(ph.TokenExpiresAt) <= ph.ReloginWarningLead {
+			return "session expiring soon; login required before expiry"
+		}
+		if !ph.CredentialRenewable() && !ph.TokenExpiresAt.IsZero() && time.Until(ph.TokenExpiresAt) < 24*time.Hour {
 			return "token expiring soon"
 		}
 		if ph.ErrorCount1h >= cfg.ErrorCountWarning {
@@ -552,12 +634,21 @@ func generateRecommendation(p RobotProfileInfo) string {
 		return fmt.Sprintf("wait for cooldown (%s remaining)", p.Cooldown.RemainingStr)
 	}
 	if p.Health.Status == "critical" {
+		if p.Health.LoginRequired != nil && *p.Health.LoginRequired {
+			return "log in again"
+		}
+		if strings.Contains(p.Health.Reason, "login required") {
+			return "log in again"
+		}
 		if strings.Contains(p.Health.Reason, "expired") {
 			return "refresh token required"
 		}
 		return "investigate errors before use"
 	}
 	if p.Health.Status == "warning" {
+		if strings.Contains(p.Health.Reason, "login required") {
+			return "log in again before session expiry"
+		}
 		if strings.Contains(p.Health.Reason, "expiring") {
 			return "consider refreshing token soon"
 		}
@@ -591,48 +682,69 @@ func robotFormatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dd", days)
 }
 
+// checkCoordinators probes this host's coordinator (from its config file,
+// with its token) and every coordinator in the local auth-agent config
+// (through its SSH tunnel when configured), concurrently.
 func checkCoordinators() []RobotCoordinator {
-	// Check known coordinator endpoints
-	// This is a simplified version - in production, this would read from config
-	endpoints := []struct {
-		name string
-		url  string
-	}{
-		{"local", "http://localhost:7890"},
+	type target struct {
+		source   string
+		endpoint *agent.CoordinatorEndpoint
 	}
+	var targets []target
 
-	var coords []RobotCoordinator
-	client := &http.Client{Timeout: 2 * time.Second}
-
-	for _, ep := range endpoints {
-		coord := RobotCoordinator{
-			Name: ep.name,
-			URL:  ep.url,
+	if dir, err := os.UserConfigDir(); err == nil {
+		if fc, err := coordinator.LoadFileConfig(filepath.Join(dir, "caam", "coordinator.json")); err == nil {
+			bind := strings.TrimSpace(fc.Bind)
+			if bind == "" || bind == "0.0.0.0" || bind == "::" {
+				bind = coordinator.DefaultBindAddress
+			}
+			port := fc.Port
+			if port == 0 {
+				port = 7890
+			}
+			targets = append(targets, target{"local", &agent.CoordinatorEndpoint{
+				Name: "local", URL: "http://" + coordinator.ListenAddress(bind, port), Token: fc.AuthToken,
+			}})
 		}
-
-		start := time.Now()
-		resp, err := client.Get(ep.url + "/status")
-		coord.Latency = time.Since(start).Milliseconds()
-
-		if err != nil {
-			coord.Error = err.Error()
-			coord.Healthy = false
-		} else {
-			resp.Body.Close()
-			coord.Healthy = resp.StatusCode == http.StatusOK
-
-			// Try to get pending count
-			if pendResp, err := client.Get(ep.url + "/auth/pending"); err == nil {
-				var pending []interface{}
-				json.NewDecoder(pendResp.Body).Decode(&pending)
-				pendResp.Body.Close()
-				coord.Pending = len(pending)
+	}
+	if fc, err := agent.LoadFileConfig(agent.DefaultConfigPath()); err == nil {
+		for _, c := range fc.Coordinators {
+			if c != nil {
+				targets = append(targets, target{"agent", c})
 			}
 		}
-
-		coords = append(coords, coord)
+		if len(fc.Coordinators) == 0 && (fc.CoordinatorURL != "" || fc.Coordinator != "") {
+			url := firstNonEmpty(fc.CoordinatorURL, fc.Coordinator)
+			targets = append(targets, target{"agent", &agent.CoordinatorEndpoint{Name: "coordinator", URL: url, Token: fc.CoordinatorToken}})
+		}
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	coords := make([]RobotCoordinator, len(targets))
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		wg.Add(1)
+		go func(i int, t target) {
+			defer wg.Done()
+			defer t.endpoint.Close()
+			probe := t.endpoint.Probe(ctx)
+			coords[i] = RobotCoordinator{
+				Name:      t.endpoint.Name,
+				URL:       t.endpoint.URL,
+				Transport: t.endpoint.Transport(),
+				Source:    t.source,
+				Healthy:   probe.Healthy,
+				Latency:   probe.Latency.Milliseconds(),
+				Backend:   probe.Backend,
+				Panes:     probe.PaneCount,
+				Pending:   probe.PendingAuths,
+				Error:     probe.Error,
+			}
+		}(i, t)
+	}
+	wg.Wait()
 	return coords
 }
 
@@ -688,7 +800,18 @@ func runRobotNext(cmd *cobra.Command, args []string) error {
 	now := time.Now()
 
 	for _, profileName := range profiles {
+		if authfile.IsSystemProfile(profileName) {
+			continue
+		}
 		pInfo := buildProfileInfo(provider, profileName, "", db, false)
+		// Including cooldowns must never admit an absent, expired, or rejected
+		// credential. Unknown expiry alone is not evidence of unusability.
+		if pInfo.Health.LoginRequired != nil && *pInfo.Health.LoginRequired {
+			continue
+		}
+		if !includeCooldown && pInfo.Health.LaunchUsable != nil && !*pInfo.Health.LaunchUsable {
+			continue
+		}
 
 		// Skip profiles in cooldown unless requested
 		if !includeCooldown && pInfo.Cooldown != nil && pInfo.Cooldown.Active {
@@ -729,7 +852,7 @@ func runRobotNext(cmd *cobra.Command, args []string) error {
 		}
 
 		// Token expiry consideration
-		if pInfo.Health.ExpiresAt != "" {
+		if pInfo.Health.ExpiresAt != "" && !pInfo.Health.Renewable {
 			if exp, err := time.Parse(time.RFC3339, pInfo.Health.ExpiresAt); err == nil {
 				remaining := exp.Sub(now)
 				if remaining > 7*24*time.Hour {
@@ -843,22 +966,58 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 		profile := args[2]
 		result.Profile = profile
 
-		// Get current active profile
 		fileSet := tools[provider]()
-		if oldProfile, err := vault.ActiveProfile(fileSet); err == nil {
-			result.OldProfile = oldProfile
-		}
-
-		// Activate the profile
-		if err := vault.Restore(fileSet, profile); err != nil {
+		switched, err := vault.Switch(fileSet, profile, loadSwitchOptions())
+		if err != nil {
 			return robotError(cmd, "act", "ACTIVATE_FAILED",
 				fmt.Sprintf("failed to activate %s/%s", provider, profile),
 				err.Error(),
 				[]string{fmt.Sprintf("caam robot status %s", provider)})
 		}
+		result.OldProfile = switched.PreviousProfile
+		result.AutoBackup = switched.AutoBackup
+		result.ResnapshottedProfile = switched.ResnapshottedProfile
+		result.KeptLive = switched.KeptLive
+		result.Warnings = switched.Warnings
 
 		result.Success = true
 		result.Message = fmt.Sprintf("activated %s/%s", provider, profile)
+		if switched.KeptLive {
+			result.Message = fmt.Sprintf("kept live credentials for %s/%s", provider, profile)
+		}
+
+	case "refresh":
+		if len(args) < 3 {
+			return robotError(cmd, "act", "MISSING_PROFILE",
+				"profile name required for refresh",
+				"usage: caam robot act refresh <provider> <profile>", nil)
+		}
+		profile := args[2]
+		result.Profile = profile
+		if err := ensureVaultProfileDir(provider, profile); err != nil {
+			return robotError(cmd, "act", "PROFILE_NOT_FOUND", "saved profile not found", err.Error(), nil)
+		}
+		if err := vault.ValidateProfileCredentials(tools[provider](), profile); err != nil {
+			return robotError(cmd, "act", "REFRESH_FAILED", "saved credential is not usable for refresh", err.Error(), nil)
+		}
+		refreshErr := refresh.RefreshProfile(cmd.Context(), provider, profile, vault, healthStore, refresh.WithProfileStore(profileStore))
+		if refreshErr != nil && !refresh.IsDeliveryIncomplete(refreshErr) {
+			code := "REFRESH_FAILED"
+			switch {
+			case errors.Is(refreshErr, refresh.ErrUnsupported):
+				code = "REFRESH_UNSUPPORTED"
+			case refresh.IsSkipped(refreshErr):
+				code = "REFRESH_SKIPPED"
+			}
+			return robotError(cmd, "act", code,
+				fmt.Sprintf("credential was not refreshed for %s/%s", provider, profile),
+				refreshErr.Error(), []string{fmt.Sprintf("caam robot validate %s %s", provider, profile)})
+		}
+		if refreshErr != nil {
+			result.Warnings = append(result.Warnings, refreshErr.Error())
+		}
+		result.Success = true
+		result.Message = fmt.Sprintf("refreshed %s/%s", provider, profile)
 
 	case "cooldown":
 		if len(args) < 3 {
@@ -936,7 +1095,9 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 				nil)
 		}
 
-		profile := "backup-" + time.Now().Format("20060102-150405")
+		// An unnamed snapshot is a system backup, not another account eligible
+		// for routing or a new active-profile identity.
+		profile := "_backup_" + time.Now().Format("20060102_150405.000000000")
 		if len(args) >= 3 {
 			profile = args[2]
 		}
@@ -951,15 +1112,19 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 
 		result.Success = true
 		result.Message = fmt.Sprintf("backed up to %s/%s", provider, profile)
+		if provider == "claude" {
+			result.Warnings = claudeBackupIdentityWarnings(vault.ProfilePath(provider, profile))
+		}
 
 	default:
 		return robotError(cmd, "act", "INVALID_ACTION",
 			fmt.Sprintf("unknown action: %s", action),
-			"valid actions: activate, cooldown, uncooldown, backup",
+			"valid actions: activate, cooldown, uncooldown, refresh, backup",
 			[]string{
 				"caam robot act activate <provider> <profile>",
 				"caam robot act cooldown <provider> <profile> [duration]",
 				"caam robot act uncooldown <provider> <profile>",
+				"caam robot act refresh <provider> <profile>",
 				"caam robot act backup <provider> [profile]",
 			})
 	}
@@ -1000,7 +1165,7 @@ func runRobotHealth(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check vault
-	vaultPath := authfile.DefaultVaultPath()
+	vaultPath := vault.BasePath()
 	if _, err := os.Stat(vaultPath); err == nil {
 		result.Checks = append(result.Checks, HealthCheck{
 			Name:   "vault",
@@ -1036,20 +1201,30 @@ func runRobotHealth(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check each provider
-	for _, tool := range []string{"codex", "claude", "gemini"} {
+	for _, tool := range supportedTools() {
+		fileSetFn := tools[tool]
+		if fileSetFn == nil {
+			continue
+		}
 		profiles, err := vault.List(tool)
 		if err != nil {
 			continue
 		}
 
 		healthyCount := 0
-		totalCount := len(profiles)
+		totalCount := 0
+		activeProfile, _ := vault.ActiveProfile(fileSetFn())
 
 		for _, profileName := range profiles {
-			ph := buildProfileHealth(tool, profileName)
-			status := health.CalculateStatus(ph)
-			if status == health.StatusHealthy {
+			if authfile.IsSystemProfile(profileName) {
+				continue
+			}
+			totalCount++
+			pInfo := buildProfileInfo(tool, profileName, activeProfile, nil, false)
+			if pInfo.Health.Status == "healthy" {
 				healthyCount++
+			} else if pInfo.Recommendation != "" {
+				result.Suggestions = append(result.Suggestions, pInfo.Recommendation)
 			}
 		}
 
@@ -1141,7 +1316,7 @@ func runRobotWatch(cmd *cobra.Command, args []string) error {
 }
 
 func emitWatchStatus(cmd *cobra.Command, providerFilter string) error {
-	providersToCheck := []string{"codex", "claude", "gemini"}
+	providersToCheck := supportedTools()
 	if providerFilter != "" {
 		providersToCheck = []string{providerFilter}
 	}
@@ -1186,9 +1361,12 @@ caam robot act activate claude <profile>   # Switch profile
 caam robot act cooldown claude <profile> 1h  # Set cooldown
 caam robot act uncooldown claude <profile>   # Clear cooldown
 caam robot act backup claude [name]          # Backup current auth
-caam robot act delete claude <profile>       # Delete profile
-caam robot act refresh claude <profile>      # Refresh token
+caam robot act refresh codex <profile>       # Refresh a CAAM-managed token
 ` + "```" + `
+
+Claude and Grok renew through their own CLIs. A robot refresh request for an
+unsupported credential returns REFRESH_UNSUPPORTED and a nonzero exit status.
+Validation checks saved credentials locally; it does not probe the provider.
 
 ## Diagnostics
 ` + "```" + `
@@ -1197,6 +1375,8 @@ caam robot doctor              # Full diagnostics
 caam robot validate claude     # Token validation
 caam robot paths               # Auth file locations
 caam robot history             # Recent activity
+caam robot docs                # All commands/flags, exit and error codes, JSON Schemas
+caam robot docs schemas ls     # JSON Schema for one output
 ` + "```" + `
 
 ## Configuration
@@ -1222,16 +1402,23 @@ All commands return:
 ## Error Codes
 - INVALID_PROVIDER: Unknown provider (use: claude, codex, gemini)
 - NO_PROFILES: No profiles exist for provider
-- ALL_BLOCKED: All profiles in cooldown/unhealthy
+- ALL_BLOCKED: No profile meets credential, cooldown, and requested quota checks
+- INVALID_TIMEOUT: Quota timeout must be positive
+- QUOTA_UNAVAILABLE: No profile has measurable quota
+- REQUEST_CANCELED: The caller canceled the operation
 - MISSING_PROFILE: Profile name required
 - VAULT_ERROR: Cannot access profile storage
+- PROFILE_NOT_FOUND: The requested saved profile does not exist
+- REFRESH_UNSUPPORTED: Renewal belongs to the native CLI or requires a new login
+- REFRESH_SKIPPED: The saved credential cannot be safely refreshed
+- ACTIVE_VALIDATION_UNSUPPORTED: Provider probing is unavailable for saved profiles
 
 ## Typical Workflow
 1. ` + "`caam robot precheck claude`" + ` - Plan session
 2. ` + "`caam robot act activate claude <best>`" + ` - Switch
 3. Work until rate limited...
 4. ` + "`caam robot act cooldown claude <current> 1h`" + ` - Mark cooldown
-5. ` + "`caam robot next claude`" + ` - Get next best
+5. ` + "`caam robot precheck claude`" + ` - Refresh quotas and choose the next account
 6. Repeat from step 2
 `
 	fmt.Fprint(cmd.OutOrStdout(), guide)
@@ -1244,11 +1431,15 @@ All commands return:
 
 var robotLimitsCmd = &cobra.Command{
 	Use:   "limits <provider>",
-	Short: "Fetch rate limits and burn rate",
+	Short: "Fetch measured rate limits",
 	Long: `Fetches real-time rate limit data from provider APIs.
 
-Returns usage percentages, reset times, burn rates, and depletion forecasts.
-Useful for deciding when to switch profiles.`,
+Returns measured usage, applicable model restrictions, reset times, and
+explicit quota availability. Unknown percentages are omitted, including an
+inapplicable session window. With --forecast, a depletion estimate is included
+only when an attributable percentage burn rate is available; otherwise
+forecast_error explains why no estimate can be made. Reset times do not
+guarantee that every allowance will be available afterward.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runRobotLimits,
 }
@@ -1260,8 +1451,14 @@ var robotPrecheckCmd = &cobra.Command{
 - Recommended profile with score breakdown
 - Backup profiles in priority order
 - Profiles in cooldown
-- Usage forecasts and alerts
-- Quick action commands`,
+- Measured quota diagnostics and alerts
+- Quick action commands
+
+By default, recommendations require both usable saved credentials and measured
+available quota. --model applies the requested model's restrictions alongside
+general quotas; an omitted model conservatively includes every scoped limit.
+--no-fetch performs credential and cooldown checks only and reports
+quota_checked=false; it does not read a quota cache.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runRobotPrecheck,
 }
@@ -1348,10 +1545,13 @@ func init() {
 
 	// Limits flags
 	robotLimitsCmd.Flags().Bool("forecast", false, "include depletion forecasts")
+	robotLimitsCmd.Flags().Duration("timeout", 30*time.Second, "quota API fetch timeout")
+	robotLimitsCmd.Flags().String("model", "", "model whose quota restrictions apply")
 
 	// Precheck flags
 	robotPrecheckCmd.Flags().Duration("timeout", 30*time.Second, "API fetch timeout")
-	robotPrecheckCmd.Flags().Bool("no-fetch", false, "skip API calls (use cached data)")
+	robotPrecheckCmd.Flags().Bool("no-fetch", false, "skip quota API calls; plan from credential health and cooldowns only")
+	robotPrecheckCmd.Flags().String("model", "", "model whose quota restrictions apply")
 
 	// Validate flags
 	robotValidateCmd.Flags().Bool("active", false, "perform active validation (API calls)")
@@ -1368,26 +1568,155 @@ func init() {
 
 // RobotLimitsData contains rate limit information.
 type RobotLimitsData struct {
-	Provider string               `json:"provider"`
-	Profiles []RobotProfileLimits `json:"profiles"`
+	Provider     string               `json:"provider"`
+	Model        string               `json:"model,omitempty"`
+	QuotaChecked bool                 `json:"quota_checked"`
+	Profiles     []RobotProfileLimits `json:"profiles"`
 }
 
 // RobotProfileLimits contains rate limits for a profile.
 type RobotProfileLimits struct {
-	Name           string `json:"name"`
-	AvailScore     int    `json:"availability_score"`
-	PrimaryPct     int    `json:"primary_percent,omitempty"`
-	SecondaryPct   int    `json:"secondary_percent,omitempty"`
-	ResetsIn       string `json:"resets_in,omitempty"`
-	BurnRate       string `json:"burn_rate,omitempty"`
-	DepletesIn     string `json:"depletes_in,omitempty"`
-	Error          string `json:"error,omitempty"`
-	Recommendation string `json:"recommendation,omitempty"`
+	Name               string           `json:"name"`
+	AvailScore         int              `json:"availability_score"`
+	QuotaKnown         bool             `json:"quota_known"`
+	QuotaAvailable     bool             `json:"quota_available"`
+	PrimaryPct         *float64         `json:"primary_percent,omitempty"`
+	SecondaryPct       *float64         `json:"secondary_percent,omitempty"`
+	BindingPct         *float64         `json:"binding_percent,omitempty"`
+	Usage              *usage.UsageInfo `json:"usage,omitempty"`
+	ResetsIn           string           `json:"resets_in,omitempty"`
+	BurnRate           string           `json:"burn_rate,omitempty"`
+	DepletesIn         string           `json:"depletes_in,omitempty"`
+	ForecastConfidence *float64         `json:"forecast_confidence,omitempty"`
+	ForecastError      string           `json:"forecast_error,omitempty"`
+	Error              string           `json:"error,omitempty"`
+	Recommendation     string           `json:"recommendation,omitempty"`
+}
+
+// fetchRobotUsage reads only the requested saved profiles. Missing credentials,
+// unsupported providers, and failed reads remain explicit unknown rows rather
+// than silently turning a requested quota check into credential-only planning.
+func fetchRobotUsage(ctx context.Context, vaultDir, provider string, profiles []string, timeout time.Duration) map[string]*usage.UsageInfo {
+	results := make(map[string]*usage.UsageInfo, len(profiles))
+	for _, name := range profiles {
+		if authfile.IsSystemProfile(name) {
+			continue
+		}
+		results[name] = &usage.UsageInfo{
+			Provider: provider, ProfileName: name, Source: usage.SourceAPI,
+			FetchedAt: time.Now(), QuotaStatus: usage.QuotaUnavailable,
+			Error: "no readable quota credential for saved profile",
+		}
+	}
+	unavailable := func(reason string) {
+		for _, info := range results {
+			info.QuotaStatus = usage.QuotaUnavailable
+			info.QuotaNote = reason
+			info.Error = reason
+		}
+	}
+	if len(results) == 0 {
+		return results
+	}
+	if err := ctx.Err(); err != nil {
+		unavailable(err.Error())
+		return results
+	}
+	if !isLimitsProvider(provider) {
+		unavailable("quota reads are not supported for this provider")
+		return results
+	}
+	credentials, err := usage.LoadProfileCredentials(vaultDir, provider)
+	if err != nil {
+		unavailable("saved quota credentials could not be read")
+		return results
+	}
+	selected := make(map[string]string, len(results))
+	for name := range results {
+		if token := credentials[name]; token != "" {
+			selected[name] = token
+		}
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// The machine's local session logs do not identify these saved accounts.
+	// Do not attach their shared burn rate to individual quota responses.
+	fetcher := usage.NewMultiProfileFetcher()
+	for _, result := range fetcher.FetchAllProfiles(queryCtx, provider, selected) {
+		if _, requested := results[result.ProfileName]; requested && result.Provider == provider && result.Usage != nil {
+			results[result.ProfileName] = result.Usage
+		}
+	}
+	// Caller cancellation invalidates a recommendation for this operation.
+	// A query deadline can still leave independently completed rows usable.
+	if err := ctx.Err(); err != nil {
+		unavailable(err.Error())
+	}
+	return results
+}
+
+// buildRobotProfileLimits keeps measured quota independent of forecastability.
+// Diagnostic provider windows remain available even when the complete response
+// is unusable for selection; only trustworthy rows acquire percentage fields.
+func buildRobotProfileLimits(name string, info *usage.UsageInfo, model string, forecast bool) RobotProfileLimits {
+	result := RobotProfileLimits{Name: name, Usage: info}
+	if !info.NumericQuotaKnown() {
+		result.Error = "numeric quota unavailable"
+		if info != nil {
+			if info.Error != "" {
+				result.Error = info.Error
+			} else if info.QuotaNote != "" {
+				result.Error = info.QuotaNote
+			}
+		}
+		result.Recommendation = "quota unavailable; refresh before choosing this profile"
+		return result
+	}
+	percent := func(window *usage.UsageWindow) *float64 {
+		if window == nil {
+			return nil
+		}
+		value := math.Max(window.Utilization*100, float64(window.UsedPercent))
+		return &value
+	}
+	result.QuotaKnown = true
+	result.QuotaAvailable = !info.IsNearLimitForModel(1, model)
+	result.AvailScore = info.AvailabilityScoreForModel(model)
+	result.PrimaryPct = percent(info.PrimaryWindow)
+	result.SecondaryPct = percent(info.SecondaryWindow)
+	result.BindingPct = percent(info.MostConstrainedWindowForModel(model))
+	if reset := info.EarliestResetForModel(model); !reset.IsZero() {
+		if remaining := time.Until(reset); remaining > 0 {
+			result.ResetsIn = robotFormatDuration(remaining)
+		}
+	}
+	if result.QuotaAvailable {
+		result.Recommendation = "measured quota available"
+	} else {
+		result.Recommendation = "applicable quota exhausted; refresh after reset before choosing this profile"
+	}
+	if forecast {
+		pred := prediction.NewPredictionEngine(prediction.WithModel(model)).Predict(context.Background(), info)
+		if pred.IsValid() && pred.TimeToDepletion > 0 {
+			result.DepletesIn = robotFormatDuration(pred.TimeToDepletion)
+			result.ForecastConfidence = &pred.Confidence
+			if pred.BurnRate != nil {
+				result.BurnRate = fmt.Sprintf("%.2f%%/hour", pred.BurnRate.PercentPerHour)
+			}
+		} else {
+			result.ForecastError = pred.Error
+		}
+	}
+	return result
 }
 
 func runRobotLimits(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 	provider := strings.ToLower(args[0])
+	timeout, _ := cmd.Flags().GetDuration("timeout")
+	model, _ := cmd.Flags().GetString("model")
+	model = strings.TrimSpace(model)
+	forecast, _ := cmd.Flags().GetBool("forecast")
 
 	if _, ok := tools[provider]; !ok {
 		return robotError(cmd, "limits", "INVALID_PROVIDER",
@@ -1396,7 +1725,10 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 			nil)
 	}
 
-	// For now, use health data as a proxy. Full implementation would call usage APIs.
+	if timeout <= 0 {
+		return robotError(cmd, "limits", "INVALID_TIMEOUT", "quota timeout must be positive", "", nil)
+	}
+
 	profiles, err := vault.List(provider)
 	if err != nil {
 		return robotError(cmd, "limits", "VAULT_ERROR",
@@ -1405,6 +1737,13 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 			nil)
 	}
 
+	userProfiles := profiles[:0]
+	for _, name := range profiles {
+		if !authfile.IsSystemProfile(name) {
+			userProfiles = append(userProfiles, name)
+		}
+	}
+	profiles = userProfiles
 	if len(profiles) == 0 {
 		return robotError(cmd, "limits", "NO_PROFILES",
 			fmt.Sprintf("no profiles found for %s", provider),
@@ -1413,44 +1752,25 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 	}
 
 	data := RobotLimitsData{
-		Provider: provider,
-		Profiles: make([]RobotProfileLimits, 0, len(profiles)),
+		Provider:     provider,
+		Model:        model,
+		QuotaChecked: true,
+		Profiles:     make([]RobotProfileLimits, 0, len(profiles)),
 	}
 
+	usageMap := fetchRobotUsage(cmd.Context(), vault.BasePath(), provider, profiles, timeout)
+	known := 0
 	for _, profileName := range profiles {
-		if strings.HasPrefix(profileName, "_") {
-			continue
+		limits := buildRobotProfileLimits(profileName, usageMap[profileName], model, forecast)
+		if limits.QuotaKnown {
+			known++
 		}
-
-		limits := RobotProfileLimits{
-			Name: profileName,
-		}
-
-		// Get health info for estimates
-		ph, _ := getProfileHealthWithIdentity(provider, profileName)
-		status := health.CalculateStatus(ph)
-
-		switch status {
-		case health.StatusHealthy:
-			limits.AvailScore = 100
-			limits.Recommendation = "ready to use"
-		case health.StatusWarning:
-			limits.AvailScore = 50
-			limits.Recommendation = "use with caution"
-		case health.StatusCritical:
-			limits.AvailScore = 10
-			limits.Recommendation = "avoid - issues detected"
-		default:
-			limits.AvailScore = 0
-			limits.Recommendation = "status unknown"
-		}
-
 		data.Profiles = append(data.Profiles, limits)
 	}
 
 	duration := time.Since(start)
 	output := RobotOutput{
-		Success: true,
+		Success: known > 0 && cmd.Context().Err() == nil,
 		Command: "limits",
 		Data:    data,
 		Timing: &RobotTiming{
@@ -1459,27 +1779,43 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 		},
 	}
 
-	return robotOutput(cmd, output)
+	if !output.Success {
+		output.Error = &RobotError{Code: "QUOTA_UNAVAILABLE", Message: "no profile has measurable quota"}
+		if err := cmd.Context().Err(); err != nil {
+			output.Error = &RobotError{Code: "REQUEST_CANCELED", Message: err.Error()}
+		}
+	}
+	if err := robotOutput(cmd, output); err != nil {
+		return err
+	}
+	if !output.Success {
+		return errors.New(output.Error.Message)
+	}
+	return nil
 }
 
 // RobotPrecheckData contains session planning data.
 type RobotPrecheckData struct {
-	Provider    string                 `json:"provider"`
-	Recommended *RobotPrecheckProfile  `json:"recommended,omitempty"`
-	Backups     []RobotPrecheckProfile `json:"backups"`
-	InCooldown  []RobotCooldownProfile `json:"in_cooldown"`
-	Alerts      []RobotPrecheckAlert   `json:"alerts,omitempty"`
-	Summary     RobotPrecheckSummary   `json:"summary"`
-	Commands    RobotPrecheckCommands  `json:"commands"`
+	Provider     string                 `json:"provider"`
+	Model        string                 `json:"model,omitempty"`
+	QuotaChecked bool                   `json:"quota_checked"`
+	Recommended  *RobotPrecheckProfile  `json:"recommended,omitempty"`
+	Backups      []RobotPrecheckProfile `json:"backups"`
+	Blocked      []RobotPrecheckProfile `json:"blocked"`
+	InCooldown   []RobotCooldownProfile `json:"in_cooldown"`
+	Alerts       []RobotPrecheckAlert   `json:"alerts,omitempty"`
+	Summary      RobotPrecheckSummary   `json:"summary"`
+	Commands     RobotPrecheckCommands  `json:"commands"`
 }
 
 // RobotPrecheckProfile is a profile with recommendation data.
 type RobotPrecheckProfile struct {
-	Name       string   `json:"name"`
-	Score      float64  `json:"score"`
-	Health     string   `json:"health"`
-	Reasons    []string `json:"reasons"`
-	PoolStatus string   `json:"pool_status,omitempty"`
+	Name       string              `json:"name"`
+	Score      float64             `json:"score"`
+	Health     string              `json:"health"`
+	Reasons    []string            `json:"reasons"`
+	PoolStatus string              `json:"pool_status,omitempty"`
+	Quota      *RobotProfileLimits `json:"quota,omitempty"`
 }
 
 // RobotCooldownProfile is a profile in cooldown.
@@ -1517,12 +1853,20 @@ type RobotPrecheckCommands struct {
 func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 	provider := strings.ToLower(args[0])
+	noFetch, _ := cmd.Flags().GetBool("no-fetch")
+	timeout, _ := cmd.Flags().GetDuration("timeout")
+	model, _ := cmd.Flags().GetString("model")
+	model = strings.TrimSpace(model)
 
 	if _, ok := tools[provider]; !ok {
 		return robotError(cmd, "precheck", "INVALID_PROVIDER",
 			fmt.Sprintf("unknown provider: %s", provider),
 			"valid providers: codex, claude, gemini",
 			nil)
+	}
+
+	if !noFetch && timeout <= 0 {
+		return robotError(cmd, "precheck", "INVALID_TIMEOUT", "quota timeout must be positive", "", nil)
 	}
 
 	profiles, err := vault.List(provider)
@@ -1546,21 +1890,29 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 	}()
 
 	data := RobotPrecheckData{
-		Provider:   provider,
-		Backups:    make([]RobotPrecheckProfile, 0),
-		InCooldown: make([]RobotCooldownProfile, 0),
+		Provider:     provider,
+		Model:        model,
+		QuotaChecked: !noFetch,
+		Backups:      make([]RobotPrecheckProfile, 0),
+		Blocked:      make([]RobotPrecheckProfile, 0),
+		InCooldown:   make([]RobotCooldownProfile, 0),
 		Commands: RobotPrecheckCommands{
 			Next: fmt.Sprintf("caam robot next %s", provider),
-			Run:  fmt.Sprintf("caam run %s -- <command>", provider),
 		},
+	}
+	if !noFetch {
+		data.Commands.Next = fmt.Sprintf("caam robot precheck %s", provider)
+		if model != "" {
+			data.Commands.Next += " --model " + shellQuote(model)
+		}
 	}
 
 	now := time.Now()
-	var bestScore float64 = -9999
-	var bestProfile string
+	candidates := make([]RobotPrecheckProfile, 0, len(profiles))
+	candidateNames := make([]string, 0, len(profiles))
 
 	for _, profileName := range profiles {
-		if strings.HasPrefix(profileName, "_") {
+		if authfile.IsSystemProfile(profileName) {
 			continue
 		}
 
@@ -1582,67 +1934,123 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// Get health
-		ph, _ := getProfileHealthWithIdentity(provider, profileName)
-		status := health.CalculateStatus(ph)
+		// Use the same checked credentials and launch signals as robot next.
+		pInfo := buildProfileInfo(provider, profileName, "", db, false)
 
 		rec := RobotPrecheckProfile{
 			Name:    profileName,
-			Health:  status.String(),
+			Health:  pInfo.Health.Status,
 			Reasons: []string{},
 		}
 
 		// Calculate score
-		switch status {
-		case health.StatusHealthy:
+		switch pInfo.Health.Status {
+		case "healthy":
 			rec.Score = 100
 			rec.Reasons = append(rec.Reasons, "+healthy status")
 			data.Summary.Healthy++
-		case health.StatusWarning:
+		case "warning":
 			rec.Score = 50
 			rec.Reasons = append(rec.Reasons, "-warning status")
 			data.Summary.Warning++
-		case health.StatusCritical:
+		case "critical":
 			rec.Score = 10
 			rec.Reasons = append(rec.Reasons, "-critical status")
 			data.Summary.Critical++
 		default:
 			rec.Score = 30
 		}
+		if pInfo.Health.Reason != "" {
+			rec.Reasons = append(rec.Reasons, pInfo.Health.Reason)
+		}
+		if (pInfo.Health.LoginRequired != nil && *pInfo.Health.LoginRequired) ||
+			(pInfo.Health.LaunchUsable != nil && !*pInfo.Health.LaunchUsable) {
+			data.Blocked = append(data.Blocked, rec)
+			continue
+		}
+		candidates = append(candidates, rec)
+		candidateNames = append(candidateNames, profileName)
+	}
+
+	var usageMap map[string]*usage.UsageInfo
+	if !noFetch {
+		usageMap = fetchRobotUsage(cmd.Context(), vault.BasePath(), provider, candidateNames, timeout)
+	}
+	for _, rec := range candidates {
+		if !noFetch {
+			info := usageMap[rec.Name]
+			quota := buildRobotProfileLimits(rec.Name, info, model, false)
+			rec.Quota = &quota
+			_, quotaErr := rotation.QuotaCandidates(provider, []string{rec.Name}, map[string]*rotation.UsageInfo{
+				rec.Name: toRotationUsageInfo(rec.Name, info, model),
+			})
+			if quotaErr != nil {
+				reason := quota.Recommendation
+				if quota.Error != "" {
+					reason = quota.Error
+				}
+				rec.Reasons = append(rec.Reasons, reason)
+				data.Blocked = append(data.Blocked, rec)
+				continue
+			}
+			rec.Score = (rec.Score + float64(quota.AvailScore)) / 2
+			rec.Reasons = append(rec.Reasons, fmt.Sprintf("measured quota availability score: %d/100", quota.AvailScore))
+		}
+		if err := cmd.Context().Err(); err != nil {
+			rec.Reasons = append(rec.Reasons, err.Error())
+			data.Blocked = append(data.Blocked, rec)
+			continue
+		}
 
 		data.Summary.Ready++
 
-		if rec.Score > bestScore {
-			bestScore = rec.Score
-			bestProfile = profileName
-			data.Recommended = &RobotPrecheckProfile{
-				Name:    rec.Name,
-				Score:   rec.Score,
-				Health:  rec.Health,
-				Reasons: rec.Reasons,
+		if data.Recommended == nil || rec.Score > data.Recommended.Score {
+			if data.Recommended != nil {
+				data.Backups = append(data.Backups, *data.Recommended)
 			}
+			data.Recommended = &rec
 		} else {
 			data.Backups = append(data.Backups, rec)
 		}
 	}
-
-	// Update recommended from backups if needed
-	if data.Recommended == nil && len(data.Backups) > 0 {
-		data.Recommended = &data.Backups[0]
-		data.Backups = data.Backups[1:]
+	// Cancellation can arrive after an earlier candidate was ranked. Do not
+	// leave that recommendation in an unsuccessful command's JSON envelope.
+	if err := cmd.Context().Err(); err != nil {
+		if data.Recommended != nil {
+			data.Backups = append(data.Backups, *data.Recommended)
+			data.Recommended = nil
+		}
+		for _, rec := range data.Backups {
+			rec.Reasons = append(rec.Reasons, err.Error())
+			data.Blocked = append(data.Blocked, rec)
+		}
+		data.Backups = make([]RobotPrecheckProfile, 0)
+		data.Summary.Ready = 0
 	}
 
+	sort.SliceStable(data.Backups, func(i, j int) bool { return data.Backups[i].Score > data.Backups[j].Score })
+
 	if data.Recommended != nil {
-		data.Commands.Activate = fmt.Sprintf("caam robot act activate %s %s", provider, data.Recommended.Name)
+		data.Commands.Activate = fmt.Sprintf("caam robot act activate %s %s", provider, shellQuote(data.Recommended.Name))
+		data.Commands.Run = fmt.Sprintf("caam run %s", provider)
+		if !noFetch {
+			data.Commands.Run += " --precheck"
+		}
+		data.Commands.Run += " --"
+		if model != "" {
+			// run reads the model from the arguments forwarded to the native CLI.
+			data.Commands.Run += " --model " + shellQuote(model)
+		}
+		data.Commands.Run += " <args>"
 	}
 
 	// Generate alerts
-	if data.Summary.Ready == 0 && data.Summary.InCooldown > 0 {
+	if data.Summary.Ready == 0 {
 		data.Alerts = append(data.Alerts, RobotPrecheckAlert{
 			Type:    "all_blocked",
-			Message: "all profiles are in cooldown",
+			Message: "no saved profile is ready to launch",
 			Urgency: "high",
-			Action:  "wait for cooldown to expire or add new profile",
+			Action:  "check credential validation, quota diagnostics, and cooldowns, or save a new login",
 		})
 	}
 	if data.Summary.Critical > 0 {
@@ -1654,11 +2062,9 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	_ = bestProfile // Used above
-
 	duration := time.Since(start)
 	output := RobotOutput{
-		Success: true,
+		Success: data.Recommended != nil,
 		Command: "precheck",
 		Data:    data,
 		Timing: &RobotTiming{
@@ -1666,8 +2072,20 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 			DurationMs: duration.Milliseconds(),
 		},
 	}
+	if !output.Success {
+		output.Error = &RobotError{Code: "ALL_BLOCKED", Message: "no saved profile is ready to launch"}
+		if err := cmd.Context().Err(); err != nil {
+			output.Error = &RobotError{Code: "REQUEST_CANCELED", Message: err.Error()}
+		}
+	}
 
-	return robotOutput(cmd, output)
+	if err := robotOutput(cmd, output); err != nil {
+		return err
+	}
+	if !output.Success {
+		return errors.New(output.Error.Message)
+	}
+	return nil
 }
 
 // RobotValidateData contains validation results.
@@ -1679,12 +2097,14 @@ type RobotValidateData struct {
 
 // RobotValidateResult is a single validation result.
 type RobotValidateResult struct {
-	Provider  string `json:"provider"`
-	Profile   string `json:"profile"`
-	Valid     bool   `json:"valid"`
-	ExpiresAt string `json:"expires_at,omitempty"`
-	ExpiresIn string `json:"expires_in,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Provider       string `json:"provider"`
+	Profile        string `json:"profile"`
+	Valid          bool   `json:"valid"`
+	ExpiresAt      string `json:"expires_at,omitempty"`
+	ExpiresIn      string `json:"expires_in,omitempty"`
+	Error          string `json:"error,omitempty"`
+	Recommendation string `json:"recommendation,omitempty"`
+	health.Signals
 }
 
 // RobotValidateSummary contains validation summary.
@@ -1696,6 +2116,11 @@ type RobotValidateSummary struct {
 
 func runRobotValidate(cmd *cobra.Command, args []string) error {
 	start := time.Now()
+	if active, _ := cmd.Flags().GetBool("active"); active {
+		return robotError(cmd, "validate", "ACTIVE_VALIDATION_UNSUPPORTED",
+			"active validation is not supported for saved vault profiles",
+			"omit --active for passive credential checks; no provider request was made", nil)
+	}
 
 	var providersToCheck []string
 	var profileFilter string
@@ -1713,7 +2138,7 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 			profileFilter = args[1]
 		}
 	} else {
-		providersToCheck = []string{"codex", "claude", "gemini"}
+		providersToCheck = supportedTools()
 	}
 
 	data := RobotValidateData{
@@ -1724,46 +2149,48 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 	for _, provider := range providersToCheck {
 		profiles, err := vault.List(provider)
 		if err != nil {
-			continue
+			return robotError(cmd, "validate", "VAULT_ERROR", "failed to list profiles", err.Error(), nil)
 		}
 
 		for _, profileName := range profiles {
-			if strings.HasPrefix(profileName, "_") {
+			if authfile.IsSystemProfile(profileName) {
 				continue
 			}
 			if profileFilter != "" && profileName != profileFilter {
 				continue
 			}
 
+			validation, ph := validateVaultProfile(provider, profileName)
 			result := RobotValidateResult{
-				Provider: provider,
-				Profile:  profileName,
+				Provider:       provider,
+				Profile:        profileName,
+				Valid:          validation.Valid,
+				Error:          validation.Error,
+				Recommendation: validation.Recommendation,
+				Signals:        validation.Signals,
 			}
-
-			// Get health info for token expiry
-			ph, _ := getProfileHealthWithIdentity(provider, profileName)
 			if !ph.TokenExpiresAt.IsZero() {
 				result.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
 				remaining := time.Until(ph.TokenExpiresAt)
 				if remaining > 0 {
 					result.ExpiresIn = robotFormatDuration(remaining)
-					result.Valid = true
-					data.Summary.Valid++
 				} else {
 					result.ExpiresIn = "expired"
-					result.Valid = false
-					result.Error = "token expired"
-					data.Summary.Invalid++
 				}
-			} else {
-				// No expiry info - assume valid
-				result.Valid = true
+			}
+			if result.Valid {
 				data.Summary.Valid++
+			} else {
+				data.Summary.Invalid++
 			}
 
 			data.Summary.Total++
 			data.Profiles = append(data.Profiles, result)
 		}
+	}
+	if profileFilter != "" && data.Summary.Total == 0 {
+		return robotError(cmd, "validate", "PROFILE_NOT_FOUND", "saved profile not found",
+			fmt.Sprintf("no saved profile %s/%s", providersToCheck[0], profileFilter), nil)
 	}
 
 	duration := time.Since(start)
@@ -1777,7 +2204,13 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 		},
 	}
 
-	return robotOutput(cmd, output)
+	if err := robotOutput(cmd, output); err != nil {
+		return err
+	}
+	if !output.Success {
+		return fmt.Errorf("%d saved profile(s) failed passive validation", data.Summary.Invalid)
+	}
+	return nil
 }
 
 func runRobotDoctor(cmd *cobra.Command, args []string) error {

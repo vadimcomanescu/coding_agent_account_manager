@@ -2,6 +2,7 @@ package exec
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -640,6 +641,155 @@ func TestRun_EnvironmentOverride(t *testing.T) {
 	}
 }
 
+func TestRunSelectedCredentialWinsOverAmbientEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     string
+		global   bool
+		explicit string
+		want     string
+	}{
+		{"isolated subscription", "oauth", false, "", "selected-file"},
+		{"vault file even with same-name API profile", "api-key", true, "", "selected-file"},
+		{"documented ambient API key", "api-key", false, "", "ambient-key"},
+		{"explicit caller override", "oauth", false, "explicit-key", "explicit-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			prof := &profile.Profile{Name: "selected", Provider: "claude", AuthMode: tc.mode, BasePath: filepath.Join(root, "profile")}
+			configDir := filepath.Join(root, "selected-config")
+			if err := os.MkdirAll(configDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(configDir, ".credentials.json"), []byte("selected-file"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			capture := filepath.Join(root, "native-account")
+			t.Setenv("ANTHROPIC_API_KEY", "ambient-key")
+			t.Setenv("OPENAI_API_KEY", "unrelated-tool-key")
+			t.Setenv("CLAUDE_CONFIG_DIR", configDir)
+			mock := &mockProvider{id: "claude", defaultBin: "sh", envVars: map[string]string{"HOME": prof.HomePath(), "CLAUDE_CONFIG_DIR": configDir}}
+			extra := map[string]string{"CAAM_TEST_ACCOUNT_CAPTURE": capture}
+			if tc.explicit != "" {
+				extra["ANTHROPIC_API_KEY"] = tc.explicit
+			}
+			script := `test "$OPENAI_API_KEY" = unrelated-tool-key || exit 8
+if [ -n "$ANTHROPIC_API_KEY" ]; then
+  printf %s "$ANTHROPIC_API_KEY" > "$CAAM_TEST_ACCOUNT_CAPTURE"
+else
+  cat "$CLAUDE_CONFIG_DIR/.credentials.json" > "$CAAM_TEST_ACCOUNT_CAPTURE"
+fi`
+			if err := NewRunner(provider.NewRegistry()).Run(context.Background(), RunOptions{
+				Profile: prof, Provider: mock, Args: []string{"-c", script}, Env: extra, NoLock: true, UseGlobalEnv: tc.global,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(capture)
+			if err != nil || string(got) != tc.want {
+				t.Fatalf("native credential = %q, want %q: %v", got, tc.want, err)
+			}
+			if os.Getenv("ANTHROPIC_API_KEY") != "ambient-key" {
+				t.Fatal("launch mutated parent environment")
+			}
+		})
+	}
+}
+
+func TestRunReloadsImportedAuthModeAfterLock(t *testing.T) {
+	store := profile.NewStore(t.TempDir())
+	stale, err := store.Create("codex", "work", "api-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The caller has already selected this profile when an import publishes a
+	// different credential mode. Run must use the now-locked replacement.
+	_, err = store.Import(context.Background(), "codex", "work", "oauth", true, func(current *profile.Profile) error {
+		current.Description = "published OAuth account"
+		return os.WriteFile(filepath.Join(current.CodexHomePath(), "auth.json"), []byte("synthetic-imported-oauth"), 0600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENAI_API_KEY", "synthetic-ambient-key")
+	t.Setenv("CODEX_API_KEY", "synthetic-ambient-key")
+	t.Setenv("OPENAI_BASE_URL", "https://synthetic.invalid")
+	capture := filepath.Join(t.TempDir(), "native-account")
+	prov := &preparingProvider{
+		mockProvider: mockProvider{id: "codex", defaultBin: "sh", envVars: map[string]string{"CODEX_HOME": stale.CodexHomePath()}},
+		prepare: func(current *profile.Profile) error {
+			if current.AuthMode != "oauth" || current.Description != "published OAuth account" || !current.IsLocked() {
+				return errors.New("launch preparation received stale or unlocked metadata")
+			}
+			return nil
+		},
+	}
+	script := `test -z "$OPENAI_API_KEY$CODEX_API_KEY$OPENAI_BASE_URL" || exit 8
+cat "$CODEX_HOME/auth.json" > "$CAAM_TEST_ACCOUNT_CAPTURE"`
+	if err := NewRunner(provider.NewRegistry()).Run(context.Background(), RunOptions{
+		Profile: stale, Provider: prov, Args: []string{"-c", script}, Env: map[string]string{"CAAM_TEST_ACCOUNT_CAPTURE": capture},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(capture)
+	if err != nil || string(got) != "synthetic-imported-oauth" {
+		t.Fatalf("native process did not use the published account: %q, %v", got, err)
+	}
+	current, err := store.Load("codex", "work")
+	if err != nil || current.AuthMode != "oauth" || stale.AuthMode != "oauth" || current.IsLocked() || prov.called != 1 {
+		t.Fatalf("run restored stale metadata or retained its lock: %+v, %v", current, err)
+	}
+}
+
+func TestRunRejectsChangedRegisteredIdentity(t *testing.T) {
+	for _, change := range []string{"name", "provider", "path", "malformed"} {
+		t.Run(change, func(t *testing.T) {
+			store := profile.NewStore(t.TempDir())
+			selected, err := store.Create("codex", "work", "oauth")
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := *selected
+			switch change {
+			case "name":
+				current.Name = "other-account"
+			case "provider":
+				current.Provider = "gemini"
+			case "path":
+				current.BasePath = t.TempDir()
+			}
+			body, err := json.Marshal(current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if change == "malformed" {
+				body = []byte("{invalid")
+			}
+			if err := os.WriteFile(selected.MetaPath(), body, 0600); err != nil {
+				t.Fatal(err)
+			}
+			prov := &preparingProvider{mockProvider: mockProvider{id: "codex", defaultBin: "false"}, prepare: func(*profile.Profile) error { return nil }}
+			err = NewRunner(provider.NewRegistry()).Run(context.Background(), RunOptions{Profile: selected, Provider: prov})
+			if err == nil || !strings.Contains(err.Error(), "reload locked profile") || prov.called != 0 || selected.IsLocked() {
+				t.Fatalf("changed registered identity reached preparation or kept a lock: %v, calls=%d", err, prov.called)
+			}
+		})
+	}
+}
+
+func TestRunPreservesLockedTransientAuthMode(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "synthetic-explicit-api-mode")
+	transient := &profile.Profile{Name: "ephemeral", Provider: "codex", AuthMode: "api-key", BasePath: t.TempDir()}
+	prov := &mockProvider{id: "codex", defaultBin: "sh"}
+	if err := NewRunner(provider.NewRegistry()).Run(context.Background(), RunOptions{
+		Profile: transient, Provider: prov, Args: []string{"-c", `test "$OPENAI_API_KEY" = synthetic-explicit-api-mode`},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if transient.AuthMode != "api-key" || transient.IsLocked() {
+		t.Fatal("transient profile configuration or lock lifecycle changed")
+	}
+}
+
 func TestRun_ProfileMetadataUpdated(t *testing.T) {
 	tmpDir := t.TempDir()
 	prof := &profile.Profile{
@@ -963,5 +1113,87 @@ func TestRun_GlobalEnvSkipsProfileRefresh(t *testing.T) {
 	}
 	if len(mock.refreshed) != 0 {
 		t.Fatalf("RefreshProfile must not run for a global-env launch, got %d calls", len(mock.refreshed))
+	}
+}
+
+type preparingProvider struct {
+	mockProvider
+	prepare func(*profile.Profile) error
+	called  int
+}
+
+func (p *preparingProvider) PrepareRun(_ context.Context, prof *profile.Profile) error {
+	p.called++
+	return p.prepare(prof)
+}
+
+func TestLaunchPreparationFailurePreventsNativeExecution(t *testing.T) {
+	for _, mode := range []string{"basic", "smart-claude", "smart-codex"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			marker := filepath.Join(dir, "native-started")
+			id := "claude"
+			if mode == "smart-codex" {
+				id = "codex"
+			}
+			prof := &profile.Profile{Name: "account", Provider: id, BasePath: dir}
+			preparationErr := errors.New("invalid shared policy")
+			prov := &preparingProvider{
+				mockProvider: mockProvider{id: id, defaultBin: "sh"},
+				prepare: func(got *profile.Profile) error {
+					if got != prof {
+						t.Fatal("prepared a different profile")
+					}
+					return preparationErr
+				},
+			}
+			opts := RunOptions{Profile: prof, Provider: prov, NoLock: true,
+				Args: []string{"-c", `printf started > "$NATIVE_MARKER"`},
+				Env:  map[string]string{"NATIVE_MARKER": marker},
+			}
+			runner := NewRunner(provider.NewRegistry())
+			var err error
+			if mode == "basic" {
+				err = runner.Run(context.Background(), opts)
+			} else {
+				err = NewSmartRunner(runner, SmartRunnerOptions{}).Run(context.Background(), opts)
+			}
+			if !errors.Is(err, preparationErr) || prov.called != 1 {
+				t.Fatalf("preparation error/calls = %v/%d, want required failure once", err, prov.called)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("native process ran despite failed preparation: %v", err)
+			}
+		})
+	}
+}
+
+func TestLaunchPreparationRunsBeforeNativeAndSkipsGlobalEnv(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "prepared")
+	prof := &profile.Profile{Name: "account", Provider: "claude", BasePath: dir}
+	prov := &preparingProvider{
+		mockProvider: mockProvider{id: "claude", defaultBin: "sh"},
+		prepare: func(_ *profile.Profile) error {
+			return os.WriteFile(marker, []byte("ready"), 0600)
+		},
+	}
+	runner := NewRunner(provider.NewRegistry())
+	err := runner.Run(context.Background(), RunOptions{
+		Profile: prof, Provider: prov, NoLock: true,
+		Args: []string{"-c", `test "$(cat "$PREPARED_MARKER")" = ready`},
+		Env:  map[string]string{"PREPARED_MARKER": marker},
+	})
+	if err != nil || prov.called != 1 {
+		t.Fatalf("native launch did not observe preparation: %v (calls=%d)", err, prov.called)
+	}
+	prov.prepare = func(*profile.Profile) error { return errors.New("must not prepare a vault/global launch") }
+	if err := runner.Run(context.Background(), RunOptions{
+		Profile: prof, Provider: prov, NoLock: true, UseGlobalEnv: true, Args: []string{"-c", "exit 0"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if prov.called != 1 {
+		t.Fatal("global launch prepared an isolated profile")
 	}
 }

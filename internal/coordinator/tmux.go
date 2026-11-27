@@ -132,7 +132,9 @@ func (c *TmuxClient) parsePaneLine(line string) (Pane, error) {
 func (c *TmuxClient) GetText(ctx context.Context, paneID int, startLine int) (string, error) {
 	target := fmt.Sprintf("%%%d", paneID)
 
-	args := []string{"capture-pane", "-t", target, "-p"}
+	// -J joins soft-wrapped lines: an OAuth URL is far wider than a pane,
+	// and split across lines it would be extracted truncated.
+	args := []string{"capture-pane", "-t", target, "-p", "-J"}
 	if startLine != 0 {
 		args = append(args, "-S", strconv.Itoa(startLine))
 	}
@@ -157,7 +159,7 @@ func (c *TmuxClient) SendText(ctx context.Context, paneID int, text string, noPa
 	var args []string
 	if noPaste {
 		// Send as literal text (like typing)
-		args = []string{"send-keys", "-t", target, "-l", text}
+		args = []string{"send-keys", "-t", target, "-l", TypedText(text)}
 	} else {
 		// Send through paste buffer (bracketed paste mode if terminal supports it)
 		args = []string{"send-keys", "-t", target, text}

@@ -17,6 +17,8 @@
 //	  .credentials.json            (real file — copied from a vault profile)
 //	  .credentials.lock            (real file — empty, prevents Claude from
 //	                                touching the symlinked .claude folder above)
+//	  .caam-identity.json           (private, exact-token identity proof)
+//	  settings.json                (private account fields plus shared policy)
 //	  projects/, todos/, ...       (symlinks to ~/.claude/projects, etc.)
 //	.claude.json                   (real file — the user's settings minus the
 //	                                account-bound keys; Claude rewrites this
@@ -45,10 +47,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
 )
 
@@ -138,10 +143,14 @@ func layoutFor(provider string) (*providerLayout, error) {
 	switch NormalizeProvider(provider) {
 	case "claude":
 		return &providerLayout{
-			provider:          "claude",
-			realDirs:          []string{".claude"},
-			realEntries:       []string{".claude/.credentials.json", ".claude/.credentials.lock", ".claude.json", ProfileMetaFilename},
-			innerSymlinkRoots: []string{".claude"},
+			provider: "claude",
+			realDirs: claudeRealDirs(),
+			realEntries: []string{
+				".claude/.credentials.json", ".claude/.credentials.lock", ".claude/auth.json",
+				".claude/" + identity.ClaudeIdentityCacheFile, ".claude/meta.json",
+				".claude/settings.json", ".claude/.claude.json", ".claude.json", ProfileMetaFilename,
+			},
+			innerSymlinkRoots: claudeInnerSymlinkRoots(),
 			primaryCredRel:    ".claude/.credentials.json",
 			skillShareDirs:    []skillShareDir{{rel: ".claude/skills"}},
 		}, nil
@@ -174,6 +183,22 @@ func layoutFor(provider string) (*providerLayout, error) {
 	default:
 		return nil, fmt.Errorf("unsupported shallow provider %q (supported: %s)", provider, strings.Join(SupportedProviders(), ", "))
 	}
+}
+
+// Claude shallow sessions on macOS must not expose the host login Keychain.
+// Other providers preserve their existing HOME layouts.
+func claudeRealDirs() []string {
+	if runtime.GOOS == "darwin" {
+		return []string{".claude", "Library"}
+	}
+	return []string{".claude"}
+}
+
+func claudeInnerSymlinkRoots() []string {
+	if runtime.GOOS == "darwin" {
+		return []string{".claude", "Library"}
+	}
+	return []string{".claude"}
 }
 
 // PrimaryCredentialRel returns the HOME-relative path of a provider's primary
@@ -223,6 +248,12 @@ func childUnder(dir, rel string) string {
 // providers, which have no Agent View feature.
 //
 // SpawnEnv is a pure function so the env-isolation policy is unit-testable.
+// providerHomeEnv lists every variable a supported provider CLI honors as an
+// override of its config/credential directory. All of them are scrubbed from a
+// shallow session's environment regardless of the session's own provider; the
+// session's provider re-pins its own variable inside the shallow HOME.
+var providerHomeEnv = []string{"CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_HOME"}
+
 func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet bool) (set map[string]string, scrub []string) {
 	set = map[string]string{
 		"HOME":            home,
@@ -236,11 +267,23 @@ func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet b
 	// caam resolves its vault under the shallow HOME, where the caam data subtree
 	// is deliberately withheld, so the spawned process sees no other identities.
 	scrub = []string{"CAAM_HOME", "XDG_DATA_HOME"}
+	// A setup token explicitly supplied to an outer Claude launch is ambient
+	// in any nested shallow launch. Drop it for EVERY provider, so a Codex/agy
+	// session cannot carry that launch's Claude identity into unrelated tools.
+	// Only the CLI's validated per-launch input may reintroduce an OAuth token.
+	scrub = append(scrub, "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")
+	// Every provider-home override is scrubbed for EVERY provider (issue #106).
+	// A shallow session is itself a parent shell for whatever it spawns: a
+	// claude shallow spawn launched from inside a codex shallow session would
+	// otherwise inherit the outer CODEX_HOME, so nested tools (ccusage, a
+	// nested `caam shallow-spawn`, codex itself) read the outer profile's
+	// state. Likewise a stale CLAUDE_CONFIG_DIR from a parent shell would pin
+	// auth.json outside the shallow HOME, re-sharing the user's real identity.
+	// The provider's own home is re-pinned below via `set`, which is applied
+	// after the scrub, so pinning always wins over scrubbing.
+	scrub = append(scrub, providerHomeEnv...)
 	switch NormalizeProvider(provider) {
 	case "claude":
-		// A stale CLAUDE_CONFIG_DIR from a parent shell would pin auth.json
-		// outside the shallow HOME, re-sharing the user's real identity.
-		scrub = append(scrub, "CLAUDE_CONFIG_DIR")
 		// Agent View / background supervisor (issue #49): Claude Code's Agent
 		// View feature runs a long-lived, cross-session background supervisor
 		// daemon that is NOT bound to the shallow profile's HOME. On resume a
@@ -363,7 +406,8 @@ type CreateOptions struct {
 
 	// ExtraSources maps additional managed real-file destination relpaths (within
 	// the shallow HOME) to source file paths. Used for multi-file providers — the
-	// agy optional google_accounts.json / oauth_creds.json / settings.json. Each
+	// Claude settings.json or agy google_accounts.json / oauth_creds.json /
+	// settings.json. Each
 	// destination MUST be in the provider's realEntries set; each source is copied
 	// mode 0600 if it exists and skipped if absent.
 	ExtraSources map[string]string
@@ -379,6 +423,10 @@ type CreateOptions struct {
 	// Force overwrites an existing shallow profile of the same name.
 	// Without this, Create returns an error if the directory already exists.
 	Force bool
+
+	// Captured once by Create so the credential and its cached provider proof
+	// cannot come from different source generations during staging.
+	claudeSeed *claudeCredentialSeed
 }
 
 // Create provisions a new shallow profile.
@@ -430,6 +478,12 @@ func (m *Manager) Create(name string, opts CreateOptions) (string, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("stat profile dir: %w", err)
 	}
+	if layout.provider == "claude" {
+		opts.claudeSeed, err = captureClaudeCredentialSeed(opts.CredentialSource)
+		if err != nil {
+			return "", fmt.Errorf("capture Claude source identity: %w", err)
+		}
+	}
 
 	// Ensure the base dir exists so the staging dir and the final rename happen
 	// on the same filesystem (rename is only atomic within one filesystem).
@@ -446,6 +500,12 @@ func (m *Manager) Create(name string, opts CreateOptions) (string, error) {
 	if err := m.buildProfile(staging, name, layout, opts); err != nil {
 		_ = m.safeRemoveAll(staging)
 		return "", err
+	}
+	if opts.claudeSeed != nil {
+		if err := opts.claudeSeed.checkUnchanged(); err != nil {
+			_ = m.safeRemoveAll(staging)
+			return "", err
+		}
 	}
 
 	// Swap the fully-built staging profile into place. Only here, and only after
@@ -563,7 +623,11 @@ func (m *Manager) swapIntoPlace(staging, home, clean string, exists bool) error 
 func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts CreateOptions) error {
 	// Principal credential file (every provider has exactly one).
 	primary := filepath.Join(home, filepath.FromSlash(layout.primaryCredRel))
-	if opts.CredentialSource != "" {
+	if opts.claudeSeed != nil {
+		if err := writeFileAtomic(primary, opts.claudeSeed.credentials, 0o600); err != nil {
+			return fmt.Errorf("write captured Claude credentials: %w", err)
+		}
+	} else if opts.CredentialSource != "" {
 		if err := copyFileMode(opts.CredentialSource, primary, 0o600); err != nil {
 			return fmt.Errorf("copy credentials: %w", err)
 		}
@@ -583,10 +647,16 @@ func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts Creat
 		if err := writeFileAtomic(lockPath, []byte(""), 0o600); err != nil {
 			return fmt.Errorf("create credentials lock: %w", err)
 		}
+		if err := m.writeClaudeSettings(home, opts); err != nil {
+			return err
+		}
 		if err := m.writeClaudeJSON(home, opts); err != nil {
 			return err
 		}
 		if err := m.ensureClaudeOnboarding(home, opts); err != nil {
+			return err
+		}
+		if err := writeClaudeSeedIdentity(home, opts); err != nil {
 			return err
 		}
 	case "codex":
@@ -608,8 +678,9 @@ func (m *Manager) writeRealFiles(home string, layout *providerLayout, opts Creat
 }
 
 // writeClaudeJSON writes <home>/.claude.json. An explicit source (a vault
-// snapshot or --from-claude-json) is copied verbatim — its identity belongs
-// to the credentials it came with. Otherwise the user's real ~/.claude.json
+// snapshot or --from-claude-json) supplies preferences and session state;
+// writeClaudeSeedIdentity separately binds its account label to the captured
+// credentials. Otherwise the user's real ~/.claude.json
 // is used as the seed (automatic onboarding: preferences, theme, project
 // approvals) with the account-bound keys stripped, so the new profile never
 // reports the real HOME's identity or usage as its own (issue #92; policy in
@@ -623,7 +694,7 @@ func (m *Manager) writeClaudeJSON(home string, opts CreateOptions) error {
 		}
 		return nil
 	}
-	realClaudeJSON := filepath.Join(m.realHome, ".claude.json")
+	_, realClaudeJSON := claudesettings.SharedPaths(m.realHome)
 	if _, err := os.Stat(realClaudeJSON); err == nil {
 		seed, serr := seedClaudeJSONFromRealHome(realClaudeJSON)
 		if serr != nil {
@@ -799,7 +870,16 @@ func allProviderReservedTops() map[string]bool {
 			continue
 		}
 		for _, d := range layout.realDirs {
-			tops[topComponent(d)] = true
+			top := topComponent(d)
+			// Library is an OS-shared top, not a provider data dir. #130 makes it
+			// a private directory only for macOS Claude, and claude's own layout
+			// already keeps it out of a claude profile's farm. Withholding it
+			// across providers would also strip the host ~/Library passthrough
+			// that codex and agy profiles have always had.
+			if top == "Library" {
+				continue
+			}
+			tops[top] = true
 		}
 		for _, e := range layout.realEntries {
 			tops[topComponent(e)] = true
@@ -976,7 +1056,7 @@ func (m *Manager) populateSymlinks(home string, layout *providerLayout) error {
 
 	for _, e := range entries {
 		name := e.Name()
-		if skip[name] {
+		if skip[name] || (runtime.GOOS == "windows" && isWindowsReservedName(name)) {
 			continue
 		}
 		src := filepath.Join(m.realHome, name)
@@ -995,6 +1075,25 @@ func (m *Manager) populateSymlinks(home string, layout *providerLayout) error {
 		}
 	}
 	return nil
+}
+
+// isWindowsReservedName reports whether name is a reserved Windows DOS device
+// name (CON, PRN, AUX, NUL, COM1..COM9, LPT1..LPT9, optionally with an
+// extension). Such entries can appear in %USERPROFILE% from POSIX tools, but
+// Win32 file APIs map them to device objects and fail when symlinking/removing.
+func isWindowsReservedName(name string) bool {
+	stem := strings.TrimRight(name, ". ")
+	if dot := strings.IndexByte(stem, '.'); dot >= 0 {
+		stem = stem[:dot]
+	}
+	switch strings.ToUpper(stem) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		return true
+	default:
+		return false
+	}
 }
 
 // populateInnerSymlinks creates per-entry symlinks inside a real directory
@@ -1020,6 +1119,10 @@ func (m *Manager) populateInnerSymlinks(home, dirName string, layout *providerLa
 			skip[c] = true
 		}
 	}
+	// The host login Keychain is never part of a Claude shallow HOME.
+	if runtime.GOOS == "darwin" && layout.provider == "claude" && dirName == "Library" {
+		skip["Keychains"] = true
+	}
 	// Never symlink a nested realDir (e.g. .gemini/antigravity-cli inside
 	// .gemini) — it must stay a real, private directory.
 	for _, d := range layout.realDirs {
@@ -1034,14 +1137,199 @@ func (m *Manager) populateInnerSymlinks(home, dirName string, layout *providerLa
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if skip[name] {
+		if skip[name] || (runtime.GOOS == "windows" && isWindowsReservedName(name)) {
 			continue
 		}
 		src := filepath.Join(srcDir, name)
 		dst := filepath.Join(dstDir, name)
+		// An existing local directory or file belongs to the profile.
+		// Never replace it or follow it during a Library repair.
+		if dirName == "Library" && layout.provider == "claude" {
+			if _, err := os.Lstat(dst); err == nil {
+				continue
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("inspect private Library entry %s: %w", dst, err)
+			}
+			// Repair validates existing profile links before backfilling. A
+			// new host entry must pass the same boundary before this spawn
+			// can admit it, including when creating a profile from scratch.
+			if err := m.validateClaudeLibrarySource(src); err != nil {
+				return err
+			}
+		}
 		if err := atomicSymlink(src, dst); err != nil {
 			return fmt.Errorf("symlink %s -> %s: %w", dst, src, err)
 		}
+	}
+	return nil
+}
+
+// validateClaudeLibrarySource applies the same admission policy to initial
+// creation, later backfill, and staged legacy migration. A link that cannot be
+// resolved must not enter the private Library as an unverified future alias.
+func (m *Manager) validateClaudeLibrarySource(src string) error {
+	resolved, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return fmt.Errorf("resolve host Library entry %q: %w", filepath.Base(src), err)
+	}
+	hostKeychains := canonical(filepath.Join(m.realHome, "Library", "Keychains"))
+	if isEqualOrAncestor(hostKeychains, resolved) {
+		return fmt.Errorf("host Library entry %q aliases Keychains", filepath.Base(src))
+	}
+	return nil
+}
+
+// claudeKeychainHome returns the validated profile home, or an empty path when
+// the macOS Claude Keychain policy does not apply.
+func (m *Manager) claudeKeychainHome(name string) (string, error) {
+	if runtime.GOOS != "darwin" {
+		return "", nil
+	}
+	home, err := m.HomeFor(name)
+	if err != nil {
+		return "", err
+	}
+	if err := m.assertSafeProfileHome(home); err != nil {
+		return "", err
+	}
+	if err := assertLooksLikeShallowProfile(home); err != nil {
+		return "", err
+	}
+	provider, err := m.ResolveProvider(name)
+	if err != nil {
+		return "", err
+	}
+	if NormalizeProvider(provider) != "claude" {
+		return "", nil
+	}
+	return home, nil
+}
+
+// ValidateClaudeKeychainBoundary checks an existing macOS Claude profile without
+// repairing it or adding links. Environment exporters must use this before
+// printing a HOME that another process could otherwise launch unsafely.
+func (m *Manager) ValidateClaudeKeychainBoundary(name string) error {
+	home, err := m.claudeKeychainHome(name)
+	if err != nil || home == "" {
+		return err
+	}
+	return m.validateClaudeLibrary(home)
+}
+
+// validateClaudeLibrary inspects only the current profile layout. A missing
+// Library is safe and stays absent; unlinked host resources cannot affect a
+// read-only environment export.
+func (m *Manager) validateClaudeLibrary(home string) error {
+	lib := filepath.Join(home, "Library")
+	info, err := os.Lstat(lib)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect shallow Library: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("unsafe shallow Library symlink; repair the legacy layout with `caam shallow-spawn %s -- true` using the same --base or CAAM_SHALLOW_HOMES_DIR override", filepath.Base(home))
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("unsafe shallow Library: expected directory, found %s", info.Mode())
+	}
+	if _, err := os.Lstat(filepath.Join(lib, "Keychains")); err == nil {
+		return fmt.Errorf("unsafe shallow Library/Keychains exists; refusing Claude spawn")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect shallow Keychains: %w", err)
+	}
+	// Existing links may expose the host Keychain under another name. Refuse
+	// unsafe or unresolvable links while leaving profile-local resources alone.
+	entries, err := os.ReadDir(lib)
+	if err != nil {
+		return fmt.Errorf("read shallow Library: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(filepath.Join(lib, entry.Name()))
+		if err != nil {
+			return fmt.Errorf("cannot verify shallow Library link %q: %w", entry.Name(), err)
+		}
+		hostKeychains := canonical(filepath.Join(m.realHome, "Library", "Keychains"))
+		if isEqualOrAncestor(hostKeychains, resolved) {
+			return fmt.Errorf("unsafe Library entry %q resolves into the real Keychain", entry.Name())
+		}
+	}
+	return nil
+}
+
+// RepairClaudeKeychainBoundary migrates pre-fix macOS Claude profiles before
+// spawn. Never traverse a legacy Library symlink: prepare a private replacement
+// first, then rename the original symlink aside without resolving its target.
+// A suspicious existing Keychains entry fails closed rather than being deleted.
+func (m *Manager) RepairClaudeKeychainBoundary(name string) error {
+	home, err := m.claudeKeychainHome(name)
+	if err != nil || home == "" {
+		return err
+	}
+	lib := filepath.Join(home, "Library")
+	info, err := os.Lstat(lib)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		if err := os.Mkdir(lib, 0o700); err != nil {
+			return fmt.Errorf("create private Library: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("inspect shallow Library: %w", err)
+	case info.Mode()&os.ModeSymlink != 0:
+		// A legacy symlink is moved, never followed. Preserve it as a
+		// recoverable backup and never touch anything under its target.
+		backup := filepath.Join(home, ".caam-legacy-Library")
+		if _, err := os.Lstat(backup); !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("cannot safely stage legacy Library (backup exists or is unreadable)")
+		}
+		// Construct the replacement completely before changing the live
+		// Library entry. This prevents a failed mirror operation from leaving
+		// the profile half-migrated.
+		staging, err := os.MkdirTemp(home, ".caam-private-Library-")
+		if err != nil {
+			return fmt.Errorf("stage private Library: %w", err)
+		}
+		entries, err := os.ReadDir(filepath.Join(m.realHome, "Library"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			_ = os.Remove(staging)
+			return fmt.Errorf("read host Library: %w", err)
+		}
+		for _, entry := range entries {
+			if entry.Name() == "Keychains" {
+				continue
+			}
+			src := filepath.Join(m.realHome, "Library", entry.Name())
+			// Do not admit aliases to the host Keychain under other names.
+			if err := m.validateClaudeLibrarySource(src); err != nil {
+				_ = os.RemoveAll(staging)
+				return err
+			}
+			if err := os.Symlink(src, filepath.Join(staging, entry.Name())); err != nil {
+				_ = os.RemoveAll(staging)
+				return fmt.Errorf("stage Library entry %q: %w", entry.Name(), err)
+			}
+		}
+		if err := os.Rename(lib, backup); err != nil {
+			_ = os.RemoveAll(staging)
+			return fmt.Errorf("preserve legacy Library symlink: %w", err)
+		}
+		if err := os.Rename(staging, lib); err != nil {
+			_ = os.Rename(backup, lib)
+			return fmt.Errorf("install private Library: %w", err)
+		}
+	case !info.IsDir():
+		return fmt.Errorf("unsafe shallow Library: expected directory, found %s", info.Mode())
+	}
+	if err := m.validateClaudeLibrary(home); err != nil {
+		return err
+	}
+	layout, _ := layoutFor("claude")
+	if err := m.populateInnerSymlinks(home, "Library", layout); err != nil {
+		return fmt.Errorf("populate noncredential Library resources: %w", err)
 	}
 	return nil
 }
@@ -1638,6 +1926,15 @@ func copyFileMode(src, dst string, mode os.FileMode) error {
 
 // writeFileAtomic writes data to path with mode, atomically.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFileAtomicGuarded(path, data, mode, nil)
+}
+
+func writeFileAtomicGuarded(path string, data []byte, mode os.FileMode, guard func() error) error {
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
+	}
 	parent := filepath.Dir(path)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return fmt.Errorf("create parent: %w", err)
@@ -1666,6 +1963,11 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close: %w", err)
+	}
+	if guard != nil {
+		if err := guard(); err != nil {
+			return err
+		}
 	}
 	return os.Rename(tmpName, path)
 }

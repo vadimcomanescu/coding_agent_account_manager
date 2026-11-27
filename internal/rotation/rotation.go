@@ -12,6 +12,7 @@ package rotation
 import (
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -85,7 +86,10 @@ type Result struct {
 	Explanation  string         // One-line explanation of the choice (drain policy only)
 }
 
-// UsageInfo represents real-time rate limit usage for a profile.
+// UsageInfo represents validated real-time rate limit usage for a profile.
+// An error-free row requires a measured general quota. Optional absent windows
+// may have zero percentages here; callers must mark incomplete reads with Error
+// instead of constructing an unmeasured all-zero row.
 type UsageInfo struct {
 	ProfileName      string
 	PrimaryPercent   int        // Primary window usage (0-100)
@@ -108,15 +112,17 @@ func scopedQuotaLabel(u *UsageInfo) string {
 
 // Selector performs profile selection based on configured algorithm.
 type Selector struct {
-	mu           sync.RWMutex
-	algorithm    Algorithm
-	healthStore  *health.Storage
-	db           *caamdb.DB
-	rng          *rand.Rand
-	avoidRecent  time.Duration         // Don't select profiles used within this duration
-	usageData    map[string]*UsageInfo // Real-time usage data by profile name
-	policy       Policy                // Selection policy (default: availability)
-	drainCeiling int                   // Headroom ceiling (percent used) for the drain policy
+	mu             sync.RWMutex
+	algorithm      Algorithm
+	healthStore    *health.Storage
+	profileHealth  map[string]*health.ProfileHealth // Optional authoritative snapshots for isolated candidates
+	db             *caamdb.DB
+	rng            *rand.Rand
+	avoidRecent    time.Duration         // Don't select profiles used within this duration
+	usageData      map[string]*UsageInfo // Real-time usage data by profile name
+	policy         Policy                // Selection policy (default: availability)
+	drainCeiling   int                   // Headroom ceiling (percent used) for the drain policy
+	ignoreCooldown bool                  // Explicit user override; leaves scoring and quota policy intact
 }
 
 // NewSelector creates a new profile selector.
@@ -167,15 +173,68 @@ func (s *Selector) SetAvoidRecent(d time.Duration) {
 	s.avoidRecent = d
 }
 
-// SetUsageData sets real-time usage data for consideration in smart selection.
+// SetIgnoreCooldown controls an explicit override of recorded cooldowns.
+// Other selection policy and scoring still apply.
+func (s *Selector) SetIgnoreCooldown(ignore bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ignoreCooldown = ignore
+}
+
+// SetUsageData sets the quota evidence for every selection algorithm and policy.
+// A nil map opts out of quota checks. Any non-nil map means quota was requested:
+// missing, invalid, failed, or exhausted measurements are ineligible, including
+// when every account failed or only a single candidate remains.
 func (s *Selector) SetUsageData(usage map[string]*UsageInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.usageData = usage
 }
 
+// SetVaultPath binds credential hydration to the vault this selector will use.
+// A selector without a health store reads metadata next to that vault.
+func (s *Selector) SetVaultPath(root string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.healthStore == nil {
+		s.healthStore = health.NewStorage(filepath.Join(filepath.Dir(root), "health.json"))
+	}
+	s.healthStore.SetVaultPath(root)
+}
+
+// SetProfileHealth supplies authoritative health for the next selections,
+// keyed by candidate name. A non-nil map disables vault health lookup entirely:
+// an absent or nil snapshot means unknown, never a same-named vault account.
+// Pass nil to resume reading the health store. Values are copied on assignment.
+func (s *Selector) SetProfileHealth(profiles map[string]*health.ProfileHealth) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.profileHealth = nil
+	if profiles != nil {
+		s.profileHealth = make(map[string]*health.ProfileHealth, len(profiles))
+		for name, h := range profiles {
+			if h != nil {
+				copy := *h
+				s.profileHealth[name] = &copy
+			}
+		}
+	}
+}
+
+func (s *Selector) healthFor(tool, name string) *health.ProfileHealth {
+	if s.profileHealth != nil {
+		return s.profileHealth[name]
+	}
+	if s.healthStore != nil {
+		h, _ := s.healthStore.GetProfile(tool, name)
+		return h
+	}
+	return nil
+}
+
 // Select chooses a profile from the given list using the configured algorithm.
-// Returns an error if no profiles are available or all are in cooldown.
+// Returns an error if no profiles have eligible credentials and, when requested,
+// measured available quota, or if all eligible profiles are in cooldown.
 func (s *Selector) Select(tool string, profiles []string, currentProfile string) (*Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -196,33 +255,66 @@ func (s *Selector) Select(tool string, profiles []string, currentProfile string)
 		return nil, fmt.Errorf("no user profiles available for %s (only system profiles found)", tool)
 	}
 
-	// If only one profile, return it
-	if len(available) == 1 {
-		return &Result{
-			Selected:  available[0],
-			Algorithm: s.algorithm,
-			Alternatives: []ProfileScore{{
-				Name:    available[0],
-				Score:   100,
-				Reasons: []Reason{{Text: "Only available profile", Positive: true}},
-			}},
-		}, nil
+	// Credential eligibility is independent of ranking, quota policy and a
+	// cooldown override. A rejected or hard-expired non-renewable credential
+	// cannot become a usable backup just because it is the only candidate.
+	eligible := make([]string, 0, len(available))
+	var blocked []ProfileScore
+	var blockedNames []string
+	for _, name := range available {
+		h := s.healthFor(tool, name)
+		signals := health.CredentialSignals(h, health.DefaultHealthConfig())
+		if signals.LoginRequired != nil && *signals.LoginRequired {
+			reason := "Login required: credential expired and cannot be renewed"
+			if h.ProviderRejected() {
+				reason = "Login required: provider rejected this credential"
+			}
+			blocked = append(blocked, ProfileScore{Name: name, Score: -10000, Reasons: []Reason{{Text: reason}}})
+			blockedNames = append(blockedNames, name)
+			continue
+		}
+		eligible = append(eligible, name)
+	}
+	if len(eligible) == 0 {
+		return nil, fmt.Errorf("no launchable profiles for %s: login required for %s; log in again and save the replacement credentials before rotating", tool, strings.Join(blockedNames, ", "))
+	}
+
+	// Quota is an eligibility condition whenever it was requested, not a
+	// scoring hint. Apply it centrally so random/round-robin choices, drain
+	// reserves, singleton rechecks, and cooldown overrides cannot bypass it.
+	if s.usageData != nil {
+		measured, err := QuotaCandidates(tool, eligible, s.usageData)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range eligible {
+			if reason := quotaIneligibilityReason(s.usageData[name]); reason != "" {
+				blocked = append(blocked, ProfileScore{Name: name, Score: -10000, Reasons: []Reason{{Text: reason}}})
+			}
+		}
+		eligible = measured
 	}
 
 	// Opt-in drain policy overrides algorithm scoring (issue #81):
 	// drain quota that resets soonest before it expires unused.
+	var result *Result
+	var err error
 	if s.policy == PolicyDrain {
-		return s.selectDrain(tool, available)
+		result, err = s.selectDrain(tool, eligible)
+	} else {
+		switch s.algorithm {
+		case AlgorithmRandom:
+			result, err = s.selectRandom(tool, eligible)
+		case AlgorithmRoundRobin:
+			result, err = s.selectRoundRobin(tool, eligible, currentProfile)
+		default:
+			result, err = s.selectSmart(tool, eligible)
+		}
 	}
-
-	switch s.algorithm {
-	case AlgorithmRandom:
-		return s.selectRandom(tool, available)
-	case AlgorithmRoundRobin:
-		return s.selectRoundRobin(tool, available, currentProfile)
-	default:
-		return s.selectSmart(tool, available)
+	if result != nil {
+		result.Alternatives = append(result.Alternatives, blocked...)
 	}
+	return result, err
 }
 
 // selectDrain implements the opt-in drain-before-reset policy (issue #81).
@@ -231,8 +323,9 @@ func (s *Selector) Select(tool string, profiles []string, currentProfile string)
 // configured headroom ceiling, and have a known future reset time, it prefers
 // the profile whose quota resets SOONEST — draining included quota that would
 // otherwise expire unused. Profiles at/above the ceiling, with unknown reset
-// times, or with failed usage fetches are held in reserve, ranked by
-// availability so the fallback order stays sensible.
+// times are held in reserve, ranked by availability so the fallback order
+// stays sensible. When quota was requested, failed or exhausted measurements
+// have already been excluded by Select; reserves still have measured headroom.
 func (s *Selector) selectDrain(tool string, profiles []string) (*Result, error) {
 	now := time.Now()
 	var scores []ProfileScore
@@ -300,12 +393,6 @@ func (s *Selector) selectDrain(tool string, profiles []string) (*Result, error) 
 					Positive: false,
 				})
 			}
-		case usage != nil && usage.Error != "":
-			score.Score = -10
-			score.Reasons = append(score.Reasons, Reason{
-				Text:     "Usage data unavailable; held in reserve",
-				Positive: false,
-			})
 		default:
 			score.Score = 0
 			score.Reasons = append(score.Reasons, Reason{
@@ -495,9 +582,9 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 		}
 
 		// Factor 2: Health status
-		if s.healthStore != nil {
-			h, err := s.healthStore.GetProfile(tool, p)
-			if err == nil && h != nil {
+		if s.healthStore != nil || s.profileHealth != nil {
+			h := s.healthFor(tool, p)
+			if h != nil {
 				status := health.CalculateStatus(h)
 				switch status {
 				case health.StatusHealthy:
@@ -601,7 +688,9 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 					})
 				} else if usage.PrimaryPercent <= 30 {
 					score.Reasons = append(score.Reasons, Reason{
-						Text:     fmt.Sprintf("Primary limit %d%% used (plenty available)", usage.PrimaryPercent),
+						// Zero can mean an absent optional session. Describe
+						// the validated quota score rather than invent a window.
+						Text:     fmt.Sprintf("Quota availability score %d/100", usage.AvailScore),
 						Positive: true,
 					})
 				} else {
@@ -629,13 +718,6 @@ func (s *Selector) selectSmart(tool string, profiles []string) (*Result, error) 
 						Positive: false,
 					})
 				}
-			} else if usage != nil && usage.Error != "" {
-				// Fetching failed - slight penalty but don't disqualify
-				score.Score -= 10
-				score.Reasons = append(score.Reasons, Reason{
-					Text:     "Usage data unavailable",
-					Positive: false,
-				})
 			}
 		}
 
@@ -685,7 +767,7 @@ func planBonus(planType string) float64 {
 
 // isInCooldown checks if a profile is currently in cooldown.
 func (s *Selector) isInCooldown(tool, profile string, now time.Time) bool {
-	if s.db == nil {
+	if s.db == nil || s.ignoreCooldown {
 		return false
 	}
 
@@ -783,7 +865,7 @@ func FormatResult(r *Result) string {
 		}
 	}
 
-	// Show alternatives (excluding selected and cooldown profiles)
+	// Show eligible alternatives (excluding the selected profile).
 	var alts []ProfileScore
 	for _, ps := range r.Alternatives {
 		if ps.Name != r.Selected && ps.Score > -9000 {
@@ -813,17 +895,18 @@ func FormatResult(r *Result) string {
 		}
 	}
 
-	// Show cooldown profiles
-	var cooldowns []ProfileScore
+	// Credential, quota, and cooldown restrictions are all disqualifying. Keep
+	// their actual reasons rather than labelling every blocked row a cooldown.
+	var unavailable []ProfileScore
 	for _, ps := range r.Alternatives {
 		if ps.Score <= -9000 {
-			cooldowns = append(cooldowns, ps)
+			unavailable = append(unavailable, ps)
 		}
 	}
 
-	if len(cooldowns) > 0 {
-		sb.WriteString("\nIn cooldown:\n")
-		for _, ps := range cooldowns {
+	if len(unavailable) > 0 {
+		sb.WriteString("\nUnavailable:\n")
+		for _, ps := range unavailable {
 			sb.WriteString(fmt.Sprintf("  %s", ps.Name))
 			if len(ps.Reasons) > 0 {
 				sb.WriteString(fmt.Sprintf(" - %s", ps.Reasons[0].Text))

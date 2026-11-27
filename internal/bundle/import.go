@@ -9,18 +9,23 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/vaulttransfer"
 )
 
 // ImportMode defines how to handle conflicts during import.
 type ImportMode string
 
 const (
-	// ImportModeSmart compares token freshness for conflicts.
-	// New profiles are added, existing profiles keep the fresher token.
+	// ImportModeSmart compares token freshness for conflicts. Claude profiles
+	// must also prove the same account and organization, or contain exactly the
+	// same credential pair, before an existing profile can be replaced.
 	ImportModeSmart ImportMode = "smart"
 
 	// ImportModeMerge adds new profiles but skips existing ones.
@@ -117,12 +122,15 @@ type ImportResult struct {
 
 // ProfileAction describes what happened to a single profile during import.
 type ProfileAction struct {
-	Provider string
-	Profile  string
-	Action   string // "add", "update", "skip", "error"
-	Reason   string
+	Provider     string
+	Profile      string
+	Action       string // "add", "update", "skip", "error"
+	Reason       string
 	LocalExpiry  *time.Time
 	BundleExpiry *time.Time
+	// RecoveryPath retains the complete previous profile after a replacement.
+	// It is a private vault entry, not a selectable account.
+	RecoveryPath string `json:",omitempty"`
 }
 
 // OptionalAction describes what happened to an optional file during import.
@@ -137,6 +145,9 @@ type OptionalAction struct {
 type VaultImporter struct {
 	// BundlePath is the path to the bundle file.
 	BundlePath string
+
+	beforeProfilePublish func(source, destination string)
+	renameProfile        func(oldPath, newPath string) error
 }
 
 // Import restores vault from a bundle with the given options.
@@ -144,6 +155,9 @@ func (i *VaultImporter) Import(opts *ImportOptions) (*ImportResult, error) {
 	if opts == nil {
 		opts = DefaultImportOptions()
 	}
+	// Resolve trusted configured ancestors without changing the caller's options.
+	options := *opts
+	opts = &options
 
 	result := &ImportResult{
 		ProfileActions:  make([]ProfileAction, 0),
@@ -204,25 +218,42 @@ func (i *VaultImporter) Import(opts *ImportOptions) (*ImportResult, error) {
 	}
 	result.VerificationResult = verifyResult
 
-	if !verifyResult.Valid && !opts.Force {
+	if !verifyResult.Valid {
 		return result, fmt.Errorf("checksum verification failed: %s", verifyResult.Summary())
+	}
+	if err := resolveImportDestinations(opts, manifest); err != nil {
+		return result, fmt.Errorf("unsafe destination: %w", err)
+	}
+	if err := preflightImport(tempDir, manifest, opts); err != nil {
+		return result, fmt.Errorf("unsafe import: %w", err)
 	}
 
 	// If dry run, determine what would happen without doing it
 	if opts.DryRun {
-		i.previewImport(tempDir, manifest, opts, result)
-		return result, nil
+		return result, i.previewImport(tempDir, manifest, opts, result)
 	}
 
-	// Import vault profiles
-	if err := i.importVault(tempDir, manifest, opts, result); err != nil {
-		return result, fmt.Errorf("import vault: %w", err)
+	importFiles := func() error {
+		// A managed writer may have changed the destination while we waited for
+		// the lock. Capture and decide from the generation that is present now.
+		if err := preflightImport(tempDir, manifest, opts); err != nil {
+			return fmt.Errorf("unsafe import: %w", err)
+		}
+		plans, err := i.planVaultImport(tempDir, manifest, opts, result)
+		if err != nil {
+			return err
+		}
+		if err := i.importVault(plans, result); err != nil {
+			return fmt.Errorf("import vault: %w", err)
+		}
+		i.importOptionalFiles(tempDir, manifest, opts, result)
+		return nil
 	}
-
-	// Import optional files
-	i.importOptionalFiles(tempDir, manifest, opts, result)
-
-	return result, nil
+	if opts.VaultPath == "" {
+		return result, importFiles()
+	}
+	err = authfile.NewVault(opts.VaultPath).WithMutationLock(importFiles)
+	return result, err
 }
 
 // extractBundle extracts a regular (unencrypted) zip bundle.
@@ -240,6 +271,69 @@ func (i *VaultImporter) extractBundle(destDir string) error {
 	}
 
 	return nil
+}
+
+func resolveImportDestinations(opts *ImportOptions, manifest *ManifestV1) error {
+	for _, target := range []struct {
+		path      *string
+		directory bool
+		included  bool
+	}{
+		{&opts.VaultPath, true, len(manifest.Contents.Vault.Profiles) != 0},
+		{&opts.ConfigPath, false, manifest.Contents.Config.Included && !opts.SkipConfig},
+		{&opts.ProjectsPath, false, manifest.Contents.Projects.Included && !opts.SkipProjects},
+		{&opts.HealthPath, false, manifest.Contents.Health.Included && !opts.SkipHealth},
+		{&opts.DatabasePath, false, manifest.Contents.Database.Included && !opts.SkipDatabase},
+		{&opts.SyncPath, true, manifest.Contents.SyncConfig.Included && !opts.SkipSync},
+	} {
+		if !target.included || *target.path == "" {
+			continue
+		}
+		path, err := filepath.Abs(*target.path)
+		if err != nil {
+			return err
+		}
+		root := path
+		if !target.directory {
+			root = filepath.Dir(path)
+		}
+		// Root aliases are refused, while aliases above the configured storage
+		// root (such as HOME or macOS /var) are trusted caller configuration.
+		if info, err := os.Lstat(root); err == nil && !info.IsDir() {
+			return fmt.Errorf("destination root is not a real directory: %s", root)
+		} else if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		parent, err := resolveExistingAncestors(filepath.Dir(root))
+		if err != nil {
+			return err
+		}
+		resolved := filepath.Join(parent, filepath.Base(root))
+		if root == filepath.Dir(root) {
+			resolved = root
+		}
+		if !target.directory {
+			resolved = filepath.Join(resolved, filepath.Base(path))
+		}
+		*target.path = resolved
+	}
+	return nil
+}
+
+func resolveExistingAncestors(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err == nil || !os.IsNotExist(err) {
+		return resolved, err
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return "", err
+	}
+	resolved, err = resolveExistingAncestors(parent)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolved, filepath.Base(path)), nil
 }
 
 // extractEncryptedBundle decrypts and extracts an encrypted bundle.
@@ -285,6 +379,12 @@ func (i *VaultImporter) extractEncryptedBundle(destDir, password string) error {
 
 // extractZipFile extracts a single file from a zip archive.
 func extractZipFile(f *zip.File, destDir string) error {
+	if err := vaulttransfer.ValidateRelativePath(strings.TrimSuffix(f.Name, "/")); err != nil {
+		return err
+	}
+	if mode := f.Mode(); !mode.IsRegular() && !mode.IsDir() {
+		return fmt.Errorf("unsupported archive entry type: %s", f.Name)
+	}
 	// Sanitize path to prevent directory traversal (Zip Slip attack)
 	// First, clean the zip entry name to normalize any path components
 	cleanName := filepath.Clean(DenormalizePath(f.Name))
@@ -334,7 +434,7 @@ func extractZipFile(f *zip.File, destDir string) error {
 	defer rc.Close()
 
 	// Create destination
-	dest, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	dest, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
 	if err != nil {
 		return err
 	}
@@ -352,54 +452,269 @@ func extractZipFile(f *zip.File, destDir string) error {
 	return nil
 }
 
-// previewImport determines what would happen during import without making changes.
-func (i *VaultImporter) previewImport(bundleDir string, manifest *ManifestV1, opts *ImportOptions, result *ImportResult) {
-	// Preview vault profiles
+// Validate every selected path before previewing freshness or changing any
+// local file, so a bad entry cannot partially restore an otherwise valid bundle.
+func preflightImport(bundleDir string, manifest *ManifestV1, opts *ImportOptions) error {
 	for provider, profiles := range manifest.Contents.Vault.Profiles {
-		// Check provider filter
 		if len(opts.ProviderFilter) > 0 && !containsIgnoreCase(opts.ProviderFilter, provider) {
 			continue
 		}
-
 		for _, profile := range profiles {
-			// Check profile filter
 			if len(opts.ProfileFilter) > 0 && !matchesAnyPattern(profile, opts.ProfileFilter) {
 				continue
 			}
-
-			action := i.determineProfileAction(bundleDir, opts, provider, profile)
-			result.ProfileActions = append(result.ProfileActions, action)
-
-			switch action.Action {
-			case "add":
-				result.NewProfiles++
-			case "update":
-				result.UpdatedProfiles++
-			case "skip":
-				result.SkippedProfiles++
+			if opts.VaultPath == "" {
+				return fmt.Errorf("vault destination is empty")
+			}
+			if err := validateRestorePath(opts.VaultPath, true, true); err != nil {
+				return err
+			}
+			src, err := ValidateManifestPath(bundleDir, "vault/"+provider+"/"+profile)
+			if err != nil {
+				return err
+			}
+			dst, err := ValidateManifestPath(opts.VaultPath, provider+"/"+profile)
+			if err != nil {
+				return err
+			}
+			if err := validateRestoreTree(src, dst, true); err != nil {
+				return fmt.Errorf("profile %s/%s: %w", provider, profile, err)
 			}
 		}
 	}
-
-	// Preview optional files
-	i.previewOptionalFiles(manifest, opts, result)
+	for _, item := range []struct {
+		name    string
+		content OptionalContent
+		dst     string
+		skip    bool
+	}{
+		{"config", manifest.Contents.Config, opts.ConfigPath, opts.SkipConfig},
+		{"projects", manifest.Contents.Projects, opts.ProjectsPath, opts.SkipProjects},
+		{"health", manifest.Contents.Health, opts.HealthPath, opts.SkipHealth},
+		{"database", manifest.Contents.Database, opts.DatabasePath, opts.SkipDatabase},
+		{"sync", manifest.Contents.SyncConfig, opts.SyncPath, opts.SkipSync},
+	} {
+		if !item.content.Included || item.skip || item.dst == "" {
+			continue
+		}
+		src, err := ValidateManifestPath(bundleDir, item.content.Path)
+		if err != nil {
+			return err
+		}
+		info, err := os.Lstat(src)
+		if err != nil {
+			return err
+		}
+		// Older bundles stored health as a directory, whereas current callers
+		// normally restore its health.json to one file.
+		if item.name == "health" && info.IsDir() && strings.EqualFold(filepath.Ext(item.dst), ".json") {
+			src = filepath.Join(src, "health.json")
+			info, err = os.Lstat(src)
+			if err != nil {
+				return err
+			}
+		}
+		if (item.name == "sync" && !info.IsDir()) || (item.name != "sync" && item.name != "health" && info.IsDir()) {
+			return fmt.Errorf("unexpected content type: %s", item.content.Path)
+		}
+		if err := validateRestoreTree(src, item.dst, info.IsDir()); err != nil {
+			return fmt.Errorf("content %s: %w", item.content.Path, err)
+		}
+	}
+	return nil
 }
 
-// determineProfileAction determines what action to take for a profile.
-func (i *VaultImporter) determineProfileAction(bundleDir string, opts *ImportOptions, provider, profile string) ProfileAction {
+func validateRestoreTree(src, dst string, directory bool) error {
+	if err := validateRestorePath(src, directory, false); err != nil {
+		return err
+	}
+	if err := validateRestorePath(dst, directory, true); err != nil {
+		return err
+	}
+	if !directory {
+		return nil
+	}
+	return filepath.WalkDir(src, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() && !entry.Type().IsRegular() {
+			return fmt.Errorf("nonregular restore source: %s", path)
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		return validateRestorePath(filepath.Join(dst, rel), entry.IsDir(), true)
+	})
+}
+
+// Reject links and special files before reads, mkdirs, or writes. The caller's
+// configured root and its nearest existing parent must be real directories;
+// ancestors above that boundary may be trusted aliases (e.g. macOS /var or a
+// symlinked HOME). ValidateManifestPath and tree traversal check every component
+// beneath the root, so bundle-controlled names cannot redirect restoration.
+func validateRestorePath(path string, directory, allowMissing bool) error {
+	info, err := os.Lstat(path)
+	if err != nil && !(allowMissing && os.IsNotExist(err)) {
+		return err
+	}
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || (directory && !info.IsDir()) || (!directory && !info.Mode().IsRegular()) {
+			return fmt.Errorf("unexpected restore destination type: %s", path)
+		}
+	}
+	for parent := filepath.Dir(path); ; parent = filepath.Dir(parent) {
+		info, err := os.Lstat(parent)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err == nil && !info.IsDir() {
+			return fmt.Errorf("restore parent is not a real directory: %s", parent)
+		}
+		if err == nil {
+			return nil
+		}
+		if filepath.Dir(parent) == parent {
+			return nil
+		}
+	}
+}
+
+// previewImport determines what would happen during import without making changes.
+func (i *VaultImporter) previewImport(bundleDir string, manifest *ManifestV1, opts *ImportOptions, result *ImportResult) error {
+	plans, err := i.planVaultImport(bundleDir, manifest, opts, result)
+	if err != nil {
+		return err
+	}
+	for _, plan := range plans {
+		result.ProfileActions = append(result.ProfileActions, plan.action)
+		switch plan.action.Action {
+		case "add":
+			result.NewProfiles++
+		case "update":
+			result.UpdatedProfiles++
+		case "skip":
+			result.SkippedProfiles++
+		}
+	}
+	i.previewOptionalFiles(manifest, opts, result)
+	return nil
+}
+
+type profileImportPlan struct {
+	action      ProfileAction
+	source      *vaulttransfer.Snapshot
+	prepared    *vaulttransfer.Snapshot
+	destination *vaulttransfer.Snapshot
+}
+
+// Inspect all selected incoming profiles before publishing any of them. A
+// checksum-valid archive can still contain a stale identity binding or settings
+// that cannot be normalized. Prepared copies live under the private extraction
+// directory, so previewing an import never creates a vault or acquires its lock.
+func (i *VaultImporter) planVaultImport(bundleDir string, manifest *ManifestV1, opts *ImportOptions, result *ImportResult) ([]profileImportPlan, error) {
+	providers := make([]string, 0, len(manifest.Contents.Vault.Profiles))
+	for provider := range manifest.Contents.Vault.Profiles {
+		providers = append(providers, provider)
+	}
+	sort.Strings(providers)
+	var plans []profileImportPlan
+	var preparedRoot string
+	for _, provider := range providers {
+		if len(opts.ProviderFilter) > 0 && !containsIgnoreCase(opts.ProviderFilter, provider) {
+			continue
+		}
+		for _, profile := range manifest.Contents.Vault.Profiles[provider] {
+			if len(opts.ProfileFilter) > 0 && !matchesAnyPattern(profile, opts.ProfileFilter) {
+				continue
+			}
+			plan, err := i.planProfileImport(bundleDir, opts, provider, profile)
+			if err == nil && plan.action.Action != "skip" {
+				if preparedRoot == "" {
+					preparedRoot, err = os.MkdirTemp(bundleDir, ".caam-prepared-*")
+				}
+				if err == nil {
+					plan.prepared, err = vaulttransfer.Prepare(plan.source, filepath.Join(preparedRoot, fmt.Sprint(len(plans))), provider)
+				}
+				if err != nil {
+					err = fmt.Errorf("prepare incoming profile: %w", err)
+				}
+			}
+			if err != nil {
+				plan.action.Action = "error"
+				plan.action.Reason = err.Error()
+				result.ProfileActions = append(result.ProfileActions, plan.action)
+				result.Errors = append(result.Errors, fmt.Sprintf("%s/%s: %v", provider, profile, err))
+				return nil, fmt.Errorf("profile %s/%s: %w", provider, profile, err)
+			}
+			plans = append(plans, plan)
+		}
+	}
+	if err := checkProfileImportSources(plans); err != nil {
+		return nil, err
+	}
+	return plans, nil
+}
+
+// Normalization creates a new private generation, but does not authorize a
+// change to the captured archive source. Keep checking the original source,
+// including omitted native caches, through every profile's publication.
+func checkProfileImportSources(plans []profileImportPlan) error {
+	for _, plan := range plans {
+		if err := plan.source.Check(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (i *VaultImporter) planProfileImport(bundleDir string, opts *ImportOptions, provider, profile string) (profileImportPlan, error) {
+	plan := profileImportPlan{action: ProfileAction{Provider: provider, Profile: profile}}
+	var err error
+	plan.source, err = vaulttransfer.Capture(filepath.Join(bundleDir, "vault", provider, profile))
+	if err != nil {
+		return plan, fmt.Errorf("capture incoming profile: %w", err)
+	}
+	if !plan.source.Exists() {
+		return plan, fmt.Errorf("incoming profile is missing")
+	}
+	plan.destination, err = vaulttransfer.Capture(filepath.Join(opts.VaultPath, provider, profile))
+	if err != nil {
+		return plan, fmt.Errorf("capture local profile: %w", err)
+	}
+	plan.action, err = i.determineProfileAction(opts, provider, profile, plan.destination, plan.source)
+	if err != nil {
+		return plan, err
+	}
+	if err := plan.source.Check(); err != nil {
+		return plan, err
+	}
+	return plan, plan.destination.Check()
+}
+
+// determineProfileAction uses only the captured source and destination. Email
+// and display labels never authorize overwriting a Claude credential pair.
+func (i *VaultImporter) determineProfileAction(opts *ImportOptions, provider, profile string, local, incoming *vaulttransfer.Snapshot) (ProfileAction, error) {
 	action := ProfileAction{
 		Provider: provider,
 		Profile:  profile,
 	}
-
-	// Check if profile exists locally
-	localProfilePath := filepath.Join(opts.VaultPath, provider, profile)
-	localExists := directoryExists(localProfilePath)
-
-	if !localExists {
+	var incomingClaude *vaulttransfer.ClaudeIdentity
+	if strings.EqualFold(provider, "claude") {
+		var err error
+		incomingClaude, err = vaulttransfer.InspectClaude(incoming)
+		if err != nil {
+			return action, fmt.Errorf("incoming Claude identity: %w", err)
+		}
+	}
+	if !local.Exists() {
 		action.Action = "add"
 		action.Reason = "new profile"
-		return action
+		if incomingClaude != nil && incomingClaude.Binding == nil {
+			action.Reason += "; Claude account and organization are unverified; unverified account labels omitted"
+		}
+		return action, nil
 	}
 
 	// Profile exists locally - determine action based on mode
@@ -407,17 +722,52 @@ func (i *VaultImporter) determineProfileAction(bundleDir string, opts *ImportOpt
 	case ImportModeMerge:
 		action.Action = "skip"
 		action.Reason = "profile exists (merge mode)"
-		return action
+		return action, nil
 
 	case ImportModeReplace:
 		action.Action = "update"
-		action.Reason = "overwriting (replace mode)"
-		return action
+		action.Reason = "replacing profile; previous snapshot will be retained"
+		if incomingClaude != nil && incomingClaude.Binding == nil {
+			action.Reason += "; Claude account and organization are unverified; unverified account labels omitted"
+		}
+		return action, nil
 
 	case ImportModeSmart:
-		// Compare freshness
-		bundleProfilePath := filepath.Join(bundleDir, "vault", provider, profile)
-		localFresh, bundleFresh := i.compareFreshness(provider, profile, localProfilePath, bundleProfilePath)
+		if incomingClaude != nil {
+			localClaude, err := vaulttransfer.InspectClaude(local)
+			if err != nil {
+				action.Action = "skip"
+				action.Reason = "local Claude identity is invalid or its credentials changed; inspect it before using --mode replace"
+				return action, nil
+			}
+			sameCredentials := incomingClaude.Fingerprint != "" && incomingClaude.Fingerprint == localClaude.Fingerprint
+			sameOwner := incomingClaude.Binding != nil && localClaude.Binding != nil &&
+				identity.ClaudeSameAccount(&incomingClaude.Binding.Identity, &localClaude.Binding.Identity)
+			if incomingClaude.Binding != nil && localClaude.Binding != nil && !sameOwner {
+				action.Action = "skip"
+				action.Reason = "Claude account or organization differs; use another profile name or explicit --mode replace"
+				return action, nil
+			}
+			if !sameCredentials && !sameOwner {
+				action.Action = "skip"
+				action.Reason = "Claude ownership is unverified for different credentials; verify both profiles or use explicit --mode replace"
+				return action, nil
+			}
+			if sameCredentials && localClaude.Binding != nil && incomingClaude.Binding == nil {
+				action.Action = "skip"
+				action.Reason = "local Claude identity is verified; bundle would discard its verification"
+				return action, nil
+			}
+			if sameCredentials && localClaude.Binding == nil && incomingClaude.Binding != nil {
+				action.Action = "update"
+				action.Reason = "same Claude credential pair; importing verified account and organization"
+				return action, nil
+			}
+		}
+		localFresh, bundleFresh, err := i.compareFreshness(provider, profile, local, incoming)
+		if err != nil {
+			return action, err
+		}
 
 		if localFresh != nil {
 			action.LocalExpiry = &localFresh.ExpiresAt
@@ -426,43 +776,57 @@ func (i *VaultImporter) determineProfileAction(bundleDir string, opts *ImportOpt
 			action.BundleExpiry = &bundleFresh.ExpiresAt
 		}
 
-		if bundleFresh == nil {
+		if bundleFresh == nil || incomingClaude != nil && bundleFresh.ExpiresAt.IsZero() {
 			action.Action = "skip"
 			action.Reason = "cannot determine bundle freshness"
-			return action
+			return action, nil
 		}
 
+		if incomingClaude != nil && (localFresh == nil || localFresh.ExpiresAt.IsZero()) {
+			action.Action = "skip"
+			action.Reason = "cannot determine local Claude token expiry; local profile preserved"
+			return action, nil
+		}
 		if localFresh == nil {
 			action.Action = "update"
 			action.Reason = "cannot determine local freshness, importing bundle"
-			return action
+			return action, nil
 		}
 
-		if sync.CompareFreshness(bundleFresh, localFresh) {
+		fresher := sync.CompareFreshness(bundleFresh, localFresh)
+		if incomingClaude != nil {
+			// ZIP extraction times are not evidence that a token was refreshed.
+			fresher = bundleFresh.ExpiresAt.After(localFresh.ExpiresAt)
+		}
+		if fresher {
 			action.Action = "update"
 			action.Reason = fmt.Sprintf("bundle token fresher (expires %s vs %s)",
 				bundleFresh.ExpiresAt.Format("2006-01-02 15:04"),
 				localFresh.ExpiresAt.Format("2006-01-02 15:04"))
+			if incomingClaude != nil && incomingClaude.Binding == nil {
+				action.Reason += "; unverified Claude account labels omitted"
+			}
 		} else {
 			action.Action = "skip"
 			action.Reason = "local token fresher or equal"
 		}
-		return action
+		return action, nil
 
 	default:
 		action.Action = "skip"
 		action.Reason = "unknown import mode"
-		return action
+		return action, nil
 	}
 }
 
 // compareFreshness extracts freshness info from local and bundle profiles.
-func (i *VaultImporter) compareFreshness(provider, profile, localPath, bundlePath string) (*sync.TokenFreshness, *sync.TokenFreshness) {
+func (i *VaultImporter) compareFreshness(provider, profile string, local, incoming *vaulttransfer.Snapshot) (*sync.TokenFreshness, *sync.TokenFreshness, error) {
+	provider = strings.ToLower(provider)
 	// Get auth files for this provider
 	var authFileNames []string
 	switch provider {
 	case "claude":
-		authFileNames = []string{".claude.json", "auth.json"}
+		authFileNames = []string{".credentials.json", "auth.json", ".claude.json"}
 	case "codex":
 		authFileNames = []string{"auth.json"}
 	case "gemini":
@@ -472,30 +836,34 @@ func (i *VaultImporter) compareFreshness(provider, profile, localPath, bundlePat
 	case "cursor":
 		authFileNames = []string{"auth.json", "settings.json"}
 	default:
-		return nil, nil
+		return nil, nil, nil
 	}
-
-	// Extract local freshness
-	localFiles := make(map[string][]byte)
-	for _, name := range authFileNames {
-		path := filepath.Join(localPath, name)
-		if data, err := os.ReadFile(path); err == nil {
-			localFiles[path] = data
+	readFreshness := func(generation *vaulttransfer.Snapshot) (*sync.TokenFreshness, error) {
+		files := make(map[string][]byte)
+		for _, name := range authFileNames {
+			data, exists, err := generation.ReadFile(name)
+			if err != nil {
+				return nil, err
+			}
+			if !exists {
+				continue
+			}
+			files[filepath.Join(generation.Path(), name)] = data
+			if provider == "claude" && (name == ".credentials.json" || name == "auth.json") {
+				// The native runtime uses this source even when its expiry is
+				// missing. A secondary legacy file cannot make it look fresher.
+				break
+			}
 		}
+		freshness, _ := sync.ExtractFreshnessFromBytes(provider, profile, files)
+		return freshness, nil
 	}
-	localFresh, _ := sync.ExtractFreshnessFromBytes(provider, profile, localFiles)
-
-	// Extract bundle freshness
-	bundleFiles := make(map[string][]byte)
-	for _, name := range authFileNames {
-		path := filepath.Join(bundlePath, name)
-		if data, err := os.ReadFile(path); err == nil {
-			bundleFiles[path] = data
-		}
+	localFresh, err := readFreshness(local)
+	if err != nil {
+		return nil, nil, err
 	}
-	bundleFresh, _ := sync.ExtractFreshnessFromBytes(provider, profile, bundleFiles)
-
-	return localFresh, bundleFresh
+	bundleFresh, err := readFreshness(incoming)
+	return localFresh, bundleFresh, err
 }
 
 // previewOptionalFiles determines what would happen to optional files.
@@ -583,127 +951,47 @@ func (i *VaultImporter) previewOptionalFiles(manifest *ManifestV1, opts *ImportO
 }
 
 // importVault imports vault profiles from the bundle.
-func (i *VaultImporter) importVault(bundleDir string, manifest *ManifestV1, opts *ImportOptions, result *ImportResult) error {
-	for provider, profiles := range manifest.Contents.Vault.Profiles {
-		// Check provider filter
-		if len(opts.ProviderFilter) > 0 && !containsIgnoreCase(opts.ProviderFilter, provider) {
+func (i *VaultImporter) importVault(plans []profileImportPlan, result *ImportResult) error {
+	for _, plan := range plans {
+		action := plan.action
+		if action.Action == "skip" {
+			result.ProfileActions = append(result.ProfileActions, action)
+			result.SkippedProfiles++
 			continue
 		}
-
-		for _, profile := range profiles {
-			// Check profile filter
-			if len(opts.ProfileFilter) > 0 && !matchesAnyPattern(profile, opts.ProfileFilter) {
-				continue
+		var beforePublish func(source, destination string)
+		if i.beforeProfilePublish != nil {
+			beforePublish = func(_, destination string) {
+				i.beforeProfilePublish(plan.source.Path(), destination)
 			}
-
-			action := i.determineProfileAction(bundleDir, opts, provider, profile)
+		}
+		recoveryPath, err := vaulttransfer.Publish(plan.prepared, plan.destination, &vaulttransfer.Options{
+			Provider: action.Provider, BeforePublish: beforePublish, Rename: i.renameProfile,
+			CheckSource: func() error { return checkProfileImportSources(plans) },
+		})
+		action.RecoveryPath = recoveryPath
+		if err != nil {
+			action.Action = "error"
+			action.Reason = err.Error()
 			result.ProfileActions = append(result.ProfileActions, action)
-
-			if action.Action == "skip" {
-				result.SkippedProfiles++
-				continue
-			}
-
-			// Import the profile
-			bundleProfilePath := filepath.Join(bundleDir, "vault", provider, profile)
-			localProfilePath := filepath.Join(opts.VaultPath, provider, profile)
-
-			if err := copyProfileDirectory(bundleProfilePath, localProfilePath); err != nil {
-				result.Errors = append(result.Errors, fmt.Sprintf("%s/%s: %v", provider, profile, err))
-				continue
-			}
-
-			switch action.Action {
-			case "add":
-				result.NewProfiles++
-			case "update":
-				result.UpdatedProfiles++
-			}
-		}
-	}
-
-	return nil
-}
-
-// copyProfileDirectory copies a profile directory from bundle to vault atomically.
-// Uses a temporary directory to ensure the original is preserved if the copy fails.
-func copyProfileDirectory(src, dst string) error {
-	// Ensure parent directory exists
-	parentDir := filepath.Dir(dst)
-	if err := os.MkdirAll(parentDir, 0700); err != nil {
-		return fmt.Errorf("create parent dir: %w", err)
-	}
-
-	// Create a temporary directory in the same parent to ensure atomic rename works
-	tmpDir, err := os.MkdirTemp(parentDir, ".caam_import_*")
-	if err != nil {
-		return fmt.Errorf("create temp dir: %w", err)
-	}
-
-	// Clean up temp dir on failure
-	success := false
-	defer func() {
-		if !success {
-			os.RemoveAll(tmpDir)
-		}
-	}()
-
-	// Copy to temporary directory
-	if err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("%s/%s: %v", action.Provider, action.Profile, err))
 			return err
 		}
-
-		relPath, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-
-		dstPath := filepath.Join(tmpDir, relPath)
-
-		if d.IsDir() {
-			return os.MkdirAll(dstPath, 0700)
-		}
-
-		return copyFile(path, dstPath)
-	}); err != nil {
-		return fmt.Errorf("copy files: %w", err)
-	}
-
-	// Check if destination exists
-	_, statErr := os.Stat(dst)
-	dstExists := statErr == nil
-
-	// If destination exists, rename it to backup first
-	backupPath := dst + ".bak"
-	if dstExists {
-		// Remove any existing backup
-		os.RemoveAll(backupPath)
-		if err := os.Rename(dst, backupPath); err != nil {
-			return fmt.Errorf("backup existing: %w", err)
+		result.ProfileActions = append(result.ProfileActions, action)
+		if action.Action == "add" {
+			result.NewProfiles++
+		} else {
+			result.UpdatedProfiles++
 		}
 	}
-
-	// Rename temp directory to destination (atomic on same filesystem)
-	if err := os.Rename(tmpDir, dst); err != nil {
-		// Restore backup if rename failed
-		if dstExists {
-			os.Rename(backupPath, dst)
-		}
-		return fmt.Errorf("rename to destination: %w", err)
-	}
-
-	// Success - remove backup and mark success to prevent temp cleanup
-	success = true
-	if dstExists {
-		os.RemoveAll(backupPath)
-	}
-
 	return nil
 }
 
 // copyFile copies a single file.
 func copyFile(src, dst string) error {
+	if err := validateRestoreTree(src, dst, false); err != nil {
+		return err
+	}
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
@@ -714,17 +1002,25 @@ func copyFile(src, dst string) error {
 		return err
 	}
 
-	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	dstFile, err := os.CreateTemp(filepath.Dir(dst), ".caam_import_file_*")
 	if err != nil {
 		return err
 	}
+	tmpPath := dstFile.Name()
+	defer os.Remove(tmpPath)
 	defer dstFile.Close()
 
 	if _, err := io.Copy(dstFile, srcFile); err != nil {
 		return err
 	}
 
-	return dstFile.Sync()
+	if err := dstFile.Sync(); err != nil {
+		return err
+	}
+	if err := dstFile.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, dst)
 }
 
 // importOptionalFiles imports optional files from the bundle.
@@ -895,6 +1191,9 @@ func (i *VaultImporter) importOptionalFiles(bundleDir string, manifest *Manifest
 // mergeJSONFile merges a JSON file from bundle into an existing local file.
 // Uses atomic write (temp + fsync + rename) to prevent corruption.
 func mergeJSONFile(srcPath, dstPath string) error {
+	if err := validateRestoreTree(srcPath, dstPath, false); err != nil {
+		return err
+	}
 	// Read source
 	srcData, err := os.ReadFile(srcPath)
 	if err != nil {
@@ -931,11 +1230,11 @@ func mergeJSONFile(srcPath, dstPath string) error {
 	}
 
 	// Atomic write: write to temp file, fsync, then rename
-	tmpPath := dstPath + ".tmp"
-	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	tmpFile, err := os.CreateTemp(filepath.Dir(dstPath), ".caam_import_json_*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
 
 	if _, err := tmpFile.Write(merged); err != nil {
 		tmpFile.Close()
@@ -964,6 +1263,9 @@ func mergeJSONFile(srcPath, dstPath string) error {
 
 // copyDirectory copies an entire directory.
 func copyDirectory(src, dst string) error {
+	if err := validateRestoreTree(src, dst, true); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(dst, 0700); err != nil {
 		return err
 	}

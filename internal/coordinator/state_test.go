@@ -3,6 +3,8 @@ package coordinator
 import (
 	"context"
 	"regexp"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -168,6 +170,54 @@ func TestDetectStateMetadata(t *testing.T) {
 
 	if resetTime, ok := metadata["reset_time"]; !ok || resetTime != "2pm" {
 		t.Errorf("expected reset_time=2pm, got %v", metadata)
+	}
+}
+
+// TestExtractOAuthURLJoinsWrappedLines: WezTerm's get-text returns a soft-
+// wrapped URL as several lines, and Claude Code's layout can wrap it itself;
+// the agent needs the whole URL.
+func TestExtractOAuthURLJoinsWrappedLines(t *testing.T) {
+	url := "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fconsole.anthropic.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference&code_challenge=abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG&code_challenge_method=S256&state=zyxwvutsrqponmlkjihgfedcba9876543210"
+	chunks := func(width int) []string {
+		var out []string
+		for s := url; s != ""; {
+			n := min(width, len(s))
+			out = append(out, s[:n])
+			s = s[n:]
+		}
+		return out
+	}
+	wrap := func(width int, prefix, suffix string) string {
+		var b strings.Builder
+		for _, c := range chunks(width) {
+			b.WriteString(prefix + c + suffix + "\n")
+		}
+		return b.String()
+	}
+
+	for name, output := range map[string]string{
+		"soft-wrapped at 80 columns": "Browser didn't open? Use the url below to sign in:\n\n" + wrap(80, "", "") +
+			"\nPaste code here if prompted > ",
+		"wrapped with indentation": "  Use the url below to sign in:\n\n" + wrap(70, "  ", "") + "\n  Paste code here if prompted >",
+		"wrapped inside a dialog": "│ Use the url below to sign in:" + strings.Repeat(" ", 40) + "│\n" +
+			wrap(72, "│ ", " │") + "│" + strings.Repeat(" ", 74) + "│\n",
+		"prompt right below the URL": wrap(60, "", "") + "Paste code here if prompted > ",
+		"an older URL above":         "https://claude.ai/oauth/authorize?code=stale\nLogin failed\n\n" + wrap(90, "", ""),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ExtractOAuthURL(output); got != url {
+				t.Fatalf("ExtractOAuthURL =\n%q\nwant\n%q", got, url)
+			}
+		})
+	}
+
+	// A URL followed by text on its line is whole, whatever comes below.
+	if got := ExtractOAuthURL("Open https://claude.ai/oauth/authorize?a=b in a browser\nxyz123\n"); got != "https://claude.ai/oauth/authorize?a=b" {
+		t.Fatalf("got %q", got)
+	}
+	// A blank line ends the URL.
+	if got := ExtractOAuthURL("https://claude.ai/oauth/authorize?a=b\n\nWaiting\n"); got != "https://claude.ai/oauth/authorize?a=b" {
+		t.Fatalf("got %q", got)
 	}
 }
 
@@ -399,13 +449,9 @@ func TestCoordinator_ResumeCooldownPreventsDoubleInjection(t *testing.T) {
 	// First call should inject resume prompt
 	coord.handleResumingState(ctx, tracker, client.output)
 	sentBefore := client.sentText()
-	if len(sentBefore) != 1 {
-		t.Fatalf("expected 1 sent message after first call, got %d: %v", len(sentBefore), sentBefore)
-	}
-
-	// Verify the resume prompt was sent
-	if sentBefore[0] != cfg.ResumePrompt {
-		t.Fatalf("expected resume prompt %q, got %q", cfg.ResumePrompt, sentBefore[0])
+	// The resume prompt goes into an emptied prompt line.
+	if want := PromptKeys(cfg.ResumePrompt); !slices.Equal(sentBefore, want) {
+		t.Fatalf("sent %q after first call, want %q", sentBefore, want)
 	}
 
 	// Create a new tracker (simulating next poll cycle) in resuming state
@@ -416,9 +462,9 @@ func TestCoordinator_ResumeCooldownPreventsDoubleInjection(t *testing.T) {
 	// Second call with cooldown active should NOT inject
 	coord.handleResumingState(ctx, tracker2, client.output)
 	sentAfter := client.sentText()
-	// Should still be just 1 message (no additional injection)
-	if len(sentAfter) != 1 {
-		t.Fatalf("expected 1 sent message after second call (cooldown active), got %d: %v", len(sentAfter), sentAfter)
+	// No additional injection
+	if len(sentAfter) != len(sentBefore) {
+		t.Fatalf("sent %q after second call (cooldown active), want nothing more than %q", sentAfter, sentBefore)
 	}
 }
 
@@ -470,14 +516,14 @@ Waiting for authentication...`,
 			desc:     "Full URL with multiple query params should be extracted completely",
 		},
 		{
-			name: "URL with complex query params",
-			output: `Open this URL: https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef`,
+			name:     "URL with complex query params",
+			output:   `Open this URL: https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef`,
 			expected: "https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef",
 			desc:     "URL with special characters in query params",
 		},
 		{
-			name: "URL with URL-encoded values",
-			output: `Auth URL: https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email`,
+			name:     "URL with URL-encoded values",
+			output:   `Auth URL: https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email`,
 			expected: "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email",
 			desc:     "URL with percent-encoded values preserved",
 		},
@@ -501,10 +547,10 @@ Waiting for authentication...`,
 		},
 		{
 			name: "Multiple URLs in output",
-			output: `Primary: https://claude.ai/oauth/authorize?code=primary
-Alternative: https://claude.ai/oauth/authorize?code=alternate`,
-			expected: "https://claude.ai/oauth/authorize?code=primary",
-			desc:     "Multiple URLs - should extract first one (FindString behavior)",
+			output: `Earlier attempt: https://claude.ai/oauth/authorize?code=stale
+Retried /login: https://claude.ai/oauth/authorize?code=current`,
+			expected: "https://claude.ai/oauth/authorize?code=current",
+			desc:     "Multiple URLs - the most recent one belongs to the live login attempt",
 		},
 		{
 			name:     "URL with no query params",
@@ -753,11 +799,11 @@ func TestExtractOAuthURL_QueryParamPreservation(t *testing.T) {
 
 func TestDetectState_OAuthURLMetadata(t *testing.T) {
 	tests := []struct {
-		name        string
-		output      string
-		wantState   PaneState
-		wantURL     string
-		desc        string
+		name      string
+		output    string
+		wantState PaneState
+		wantURL   string
+		desc      string
 	}{
 		{
 			name:      "extracts URL to metadata",
@@ -767,11 +813,11 @@ func TestDetectState_OAuthURLMetadata(t *testing.T) {
 			desc:      "URL should be stored in metadata",
 		},
 		{
-			name:      "URL with ANSI preserved in metadata",
+			name:      "URL with ANSI stripped in metadata",
 			output:    "\x1b[32mhttps://claude.ai/oauth/authorize?ansi=true\x1b[0m",
 			wantState: StateAwaitingURL,
-			wantURL:   "https://claude.ai/oauth/authorize?ansi=true\x1b[0m",
-			desc:      "URL extracted from original output - trailing ANSI captured (regex [^\\s]+ matches escape codes)",
+			wantURL:   "https://claude.ai/oauth/authorize?ansi=true",
+			desc:      "Escape codes around the URL must not become part of the URL handed to the browser",
 		},
 		{
 			name:      "paste prompt with URL",
@@ -816,6 +862,13 @@ func TestDetectCompactingBanner(t *testing.T) {
 			wantDetected: true,
 			wantContains: "Conversation compacted",
 			desc:         "Standard Claude Code compacting banner",
+		},
+		{
+			name:         "banner with parenthesized hint (Claude Code 2.1)",
+			output:       "Conversation compacted (ctrl+o for history)",
+			wantDetected: true,
+			wantContains: "Conversation compacted",
+			desc:         "Claude Code 2.1 renders the hint in parentheses",
 		},
 		{
 			name:         "banner with bullet point",
@@ -1188,11 +1241,11 @@ func findSubstring(s, substr string) bool {
 
 func TestOAuthURLPattern_Regex(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      string
-		wantMatch  bool
-		wantFull   string
-		desc       string
+		name      string
+		input     string
+		wantMatch bool
+		wantFull  string
+		desc      string
 	}{
 		{
 			name:      "basic authorize URL",
@@ -1282,7 +1335,7 @@ func TestCoordinator_CompactionReminderInjection(t *testing.T) {
 	ctx := context.Background()
 
 	// Call handleIdleState which should detect compaction and inject
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	// Check that prompt was injected
 	client.mu.Lock()
@@ -1316,7 +1369,7 @@ func TestCoordinator_CompactionReminderDisabled(t *testing.T) {
 	ctx := context.Background()
 
 	// Call handleIdleState - should NOT inject because feature is disabled
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	sent := client.sent
@@ -1348,7 +1401,7 @@ func TestCoordinator_CompactionReminderCooldown(t *testing.T) {
 	ctx := context.Background()
 
 	// First injection should succeed
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	count1 := len(client.sent)
@@ -1359,7 +1412,7 @@ func TestCoordinator_CompactionReminderCooldown(t *testing.T) {
 	}
 
 	// Second call should be blocked by cooldown
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	count2 := len(client.sent)
@@ -1393,7 +1446,7 @@ func TestCoordinator_CompactionReminderSkipsIfAlreadyPresent(t *testing.T) {
 	ctx := context.Background()
 
 	// Should NOT inject because reminder is already in output
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	sent := client.sent
@@ -1425,17 +1478,157 @@ func TestCoordinator_CompactionReminderDoesNotTriggerOnRateLimit(t *testing.T) {
 	ctx := context.Background()
 
 	// Call handleIdleState - rate limit takes precedence
-	coord.handleIdleState(ctx, tracker, client.output)
+	coord.handleIdleState(ctx, client.panes[0], tracker, client.output)
 
 	client.mu.Lock()
 	sent := client.sent
 	client.mu.Unlock()
 
 	// Should inject /login, not the compaction reminder
-	if len(sent) != 1 {
-		t.Fatalf("expected 1 injection, got %d: %v", len(sent), sent)
+	if want := []string{KeyEndOfLine, KeyKillLine, "/login\n"}; !slices.Equal(sent, want) {
+		t.Fatalf("expected only the /login keys %q (rate limit takes precedence), got %q", want, sent)
 	}
-	if sent[0] != "/login\n" {
-		t.Errorf("expected /login injection (rate limit takes precedence), got %q", sent[0])
+}
+
+// Scrollback holds earlier sessions; the most recent message decides.
+func TestDetectStateUsesMostRecentMessage(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   PaneState
+	}{
+		{
+			name:   "fresh rate limit below an old login",
+			output: "Logged in as old@example.com\n...hours of work...\nYou've hit your limit · resets 2pm",
+			want:   StateRateLimited,
+		},
+		{
+			name:   "rate limit below unrelated 'expired' text",
+			output: "The cache entry expired, retrying\nYou've hit your limit · resets 5pm",
+			want:   StateRateLimited,
+		},
+		{
+			name:   "method prompt after the banner",
+			output: "You've hit your limit · resets 2pm\n> /login\nSelect login method:\n❯ 1. Claude account with subscription",
+			want:   StateAwaitingMethodSelect,
+		},
+		{
+			name:   "login success after the code",
+			output: "You've hit your limit · resets 2pm\nPaste code here if prompted > ABCD\nLogged in as new@example.com",
+			want:   StateResuming,
+		},
+		{
+			name:   "failure after the code",
+			output: "https://claude.ai/oauth/authorize?code=x\nPaste code here if prompted > ABCD\nInvalid code, please try again",
+			want:   StateFailed,
+		},
+		{
+			name:   "new URL after an earlier failure",
+			output: "Login failed: invalid code\n> /login\nhttps://claude.ai/oauth/authorize?code=retry\nPaste code here if prompted >",
+			want:   StateAwaitingURL,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, meta := DetectState(tt.output)
+			if got != tt.want {
+				t.Fatalf("DetectState() = %v, want %v", got, tt.want)
+			}
+			if got == StateAwaitingURL && meta["oauth_url"] != "https://claude.ai/oauth/authorize?code=retry" {
+				t.Fatalf("oauth_url = %q, want the retried URL", meta["oauth_url"])
+			}
+		})
+	}
+}
+
+func TestDetectStateReportsLatestResetTime(t *testing.T) {
+	_, meta := DetectState("You've hit your limit · resets 2pm\n...\nYou've hit your limit · resets 7pm")
+	if meta["reset_time"] != "7pm" {
+		t.Fatalf("reset_time = %q, want 7pm", meta["reset_time"])
+	}
+}
+
+func TestDetectStateRecognizesLoginSuccessVariants(t *testing.T) {
+	for _, out := range []string{
+		"Paste code here if prompted > abc#def\nLogin successful. Press Enter to continue…",
+		"Paste code here if prompted > abc#def\nSuccessfully logged in",
+		"Paste code here if prompted > abc#def\nLogged in as a@example.com",
+	} {
+		if got, _ := DetectState(out); got != StateResuming {
+			t.Errorf("DetectState(%q) = %v, want RESUMING", out, got)
+		}
+	}
+}
+
+func TestRateLimitBannerVariants(t *testing.T) {
+	for _, tc := range []struct {
+		text, reset string
+	}{
+		{"You've hit your limit · resets 2pm (America/New_York)", "2pm"},
+		{"You’ve hit your limit · resets 11am", "11am"},
+		{"Claude usage limit reached. Your limit will reset at 5pm (Europe/Paris).", "5pm"},
+		{"5-hour limit reached ∙ resets 3:30pm", "3:30pm"},
+		{"Weekly limit reached ∙ resets Oct 9", ""},
+		{"Opus weekly limit reached ∙ resets 9am", "9am"},
+		// Claude Code 2.1 names the limit that was hit.
+		{"  ⎿  You've hit your session limit · resets 3pm (America/New_York)", "3pm"},
+		{"You've hit your usage limit · resets 4pm", "4pm"},
+		{"⏺ You've hit your weekly limit · resets Oct 9, 3pm", ""},
+		{"You've hit your Opus limit · resets 9am · progress saved", "9am"},
+		{"You've hit your Fable limit · resets 10am", "10am"},
+		{"You've hit your usage credit limit · resets 8pm", "8pm"},
+		{"You've hit your monthly spend limit · raise it at claude.ai/settings · your session limit resets 3pm", "3pm"},
+		{"You're out of usage credits · resets 6pm", "6pm"},
+		// A spinner in scrollback, above the banner, is an earlier turn.
+		{"✻ Thinking… (3s · esc to interrupt)\n⏺ Done.\n" + strings.Repeat("⏺ more output\n", bottomLines) +
+			"  ⎿  You've hit your session limit · resets 4pm", "4pm"},
+	} {
+		state, meta := DetectState(tc.text)
+		if state != StateRateLimited {
+			t.Errorf("DetectState(%q) = %v, want RATE_LIMITED", tc.text, state)
+			continue
+		}
+		if meta["reset_time"] != tc.reset {
+			t.Errorf("reset_time for %q = %q, want %q", tc.text, meta["reset_time"], tc.reset)
+		}
+	}
+
+	// Conversation about limits is not a limit banner: injecting /login
+	// into a working session would interrupt it.
+	for _, text := range []string{
+		"> handle the case where the usage limit reached its maximum",
+		"We hit a rate limit (429) from the API; retrying",
+		"Opus limit reached? Let me check the docs.",
+		"⏺ It looks like you've hit your rate limit with the API; it resets hourly.",
+		"> why does it say you're out of usage credits even after the reset?",
+		// Fast mode's own limit falls back by itself; no login needed.
+		"Fast limit reached and temporarily disabled · resets in 5m",
+		// A working session that printed a banner (a diff of this
+		// repository, say) shows Claude Code's spinner below it.
+		"⏺ Update(state_test.go)\n  + You've hit your session limit · resets 3pm\n\n✻ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)\n",
+	} {
+		if state, _ := DetectState(text); state == StateRateLimited {
+			t.Errorf("DetectState(%q) = RATE_LIMITED, want no rate limit", text)
+		}
+	}
+}
+
+func TestExtractOAuthURLOnClaudeHosts(t *testing.T) {
+	for _, url := range []string{
+		"https://claude.ai/oauth/authorize?code=true&state=a",
+		"https://claude.com/cai/oauth/authorize?code=true&state=b",
+		"https://www.claude.com/oauth/authorize?code=true&state=c",
+	} {
+		if got := ExtractOAuthURL("Browse to " + url + "\nPaste code here if prompted >"); got != url {
+			t.Errorf("ExtractOAuthURL = %q, want %q", got, url)
+		}
+	}
+	for _, text := range []string{
+		"https://evil.example/claude.ai/oauth/authorize?x=1",
+		"https://claude.ai.evil.example/oauth/authorize?x=1",
+	} {
+		if got := ExtractOAuthURL(text); got != "" {
+			t.Errorf("ExtractOAuthURL(%q) = %q, want no foreign URL", text, got)
+		}
 	}
 }

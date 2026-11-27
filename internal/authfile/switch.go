@@ -1,0 +1,1371 @@
+package authfile
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
+)
+
+// SwitchOptions controls preservation of the outgoing login. Named profiles
+// always receive a proven newer credential; BackupMode controls additional
+// immutable recovery copies of live state that is not already safely saved.
+type SwitchOptions struct {
+	BackupMode       string
+	MaxAutoBackups   int
+	PreserveOriginal bool
+}
+
+// SwitchResult describes preservation and activation without exposing secrets.
+// A non-nil result is also returned on failure so a caller can locate a recovery
+// copy if RestoreStarted is true and restoring the target subsequently fails.
+type SwitchResult struct {
+	PreviousProfile      string             `json:"previous_profile,omitempty"`
+	AutoBackup           string             `json:"auto_backup,omitempty"`
+	ResnapshottedProfile string             `json:"resnapshotted_profile,omitempty"`
+	OriginalBackup       bool               `json:"original_backup,omitempty"`
+	KeptLive             bool               `json:"kept_live,omitempty"`
+	RestoreStarted       bool               `json:"restore_started,omitempty"`
+	Warnings             []string           `json:"warnings,omitempty"`
+	Identity             *identity.Identity `json:"identity,omitempty"`
+}
+
+// Serialize switches performed by different Vault instances in the same
+// process (notably concurrent API requests). Native CLI writes are additionally
+// checked against the captured bytes immediately before preservation/restore.
+var switchMu sync.Mutex
+
+// Switch validates an incoming profile, preserves the outgoing grant, then
+// restores the target. All account-switching callers should use this operation;
+// Restore remains the lower-level operation for deliberate snapshot recovery.
+// No refresh token is exchanged here and an unproven live identity is never
+// permission to overwrite a named profile.
+func (v *Vault) Switch(fileSet AuthFileSet, target string, opts SwitchOptions) (result *SwitchResult, err error) {
+	result = &SwitchResult{}
+	var recoveryProfile string
+	defer func() {
+		if err != nil && recoveryProfile != "" {
+			err = fmt.Errorf("%w; outgoing auth is saved in %s/%s", err, fileSet.Tool, recoveryProfile)
+		}
+	}()
+	mode := strings.TrimSpace(opts.BackupMode)
+	if mode == "" {
+		mode = "smart"
+	}
+	if mode != "smart" && mode != "always" && mode != "never" {
+		return result, fmt.Errorf("invalid switch backup mode: %s", mode)
+	}
+	if opts.MaxAutoBackups < 0 {
+		return result, fmt.Errorf("maximum automatic backups cannot be negative")
+	}
+
+	switchMu.Lock()
+	defer switchMu.Unlock()
+	release, err := v.lockMutation()
+	if err != nil {
+		return result, err
+	}
+	defer release()
+
+	// Validate the target before even mirroring a keychain or creating a
+	// recovery directory. Preparing Claude settings is read-only.
+	if err := v.ValidateProfileCredentials(fileSet, target); err != nil {
+		return result, err
+	}
+	targetDir, err := v.safeProfileDir(fileSet.Tool, target)
+	if err != nil {
+		return result, err
+	}
+	incoming, err := readSwitchState(fileSet, targetDir)
+	if err != nil {
+		return result, err
+	}
+	var targetIdentity *claudeProfileIdentitySnapshot
+	if fileSet.Tool == "claude" && incoming.credentialName == claudeCredentialsFile {
+		targetIdentity, err = captureClaudeProfileIdentity(targetDir)
+		if err != nil {
+			return result, err
+		}
+		defer targetIdentity.directory.Close()
+	}
+	if warning, err := v.verifyClaudeState(fileSet, targetDir, &incoming); err != nil {
+		return result, err
+	} else if warning != "" {
+		result.Warnings = append(result.Warnings, warning)
+	}
+	if incoming.identityConflict {
+		return result, fmt.Errorf("%w: incoming credential has conflicting account identities", ErrInvalidCredentials)
+	}
+	if targetIdentity != nil {
+		if err := targetIdentity.check(true); err != nil {
+			return result, err
+		}
+	}
+	for name, data := range incoming.files {
+		if fileSet.Tool == "gemini" && name == "oauth_creds.json" &&
+			(incoming.authMethod == "api-key" || incoming.authMethod == "vertex-ai") {
+			continue // Native selection ignores this cache, including malformed leftovers.
+		}
+		if filepath.Ext(name) == ".json" {
+			var obj map[string]json.RawMessage
+			if json.Unmarshal(data, &obj) != nil || obj == nil {
+				return result, fmt.Errorf("%w: incoming %s must be a JSON object", ErrInvalidCredentials, name)
+			}
+		}
+	}
+	if _, err := prepareClaudeSettingsRestore(fileSet, targetDir); err != nil {
+		return result, err
+	}
+	live, err := readSwitchState(fileSet, "")
+	if err != nil {
+		return result, fmt.Errorf("read outgoing auth: %w", err)
+	}
+	if err := checkClaudeCredentialIdentityAgreement(incoming, live); err != nil {
+		return result, err
+	}
+	if live.claudeIdentity == nil {
+		// An exact copy of the just-verified target needs no second request.
+		live.setClaudeIdentity(incoming.claudeIdentity)
+	}
+	if warning, err := v.verifyClaudeState(fileSet, "", &live); err != nil {
+		return result, err
+	} else if warning != "" && len(result.Warnings) == 0 {
+		result.Warnings = append(result.Warnings, warning)
+	}
+	if incoming.claudeIdentity == nil {
+		incoming.setClaudeIdentity(live.claudeIdentity)
+	}
+	if fileSet.Tool == "claude" && incoming.claudeIdentity != nil && live.claudeIdentity != nil {
+		result.Warnings = nil // An exact native proof may resolve legacy target uncertainty.
+	}
+	if err := live.checkUnchanged(fileSet); err != nil {
+		return result, err
+	}
+	verifiedTarget, err := readSwitchState(fileSet, targetDir)
+	if err != nil || !sameSwitchFiles(incoming.files, verifiedTarget.files) {
+		return result, fmt.Errorf("incoming profile changed during identity verification")
+	}
+	if targetIdentity != nil {
+		if err := targetIdentity.check(true); err != nil {
+			return result, err
+		}
+	}
+	if incoming.claudeIdentity != nil {
+		confirmed := incoming.claudeIdentity.Identity
+		confirmed.Verified = true
+		result.Identity = &confirmed
+	}
+
+	// Keep fresher credentials and keychain state unchanged. Retain both
+	// verified generations so offline activation still recognizes freshness.
+	if live.sameAccount(incoming) && live.complete && !live.freshness.IsZero() &&
+		!incoming.freshness.IsZero() && live.freshness.After(incoming.freshness) {
+		if err := v.persistClaudeKeptIdentity(fileSet, targetDir, incoming, live); err != nil {
+			return result, err
+		}
+		if err := checkClaudeActivation(fileSet, live); err != nil {
+			return result, err
+		}
+		result.PreviousProfile = target
+		result.KeptLive = true
+		return result, nil
+	}
+
+	outgoing, saved, err := v.switchOwner(fileSet, live)
+	if err != nil {
+		return result, err
+	}
+	result.PreviousProfile = outgoing
+	preserved := saved != nil && sameSwitchFiles(live.files, saved.files)
+	if preserved {
+		recoveryProfile = outgoing
+	}
+	if outgoing == target && preserved {
+		if err := v.persistClaudeKeptIdentity(fileSet, targetDir, incoming, live); err != nil {
+			return result, err
+		}
+		if err := checkClaudeActivation(fileSet, incoming); err != nil {
+			return result, err
+		}
+		result.KeptLive = true
+		return result, nil
+	}
+
+	if live.hasAuth() {
+		if err := live.checkUnchanged(fileSet); err != nil {
+			return result, err
+		}
+		if opts.PreserveOriginal && outgoing == "" {
+			exists, err := v.HasOriginalBackup(fileSet.Tool)
+			if err != nil {
+				return result, err
+			}
+			if !exists {
+				if _, err := v.saveSwitchRecovery(fileSet, live, originalProfileName); err != nil {
+					return result, fmt.Errorf("preserve original auth: %w", err)
+				}
+				result.OriginalBackup = true
+				recoveryProfile = originalProfileName
+				preserved = true
+			}
+		}
+
+		// Update the credential and its proven account metadata together.
+		// Unrelated settings and user metadata stay as saved. A partial,
+		// older, or unmeasured live credential goes into a separate recovery
+		// snapshot instead of weakening a possibly working named profile.
+		if outgoing != "" && outgoing != target && !IsSystemProfile(outgoing) && !preserved &&
+			saved != nil && live.sameAccount(*saved) && live.complete && saved.complete &&
+			!live.freshness.IsZero() && !saved.freshness.IsZero() && live.freshness.After(saved.freshness) {
+			outgoingDir, err := v.safeProfileDir(fileSet.Tool, outgoing)
+			if err != nil {
+				return result, err
+			}
+			current, err := readSwitchState(fileSet, outgoingDir)
+			if err != nil || !sameSwitchFiles(saved.files, current.files) {
+				return result, fmt.Errorf("outgoing saved profile changed before preservation")
+			}
+			if err := live.checkUnchanged(fileSet); err != nil {
+				return result, err
+			}
+			var preserveErr error
+			if fileSet.Tool == "claude" && live.credentialName == claudeCredentialsFile {
+				preserveErr = v.syncClaudeCredentials(outgoing, saved.credential, live.credential, live.claudeIdentity, func() error {
+					return live.checkUnchanged(fileSet)
+				})
+			} else {
+				preserveErr = writeSwitchFile(filepath.Join(outgoingDir, live.credentialName), live.credential, false)
+			}
+			if preserveErr != nil {
+				return result, fmt.Errorf("preserve outgoing profile %s: %w", outgoing, preserveErr)
+			}
+			result.ResnapshottedProfile = outgoing
+			recoveryProfile = outgoing
+			// Auxiliary credentials and session state can change independently.
+			// Canonicalizing a verified account label alone does not require an
+			// additional recovery snapshot of the same saved credential.
+			saved.files[live.credentialName] = live.credential
+			preserved = samePreservedSwitchFiles(live, *saved)
+		}
+
+		if mode == "always" || (mode == "smart" && !preserved) {
+			name, err := v.saveSwitchRecovery(fileSet, live, "")
+			if err != nil {
+				return result, fmt.Errorf("preserve outgoing auth: %w", err)
+			}
+			result.AutoBackup = name
+			recoveryProfile = name
+		}
+	}
+
+	// Do not clobber a login or target that changed while it was being saved.
+	// Successful preservation stays available when this check stops the switch.
+	if err := live.checkUnchanged(fileSet); err != nil {
+		return result, err
+	}
+	currentTarget, err := readSwitchState(fileSet, targetDir)
+	if err != nil || !sameSwitchFiles(incoming.files, currentTarget.files) {
+		return result, fmt.Errorf("incoming profile changed before activation")
+	}
+	if targetIdentity != nil {
+		if err := targetIdentity.check(true); err != nil {
+			return result, err
+		}
+	}
+	result.RestoreStarted = true
+	if err := v.restoreWithClaudeIdentity(fileSet, target, &incoming); err != nil {
+		return result, fmt.Errorf("restore target: %w", err)
+	}
+	if result.AutoBackup != "" && opts.MaxAutoBackups > 0 {
+		if err := v.rotateAutoBackups(fileSet.Tool, opts.MaxAutoBackups, result.AutoBackup); err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("rotate automatic backups: %v", err))
+		}
+	}
+	return result, nil
+}
+
+// CurrentProfile identifies the captured live credential without writing a
+// keychain mirror, migrating files, or changing the vault. It can read the
+// authoritative keychain where configured. An unproven owner returns an empty
+// name; callers must not use an identity hint as permission to overwrite it.
+func (v *Vault) CurrentProfile(fileSet AuthFileSet) (string, error) {
+	live, err := readSwitchState(fileSet, "")
+	if err != nil {
+		return "", err
+	}
+	return v.currentProfile(fileSet, live)
+}
+
+func (v *Vault) currentProfile(fileSet AuthFileSet, live switchState) (string, error) {
+	owner, _, err := v.switchOwner(fileSet, live)
+	if err != nil {
+		return "", err
+	}
+	if fileSet.Tool == "claude" && live.credentialName == claudeCredentialsFile {
+		// A native login can change while the vault is being scanned. A
+		// credential or proof change invalidates the result; independently
+		// rewritten .claude.json labels never choose an active account.
+		current, readErr := readSwitchState(fileSet, "")
+		if readErr != nil || !sameClaudeSelectionIdentity(live, current) {
+			return "", fmt.Errorf("live Claude credentials or verified identity changed during profile selection; retry")
+		}
+	}
+	return owner, err
+}
+
+func sameClaudeSelectionIdentity(before, current switchState) bool {
+	if before.provider != current.provider || before.authMethod != current.authMethod ||
+		before.credentialName != current.credentialName || before.identityConflict != current.identityConflict ||
+		!bytes.Equal(before.credential, current.credential) {
+		return false
+	}
+	if before.claudeIdentity == nil || current.claudeIdentity == nil {
+		return before.claudeIdentity == nil && current.claudeIdentity == nil
+	}
+	return before.claudeIdentity.CredentialFingerprint == current.claudeIdentity.CredentialFingerprint &&
+		identity.ClaudeSameAccount(&before.claudeIdentity.Identity, &current.claudeIdentity.Identity)
+}
+
+// ReadLiveCredential captures the current credential without creating keychain
+// mirrors, migrating files, or consulting a saved profile. Reads are bounded like
+// unattended discovery. The returned name is the artifact's base name; callers
+// must parse its contents before treating it as credential or expiry evidence.
+func ReadLiveCredential(fileSet AuthFileSet) (name string, data []byte, err error) {
+	live, err := readSwitchStateLimited(fileSet, "", MaxDiscoveryFileBytes)
+	if err != nil {
+		return "", nil, err
+	}
+	// A present primary artifact owns the result even when empty or malformed.
+	// Identification can skip empty bytes, but a health reader must not revive
+	// another login from optional settings in that case.
+	var primary []string
+	switch fileSet.Tool {
+	case "claude":
+		primary = []string{claudeCredentialsFile, "auth.json"}
+	case "codex", "cursor", "grok":
+		primary = []string{"auth.json"}
+	case "gemini":
+		selected, err := GeminiSelectedAuthType(live.files["settings.json"])
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: Gemini settings: %v", ErrInvalidCredentials, err)
+		}
+		if selected == "gemini-api-key" {
+			data, present := live.files[".env"]
+			if !present {
+				return "", nil, fmt.Errorf("%w: selected Gemini API key has no .env credential", ErrInvalidCredentials)
+			}
+			return ".env", data, nil
+		}
+		if selected == "vertex-ai" {
+			// ADC is outside this captured file set. Keep the selected method
+			// unknown rather than attribute an unused OAuth cache's deadline.
+			return "settings.json", live.files["settings.json"], nil
+		}
+		primary = []string{"oauth_creds.json"}
+	}
+	for _, name := range primary {
+		if data, present := live.files[name]; present {
+			return name, data, nil
+		}
+	}
+	if !live.hasAuth() {
+		return "", nil, ErrNoCredentials
+	}
+	return live.credentialName, live.credential, nil
+}
+
+// CodexSelectedAPIKey resolves the stored key selected by native auth.json.
+// Explicit key mode ignores leftover OAuth fields; an implicit key-only record
+// also selects the key. Callers must not attribute unused OAuth identity or
+// freshness to the returned credential.
+func CodexSelectedAPIKey(data []byte) (string, bool, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return "", false, err
+	}
+	readAliases := func(object map[string]json.RawMessage, names ...string) (string, error) {
+		var selected string
+		for _, name := range names {
+			var value string
+			if raw, ok := object[name]; ok {
+				if err := json.Unmarshal(raw, &value); err != nil {
+					return "", fmt.Errorf("Codex %s must be a string or null", name)
+				}
+			}
+			value = strings.TrimSpace(value)
+			if selected != "" && value != "" && selected != value {
+				return "", fmt.Errorf("Codex credential aliases conflict")
+			}
+			if value != "" {
+				selected = value
+			}
+		}
+		return selected, nil
+	}
+	key, err := readAliases(root, "OPENAI_API_KEY", "api_key", "apiKey")
+	if err != nil {
+		return "", false, err
+	}
+	mode, err := readAliases(root, "auth_mode")
+	if err != nil {
+		return "", false, err
+	}
+	switch strings.ToLower(mode) {
+	case "apikey", "api-key":
+		if key == "" {
+			return "", false, fmt.Errorf("Codex API-key auth mode has no API key")
+		}
+		return key, true, nil
+	case "":
+		if key == "" {
+			return "", false, nil
+		}
+		var tokens map[string]json.RawMessage
+		if raw, ok := root["tokens"]; ok {
+			if err := json.Unmarshal(raw, &tokens); err != nil {
+				return "", false, fmt.Errorf("Codex tokens must be an object or null")
+			}
+		}
+		for _, object := range []map[string]json.RawMessage{root, tokens} {
+			access, err := readAliases(object, "access_token", "accessToken", "token")
+			if err != nil {
+				return "", false, err
+			}
+			if access != "" {
+				return "", false, nil
+			}
+		}
+		return key, true, nil
+	default:
+		return "", false, nil
+	}
+}
+
+// GeminiSelectedAPIKey resolves a selected API key from captured native dotenv
+// bytes without consulting ambient credentials or an unused OAuth cache.
+func GeminiSelectedAPIKey(data []byte) (string, error) {
+	values := make(map[string]string)
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(line, "=")
+		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if !ok || key == "" || strings.ContainsAny(key, " \t\r\x00") {
+			return "", fmt.Errorf("%w: expected a Gemini dotenv assignment", ErrInvalidCredentials)
+		}
+		if len(value) > 0 && (value[0] == '\'' || value[0] == '"') {
+			quote := value[0]
+			end := strings.IndexByte(value[1:], quote)
+			if end < 0 {
+				return "", fmt.Errorf("%w: unterminated Gemini dotenv value", ErrInvalidCredentials)
+			}
+			end++
+			tail := strings.TrimSpace(value[end+1:])
+			if tail != "" && !strings.HasPrefix(tail, "#") {
+				return "", fmt.Errorf("%w: unexpected text after Gemini dotenv value", ErrInvalidCredentials)
+			}
+			value = value[1:end]
+		} else if comment := strings.IndexByte(value, '#'); comment >= 0 {
+			value = strings.TrimSpace(value[:comment])
+		}
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return "", fmt.Errorf("%w: invalid Gemini dotenv value", ErrInvalidCredentials)
+		}
+		if key == "GEMINI_API_KEY" && (strings.TrimSpace(value) == "" || strings.ContainsAny(value, " \t")) {
+			return "", fmt.Errorf("%w: Gemini API key is empty or contains whitespace", ErrInvalidCredentials)
+		}
+		values[key] = value
+	}
+	key := values["GEMINI_API_KEY"]
+	if key == "" || strings.ContainsAny(key, " \t") || values["GOOGLE_API_KEY"] != "" || values["GOOGLE_GENAI_USE_GCA"] == "true" || values["GOOGLE_GENAI_USE_VERTEXAI"] == "true" {
+		return "", fmt.Errorf("%w: selected Gemini API key is absent or conflicts with another auth method", ErrInvalidCredentials)
+	}
+	return key, nil
+}
+
+// Native Gemini settings select the credential method before the OAuth cache.
+// Read the same legacy/current selectors as the provider's directory importer,
+// using only the settings bytes already captured with the live credential.
+// GeminiSelectedAuthType reads the native authentication selector from captured
+// settings. A nil slice means no settings file; conflicting selectors or invalid
+// settings are errors so callers cannot silently use another credential method.
+func GeminiSelectedAuthType(data []byte) (string, error) {
+	if data == nil {
+		return "", nil
+	}
+	obj, err := discoveryObject(data)
+	if err != nil {
+		return "", err
+	}
+	read := func(obj map[string]json.RawMessage, key string) (string, error) {
+		raw, present := obj[key]
+		if !present {
+			return "", nil
+		}
+		var value string
+		if json.Unmarshal(raw, &value) != nil || strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("%s must be a nonempty string", key)
+		}
+		return value, nil
+	}
+	selected, err := read(obj, "selectedAuthType")
+	if err != nil {
+		return "", err
+	}
+	if raw, present := obj["security"]; present {
+		security, err := discoveryObject(raw)
+		if err != nil {
+			return "", fmt.Errorf("security must be an object")
+		}
+		if raw, present := security["auth"]; present {
+			auth, err := discoveryObject(raw)
+			if err != nil {
+				return "", fmt.Errorf("security.auth must be an object")
+			}
+			current, err := read(auth, "selectedType")
+			if err != nil {
+				return "", err
+			}
+			if selected != "" && current != "" && selected != current {
+				return "", fmt.Errorf("conflicting selected auth types")
+			}
+			if current != "" {
+				selected = current
+			}
+		}
+	}
+	switch selected {
+	case "", "oauth-personal", "gemini-api-key", "vertex-ai":
+		return selected, nil
+	default:
+		return "", fmt.Errorf("unsupported Gemini selected auth type")
+	}
+}
+
+// GeminiExpiryKeys lists the access-token deadline fields a Gemini OAuth cache
+// may carry, in precedence order. Gemini CLI (google-auth-library) writes
+// expiry_date; the others come from hand-written and older caches.
+var GeminiExpiryKeys = []string{"expiry_date", "expires_at", "expiresAt", "expiry", "token_expiry", "expires"}
+
+// GeminiCredentialExpiry parses one Gemini OAuth expiry field. It is the single
+// definition shared by import validation and passive health, so the two can
+// never disagree about when a cached grant lapses (issue #123).
+//
+// expiry_date is always Unix milliseconds, as google-auth-library stores it.
+// Other numeric fields are Unix seconds, or milliseconds when larger than
+// 1e12. Strings are RFC 3339 timestamps. Non-integral, non-positive and
+// post-9999 values are errors rather than a guessed deadline.
+func GeminiCredentialExpiry(key string, raw json.RawMessage) (time.Time, error) {
+	// This is the final millisecond of year 9999. Bounding before converting
+	// to int64 also rejects values rounded up to 2^63 by JSON float decoding.
+	const maxUnixMillis = 253402300799999
+	var expires time.Time
+	var number float64
+	if json.Unmarshal(raw, &number) == nil && number > 0 && number <= maxUnixMillis && math.Trunc(number) == number {
+		switch {
+		case key == "expiry_date", number > 1e12:
+			expires = time.UnixMilli(int64(number))
+		default:
+			expires = time.Unix(int64(number), 0)
+		}
+	} else {
+		var stamp string
+		if json.Unmarshal(raw, &stamp) == nil {
+			// The Nano layout also accepts stamps without fractional seconds.
+			expires, _ = time.Parse(time.RFC3339Nano, stamp)
+		}
+	}
+	if !expires.After(time.Unix(0, 0)) || expires.UTC().Year() > 9999 {
+		return time.Time{}, fmt.Errorf("%s is not a valid credential expiry", key)
+	}
+	return expires, nil
+}
+
+// HasAuthFilesReadOnly checks live credential presence without creating a
+// keychain mirror, migrating filenames, or changing native settings. It applies
+// the same credential validation as restore, not an online provider check.
+func HasAuthFilesReadOnly(fileSet AuthFileSet) bool {
+	if fileSet.Tool == "agy" && agyKeychainPath(fileSet) != "" {
+		live, err := readSwitchState(fileSet, "")
+		if err != nil {
+			return false
+		}
+		_, err = inspectDiscovery(fileSet, live)
+		return err == nil
+	}
+	if fileSet.Tool != "claude" {
+		// Cursor's validator preserves its native metadata-only fallback, but
+		// only when the authoritative auth.json is genuinely absent.
+		return validateCredentialFiles(fileSet, "") == nil
+	}
+
+	// Captured keychain bytes override an existing mirror. A denied read is
+	// not permission to report an older on-disk credential as the live login.
+	live, err := readSwitchState(fileSet, "")
+	if err != nil {
+		return false
+	}
+	required, optional, missingRequired := false, false, false
+	for _, spec := range fileSet.Files {
+		name := filepath.Base(spec.Path)
+		data, present := live.files[name]
+		hasAuth, err := ClaudeCredentialMaterial(data, name)
+		if err != nil {
+			return false
+		}
+		// An explicitly empty primary artifact cannot be rescued by settings
+		// or helpers, matching validateCredentialFiles's authority rules.
+		if present && !hasAuth && (name == claudeCredentialsFile || name == "auth.json") {
+			return false
+		}
+		if !hasAuth {
+			missingRequired = missingRequired || spec.Required
+			continue
+		}
+		if spec.Required {
+			required = true
+		} else {
+			optional = true
+		}
+	}
+	return (required || optional) && (!missingRequired || (fileSet.AllowOptionalOnly && !required && optional))
+}
+
+type switchAccount struct {
+	account      string
+	organization string
+	subject      string
+	email        string
+}
+
+func (a switchAccount) matches(b switchAccount) bool {
+	// A shared email must never override a conflicting account/workspace ID.
+	if a.account != "" && b.account != "" && a.account != b.account {
+		return false
+	}
+	if a.organization != "" || b.organization != "" {
+		return a.organization != "" && a.organization == b.organization &&
+			a.account != "" && a.account == b.account
+	}
+	if a.subject != "" && b.subject != "" && a.subject != b.subject {
+		return false
+	}
+	return (a.account != "" && a.account == b.account) ||
+		(a.subject != "" && a.subject == b.subject) ||
+		(a.email != "" && b.email != "" && strings.EqualFold(a.email, b.email))
+}
+
+type switchState struct {
+	files            map[string][]byte
+	provider         string
+	authMethod       string
+	selectedKey      string
+	credentialName   string
+	credential       []byte
+	account          switchAccount
+	freshness        time.Time
+	complete         bool
+	identityConflict bool
+	claudeIdentity   *identity.ClaudeIdentityBinding
+}
+
+func (s switchState) hasAuth() bool { return len(bytes.TrimSpace(s.credential)) != 0 }
+
+func (s switchState) sameCredential(other switchState) bool {
+	if s.identityConflict || other.identityConflict || s.provider != other.provider || s.authMethod != other.authMethod {
+		return false
+	}
+	if s.selectedKey != "" || other.selectedKey != "" {
+		return s.selectedKey != "" && s.selectedKey == other.selectedKey
+	}
+	if s.provider == "claude" && s.credentialName == claudeCredentialsFile && other.credentialName == claudeCredentialsFile {
+		a, err := identity.ClaudeCredentialFingerprint(s.credential)
+		b, otherErr := identity.ClaudeCredentialFingerprint(other.credential)
+		return err == nil && otherErr == nil && a != "" && a == b
+	}
+	if s.account != (switchAccount{}) && other.account != (switchAccount{}) && !s.account.matches(other.account) {
+		return false
+	}
+	return s.hasAuth() && s.credentialName == other.credentialName && bytes.Equal(s.credential, other.credential)
+}
+
+func (s switchState) sameAccount(other switchState) bool {
+	if s.provider != other.provider || s.authMethod != other.authMethod {
+		return false
+	}
+	if s.selectedKey != "" || other.selectedKey != "" {
+		return s.sameCredential(other)
+	}
+	if s.provider == "claude" {
+		return s.claudeIdentity != nil && other.claudeIdentity != nil &&
+			s.claudeIdentity.MatchesCredentials(s.credential) && other.claudeIdentity.MatchesCredentials(other.credential) &&
+			identity.ClaudeSameAccount(&s.claudeIdentity.Identity, &other.claudeIdentity.Identity)
+	}
+	// OpenAI's subject identifies a person, not their selected workspace.
+	// A workspace-scoped grant cannot match an unscoped snapshot by email.
+	if s.provider == "codex" && (s.account.account != "" || other.account.account != "") &&
+		(s.account.account == "" || other.account.account == "" || s.account.account != other.account.account) {
+		return false
+	}
+	return !s.identityConflict && !other.identityConflict && s.credentialName != "" &&
+		s.credentialName == other.credentialName && s.account.matches(other.account)
+}
+
+func (s switchState) checkUnchanged(fileSet AuthFileSet) error {
+	current, err := readSwitchState(fileSet, "")
+	if err != nil || !sameSwitchFiles(s.files, current.files) {
+		return fmt.Errorf("live auth changed during switch; retry after the native CLI finishes updating it")
+	}
+	return checkClaudeCredentialIdentityAgreement(s, current)
+}
+
+func sameSwitchFiles(a, b map[string][]byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, data := range a {
+		other, exists := b[name]
+		if !exists || !bytes.Equal(data, other) {
+			return false
+		}
+	}
+	return true
+}
+
+// samePreservedSwitchFiles is used only after preserving a proven newer grant.
+// Native Claude can rewrite its account label without retaining CAAM's verified
+// fields. Compare that label in its normalized form while requiring every other
+// captured value to be preserved. Concurrency guards still compare exact bytes.
+func samePreservedSwitchFiles(live, saved switchState) bool {
+	if sameSwitchFiles(live.files, saved.files) {
+		return true
+	}
+	if live.provider != "claude" || !live.sameAccount(saved) || len(live.files) != len(saved.files) {
+		return false
+	}
+	for name, data := range live.files {
+		other, exists := saved.files[name]
+		if !exists {
+			return false
+		}
+		if bytes.Equal(data, other) {
+			continue
+		}
+		if name != claudeSettingsFile {
+			return false
+		}
+		normalizedLive, liveErr := claudeSnapshotSettings(data, live)
+		normalizedSaved, savedErr := claudeSnapshotSettings(other, live)
+		if liveErr != nil || savedErr != nil || !bytes.Equal(normalizedLive, normalizedSaved) {
+			return false
+		}
+	}
+	return true
+}
+
+// readSwitchState captures exact bytes without migrations or keychain mirrors.
+func readSwitchState(fileSet AuthFileSet, profileDir string) (switchState, error) {
+	return readSwitchStateLimited(fileSet, profileDir, 0)
+}
+
+// readSwitchStateLimited also bounds unattended discovery reads. A positive
+// limit is enforced on the opened file, including growth after the size check.
+func readSwitchStateLimited(fileSet AuthFileSet, profileDir string, maxFileBytes int64) (switchState, error) {
+	state := switchState{files: make(map[string][]byte)}
+	if profileDir != "" {
+		for _, dir := range []string{filepath.Dir(profileDir), profileDir} {
+			info, err := os.Lstat(dir)
+			if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return state, fmt.Errorf("saved auth directory is not a regular directory: %s", dir)
+			}
+		}
+	}
+	for _, spec := range fileSet.Files {
+		name := filepath.Base(spec.Path)
+		path := spec.Path
+		if profileDir != "" {
+			path = filepath.Join(profileDir, name)
+		}
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) && profileDir != "" && fileSet.Tool == "gemini" && name == "oauth_creds.json" {
+			path = filepath.Join(profileDir, "oauth_credentials.json")
+			info, err = os.Lstat(path)
+		}
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return state, fmt.Errorf("inspect auth file: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 && profileDir == "" {
+			info, err = os.Stat(path)
+			if err != nil {
+				return state, fmt.Errorf("inspect live auth link: %w", err)
+			}
+		}
+		if !info.Mode().IsRegular() {
+			return state, fmt.Errorf("auth source is not a regular file: %s", path)
+		}
+		limit := maxFileBytes
+		if limit > 0 && isClaudeSettingsDocument(fileSet.Tool, spec.Path) {
+			limit = MaxSettingsDocumentBytes
+		}
+		data, err := readSwitchSource(path, info, limit)
+		if err != nil {
+			return state, fmt.Errorf("read auth file: %w", err)
+		}
+		if _, exists := state.files[name]; exists {
+			return state, fmt.Errorf("auth file set contains duplicate filename: %s", name)
+		}
+		state.files[name] = data
+	}
+	if profileDir == "" && claudeKeychainPath(fileSet) != "" {
+		data, err := keychain.ReadClaude()
+		if err == nil {
+			if maxFileBytes > 0 && int64(len(data)) > maxFileBytes {
+				return state, fmt.Errorf("%w: Claude keychain credential exceeds discovery size limit", ErrInvalidCredentials)
+			}
+			state.files[claudeCredentialsFile] = data
+		} else if !errors.Is(err, keychain.ErrNoKeychain) && !errors.Is(err, keychain.ErrNotFound) {
+			return state, fmt.Errorf("read outgoing Claude keychain: %w", err)
+		}
+	}
+	if profileDir == "" && agyKeychainPath(fileSet) != "" {
+		data, err := keychain.ReadAgy()
+		if err == nil {
+			if maxFileBytes > 0 && int64(len(data)) > maxFileBytes {
+				return state, fmt.Errorf("%w: Antigravity keychain credential exceeds discovery size limit", ErrInvalidCredentials)
+			}
+			state.files[agyTokenFile] = data
+		} else if !errors.Is(err, keychain.ErrNoKeychain) && !errors.Is(err, keychain.ErrNotFound) {
+			return state, fmt.Errorf("read outgoing Antigravity keychain: %w", err)
+		}
+	}
+	state.identify(fileSet)
+	if fileSet.Tool == "claude" && state.credentialName == claudeCredentialsFile {
+		path := claudeFileSetPath(fileSet, claudeCredentialsFile)
+		if profileDir != "" {
+			path = filepath.Join(profileDir, claudeCredentialsFile)
+		}
+		var binding *identity.ClaudeIdentityBinding
+		var err error
+		if profileDir != "" {
+			binding, err = readStoredClaudeBinding(profileDir)
+		} else {
+			binding, err = identity.ReadClaudeIdentityBindingForCredentials(path, state.credential)
+		}
+		if err != nil {
+			return state, fmt.Errorf("%w: read Claude identity binding: %w", ErrInvalidCredentials, err)
+		}
+		state.setClaudeIdentity(binding)
+		if profileDir != "" && binding != nil && !binding.MatchesCredentials(state.credential) {
+			// A named profile whose proof no longer covers its token pair must
+			// not become active merely because the same substituted bytes are
+			// now live. Mutation paths can reverify against the expected owner.
+			state.identityConflict = true
+		}
+	}
+	return state, nil
+}
+
+func readSwitchSource(path string, info os.FileInfo, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return os.ReadFile(path)
+	}
+	if info.Size() > maxBytes {
+		return nil, fmt.Errorf("%w: %s exceeds the %d MiB read limit", ErrInvalidCredentials, path, maxBytes>>20)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%w: %s exceeds the %d MiB read limit", ErrInvalidCredentials, path, maxBytes>>20)
+	}
+	return data, nil
+}
+
+func (s *switchState) identify(fileSet AuthFileSet) {
+	s.provider = fileSet.Tool
+	names := []string{"auth.json", "oauth_creds.json", "antigravity-oauth-token"}
+	if fileSet.Tool == "claude" {
+		names = []string{claudeCredentialsFile, "auth.json", "settings.json", claudeSettingsFile, "config.json"}
+	} else if fileSet.Tool == "agy" {
+		names = []string{"antigravity-oauth-token"}
+	}
+	for _, name := range names {
+		data := s.files[name]
+		if len(bytes.TrimSpace(data)) == 0 {
+			continue
+		}
+		if fileSet.Tool == "claude" && name != claudeCredentialsFile && name != "auth.json" {
+			if ok, _ := ClaudeCredentialMaterial(data, name); !ok {
+				continue
+			}
+		}
+		s.credentialName, s.credential = name, data
+		break
+	}
+	if s.credentialName == "" && fileSet.Tool != "claude" {
+		// Opaque provider formats can still be preserved and matched exactly;
+		// they never qualify for a rotation-based named snapshot update.
+		for _, required := range []bool{true, false} {
+			for _, spec := range fileSet.Files {
+				if data := s.files[filepath.Base(spec.Path)]; spec.Required == required && len(data) > 0 {
+					s.credentialName, s.credential = filepath.Base(spec.Path), data
+					break
+				}
+			}
+			if s.credentialName != "" {
+				break
+			}
+		}
+	}
+	// A selected key and its leftover OAuth cache are different grants. Keep
+	// the exact artifact for recovery, but derive ownership solely from the key
+	// and leave OAuth freshness unset so it cannot authorize a named overwrite.
+	switch fileSet.Tool {
+	case "codex":
+		s.authMethod = "oauth"
+		if data, present := s.files["auth.json"]; present {
+			key, selected, err := CodexSelectedAPIKey(data)
+			if err != nil {
+				s.identityConflict = true
+				return
+			}
+			if selected {
+				s.authMethod = "api-key"
+				s.selectedKey = hashBytes([]byte("codex:api-key:" + key))
+				s.credentialName, s.credential, s.complete = "auth.json", data, true
+				return
+			}
+		}
+	case "gemini":
+		s.authMethod = "oauth"
+		selected, err := GeminiSelectedAuthType(s.files["settings.json"])
+		if err != nil {
+			s.identityConflict = true
+			return
+		}
+		switch selected {
+		case "gemini-api-key":
+			s.authMethod = "api-key"
+			s.credentialName, s.credential = ".env", s.files[".env"]
+			key, err := GeminiSelectedAPIKey(s.credential)
+			if err != nil {
+				s.identityConflict = true
+				return
+			}
+			s.selectedKey = hashBytes([]byte("gemini:api-key:" + key))
+			s.complete = true
+			return
+		case "vertex-ai":
+			// The captured fileset has no ADC grant. Its OAuth cache cannot
+			// identify or refresh the account selected by Vertex settings.
+			s.authMethod = "vertex-ai"
+			s.credentialName, s.credential = "settings.json", s.files["settings.json"]
+			return
+		}
+	}
+	var root map[string]interface{}
+	if json.Unmarshal(s.credential, &root) != nil || root == nil {
+		return
+	}
+	entry := root
+	switch fileSet.Tool {
+	case "claude":
+		if s.credentialName != claudeCredentialsFile {
+			return
+		}
+		entry, _ = root["claudeAiOauth"].(map[string]interface{})
+		var identityOK bool
+		s.account, identityOK = claudeSwitchAccount(entry, nil)
+		s.identityConflict = !identityOK
+		s.complete = jsonString(entry, "accessToken") != "" && jsonString(entry, "refreshToken") != ""
+		s.freshness = switchExpiry(entry["expiresAt"], true)
+		return
+	case "codex":
+		if nested, ok := root["tokens"].(map[string]interface{}); ok {
+			entry = nested
+		}
+		s.account = switchAccount{account: jsonString(entry, "account_id")}
+		for _, source := range []map[string]interface{}{root, entry} {
+			for _, name := range []string{"id_token", "idToken", "access_token", "accessToken"} {
+				if account, ok := switchJWTAccount(jsonString(source, name)); ok {
+					var consistent bool
+					s.account, consistent = mergeSwitchAccount(s.account, account)
+					if !consistent {
+						s.identityConflict = true
+						return
+					}
+				}
+			}
+		}
+		s.complete = jsonString(entry, "access_token") != "" && jsonString(entry, "refresh_token") != ""
+		s.freshness, _ = codexFreshness(s.credential)
+		return
+	case "grok":
+		if jsonString(entry, "access_token") == "" {
+			entry = nil
+			for _, value := range root {
+				candidate, ok := value.(map[string]interface{})
+				if !ok || jsonString(candidate, "access_token") == "" {
+					continue
+				}
+				if entry != nil {
+					return // Multiple grants have no single proven owner.
+				}
+				entry = candidate
+			}
+		}
+		s.account = switchAccount{account: jsonString(entry, "user_id"), email: jsonString(entry, "email")}
+		s.complete = jsonString(entry, "access_token") != "" && jsonString(entry, "refresh_token") != ""
+		s.freshness = switchExpiry(entry["expires_at"], false)
+		return
+	case "gemini":
+		if s.credentialName != "oauth_creds.json" {
+			return
+		}
+		s.account, _ = switchJWTAccount(jsonString(entry, "id_token"))
+		s.complete = jsonString(entry, "access_token") != "" && jsonString(entry, "refresh_token") != ""
+		s.freshness = switchExpiry(entry["expiry_date"], true)
+	}
+}
+
+func mergeSwitchAccount(a, b switchAccount) (switchAccount, bool) {
+	if (a.account != "" && b.account != "" && a.account != b.account) ||
+		(a.subject != "" && b.subject != "" && a.subject != b.subject) ||
+		(a.email != "" && b.email != "" && !strings.EqualFold(a.email, b.email)) {
+		return switchAccount{}, false
+	}
+	if a.account == "" {
+		a.account = b.account
+	}
+	if a.subject == "" {
+		a.subject = b.subject
+	}
+	if a.email == "" {
+		a.email = b.email
+	}
+	return a, true
+}
+
+// Claude's paired settings and embedded token metadata must agree before
+// either may identify the owner of a rotated opaque credential.
+func claudeSwitchAccount(oauth map[string]interface{}, paired []string) (switchAccount, bool) {
+	var account switchAccount
+	for _, key := range []string{"accountId", "email"} {
+		if value, exists := oauth[key]; exists {
+			if _, ok := value.(string); !ok {
+				return switchAccount{}, false
+			}
+		}
+	}
+	account.account, account.email = jsonString(oauth, "accountId"), jsonString(oauth, "email")
+	for _, key := range paired {
+		var other switchAccount
+		if value, ok := strings.CutPrefix(key, "uuid:"); ok {
+			other.account = value
+		} else if value, ok := strings.CutPrefix(key, "email:"); ok {
+			other.email = value
+		}
+		var consistent bool
+		account, consistent = mergeSwitchAccount(account, other)
+		if !consistent {
+			return switchAccount{}, false
+		}
+	}
+	return account, true
+}
+
+func switchJWTAccount(token string) (switchAccount, bool) {
+	var account switchAccount
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return account, false
+	}
+	data, err := decodeBase64Segment(parts[1])
+	if err != nil {
+		return account, false
+	}
+	var claims map[string]interface{}
+	if json.Unmarshal(data, &claims) != nil || claims == nil {
+		return account, false
+	}
+	account.subject, account.email = jsonString(claims, "sub"), jsonString(claims, "email")
+	account.account = jsonString(claims, "account_id")
+	if nested, ok := claims["https://api.openai.com/auth"].(map[string]interface{}); ok {
+		if id := jsonString(nested, "chatgpt_account_id"); id != "" {
+			account.account = id
+		}
+	}
+	if account.email == "" {
+		if nested, ok := claims["https://api.openai.com/profile"].(map[string]interface{}); ok {
+			account.email = jsonString(nested, "email")
+		}
+	}
+	return account, account.account != "" || account.subject != "" || account.email != ""
+}
+
+func switchExpiry(raw interface{}, milliseconds bool) time.Time {
+	if value, ok := raw.(string); ok {
+		parsed, _ := time.Parse(time.RFC3339Nano, value)
+		return parsed
+	}
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 || value >= float64(1<<63-1) || math.Trunc(value) != value {
+		return time.Time{}
+	}
+	if milliseconds {
+		return time.UnixMilli(int64(value))
+	}
+	return time.Unix(int64(value), 0)
+}
+
+func (v *Vault) switchOwner(fileSet AuthFileSet, live switchState) (string, *switchState, error) {
+	return v.switchOwnerLimited(fileSet, live, 0)
+}
+
+func (v *Vault) switchOwnerLimited(fileSet AuthFileSet, live switchState, maxFileBytes int64) (string, *switchState, error) {
+	profiles, err := v.List(fileSet.Tool)
+	if err != nil {
+		return "", nil, err
+	}
+	// Prefer exact credentials over an identity-only match, and named profiles
+	// over safety artifacts. Scan all Claude matches: neither alphabetical
+	// order nor a copied token can resolve contradictory ownership proofs.
+	sort.SliceStable(profiles, func(i, j int) bool { return !IsSystemProfile(profiles[i]) && IsSystemProfile(profiles[j]) })
+	modernClaude := fileSet.Tool == "claude" && live.credentialName == claudeCredentialsFile
+	var exactOwner string
+	var exactSaved *switchState
+	exactAmbiguous := false
+	exactBinding := live.claudeIdentity
+	var owner string
+	var saved *switchState
+	var systemOwner string
+	var systemSaved *switchState
+	var systemIdentityOwner string
+	var systemIdentitySaved *switchState
+	ambiguous := false
+	for _, name := range profiles {
+		dir, err := v.safeProfileDir(fileSet.Tool, name)
+		if err != nil {
+			continue
+		}
+		candidate, err := readSwitchStateLimited(fileSet, dir, maxFileBytes)
+		if err != nil {
+			// Reading an optional artifact or parsing identity can fail after
+			// the primary credential was captured, even before identify ran.
+			// Do not hide contradictory or malformed ownership for this exact
+			// token behind another valid copy. Unrelated broken profiles do not
+			// prevent selection of a separate account.
+			if modernClaude {
+				liveFingerprint, liveErr := identity.ClaudeCredentialFingerprint(live.credential)
+				savedFingerprint, savedErr := identity.ClaudeCredentialFingerprint(candidate.files[claudeCredentialsFile])
+				if liveErr == nil && savedErr == nil && liveFingerprint == savedFingerprint {
+					return "", nil, fmt.Errorf("%w: current Claude credentials have invalid or conflicting saved identity metadata", ErrInvalidCredentials)
+				}
+			}
+			continue
+		}
+		if live.sameCredential(candidate) {
+			if modernClaude && candidate.claudeIdentity != nil {
+				if exactBinding != nil && !identity.ClaudeSameAccount(&exactBinding.Identity, &candidate.claudeIdentity.Identity) {
+					return "", nil, fmt.Errorf("%w: current Claude credentials have conflicting verified account or organization bindings", ErrInvalidCredentials)
+				}
+				exactBinding = candidate.claudeIdentity
+			}
+			if !IsSystemProfile(name) {
+				if !modernClaude {
+					return name, &candidate, nil
+				}
+				if exactOwner != "" {
+					exactAmbiguous = true
+				} else {
+					exactOwner, exactSaved = name, &candidate
+				}
+			}
+			if IsSystemProfile(name) && systemOwner == "" {
+				systemOwner, systemSaved = name, &candidate
+			}
+		}
+		if !IsSystemProfile(name) && live.sameAccount(candidate) {
+			if owner != "" {
+				ambiguous = true
+			}
+			owner, saved = name, &candidate
+		}
+		if IsSystemProfile(name) && systemIdentityOwner == "" && live.sameAccount(candidate) {
+			systemIdentityOwner, systemIdentitySaved = name, &candidate
+		}
+	}
+	finish := func(name string, saved *switchState) (string, *switchState, error) {
+		if modernClaude && saved != nil {
+			dir, err := v.safeProfileDir(fileSet.Tool, name)
+			if err != nil {
+				return "", nil, err
+			}
+			current, err := readSwitchStateLimited(fileSet, dir, maxFileBytes)
+			if err != nil || !sameClaudeSelectionIdentity(*saved, current) {
+				return "", nil, fmt.Errorf("saved Claude credentials or verified identity changed during profile selection; retry")
+			}
+		}
+		return name, saved, nil
+	}
+	if exactAmbiguous {
+		return "", nil, nil
+	}
+	if exactOwner != "" {
+		return finish(exactOwner, exactSaved)
+	}
+	if ambiguous {
+		return finish(systemOwner, systemSaved)
+	}
+	if owner == "" {
+		if systemOwner == "" {
+			return finish(systemIdentityOwner, systemIdentitySaved)
+		}
+		return finish(systemOwner, systemSaved)
+	}
+	return finish(owner, saved)
+}
+
+// saveSwitchRecovery writes the bytes already inspected, not a second backup
+// read that could capture a different account. Exclusive directory creation
+// ensures even two switches within a single clock tick cannot overwrite a
+// safety artifact. Partial failures retain their bytes and stop activation.
+func (v *Vault) saveSwitchRecovery(fileSet AuthFileSet, state switchState, name string) (string, error) {
+	toolDir, err := v.safeToolDir(fileSet.Tool)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(toolDir, 0700); err != nil {
+		return "", err
+	}
+	info, err := os.Lstat(toolDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("recovery directory is not a regular directory")
+	}
+	if name == "" {
+		var suffix [8]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return "", err
+		}
+		name = "_backup_" + time.Now().Format("20060102_150405.000000000") + "_" + hex.EncodeToString(suffix[:])
+	}
+	dir, err := v.safeProfileDir(fileSet.Tool, name)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return "", fmt.Errorf("create immutable recovery snapshot: %w", err)
+	}
+	var paths []string
+	for _, spec := range fileSet.Files {
+		filename := filepath.Base(spec.Path)
+		data, exists := state.files[filename]
+		if !exists {
+			continue
+		}
+		if fileSet.Tool == "claude" && filename == claudeSettingsFile {
+			data, err = claudeSnapshotSettings(data, state)
+			if err != nil {
+				return "", err
+			}
+		}
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			var root map[string]json.RawMessage
+			if err := json.Unmarshal(data, &root); err != nil {
+				return "", fmt.Errorf("parse outgoing desktop auth: %w", err)
+			}
+			fields := make(map[string]json.RawMessage)
+			for _, key := range claudeDesktopTokenKeys {
+				if value, ok := root[key]; ok {
+					fields[key] = value
+				}
+			}
+			if len(fields) == 0 {
+				continue
+			}
+			data, err = json.Marshal(fields)
+			if err != nil {
+				return "", err
+			}
+		}
+		if err := writeSwitchFile(filepath.Join(dir, filename), data, true); err != nil {
+			return "", err
+		}
+		paths = append(paths, spec.Path)
+	}
+	createdBy := "auto"
+	if name == originalProfileName {
+		createdBy = "first-activate"
+	}
+	meta := map[string]interface{}{
+		"tool": fileSet.Tool, "profile": name, "type": "system", "created_by": createdBy,
+		"backed_up_at": time.Now().Format(time.RFC3339Nano), "files": len(paths), "original_paths": paths,
+	}
+	if fileSet.Tool == "claude" {
+		addClaudeIdentityMetadata(meta, state.claudeIdentity)
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return "", err
+	}
+	if err := writeSwitchFile(filepath.Join(dir, "meta.json"), data, true); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func writeSwitchFile(path string, data []byte, exclusive bool) error {
+	var file *os.File
+	var err error
+	if exclusive {
+		file, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	} else {
+		file, err = os.CreateTemp(filepath.Dir(path), ".caam-switch-*")
+	}
+	if err != nil {
+		return err
+	}
+	if !exclusive {
+		defer os.Remove(file.Name())
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if !exclusive {
+		return os.Rename(file.Name(), path)
+	}
+	return nil
+}

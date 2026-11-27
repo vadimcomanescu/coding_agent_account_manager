@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -51,7 +50,7 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := newTokenHTTPClient(30 * time.Second)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("codex refresh failed: %w", err)
@@ -69,7 +68,13 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 		if resp.StatusCode == http.StatusUnauthorized && IsRefreshTokenReused(string(body)) {
 			return nil, ErrRefreshTokenReused
 		}
-		return nil, fmt.Errorf("codex refresh error %d: %s", resp.StatusCode, string(body))
+		// A definitive refusal of the refresh token (revoked, expired,
+		// invalid) gets a structured error without the raw body, so callers
+		// can record that the account needs a new login (issue #108).
+		if code, rejected := classifyRefreshRejection(resp.StatusCode, body); rejected {
+			return nil, &RefreshRejectedError{Provider: "codex", StatusCode: resp.StatusCode, Code: code}
+		}
+		return nil, fmt.Errorf("codex refresh error %d", resp.StatusCode)
 	}
 
 	var tokenResp TokenResponse
@@ -82,25 +87,38 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 
 // UpdateCodexAuth updates the auth file with the new token.
 func UpdateCodexAuth(path string, resp *TokenResponse) error {
-	// Read existing file
-	data, err := os.ReadFile(path)
+	source, err := readCredentialSnapshot(path)
 	if err != nil {
 		return fmt.Errorf("read auth file: %w", err)
 	}
-
-	var auth map[string]interface{}
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return fmt.Errorf("parse auth file: %w", err)
+	data, err := updatedCodexAuth(source.data, resp)
+	if err != nil {
+		return err
 	}
+	return source.publish(data)
+}
+
+func updatedCodexAuth(data []byte, resp *TokenResponse) ([]byte, error) {
+	if resp == nil || strings.TrimSpace(resp.AccessToken) == "" || resp.ExpiresIn < 0 {
+		return nil, fmt.Errorf("refresh returned an invalid access credential")
+	}
+	var auth map[string]interface{}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&auth); err != nil || auth == nil {
+		return nil, fmt.Errorf("auth file must contain a JSON object")
+	}
+	clearCredentialExpiry(auth)
 
 	// Prefer updating nested tokens if present (newer format).
 	if rawTokens, ok := auth["tokens"]; ok {
 		tokens, ok := rawTokens.(map[string]interface{})
 		if !ok {
-			return fmt.Errorf("invalid tokens format")
+			return nil, fmt.Errorf("invalid tokens format")
 		}
 
 		tokens["access_token"] = resp.AccessToken
+		clearCredentialExpiry(tokens)
 		if resp.RefreshToken != "" {
 			tokens["refresh_token"] = resp.RefreshToken
 		}
@@ -108,7 +126,7 @@ func UpdateCodexAuth(path string, resp *TokenResponse) error {
 			tokens["expires_at"] = time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second).Unix()
 		}
 		auth["tokens"] = tokens
-		return writeAuthFile(path, auth)
+		return json.MarshalIndent(auth, "", "  ")
 	}
 
 	// Update root fields (legacy format).
@@ -122,12 +140,24 @@ func UpdateCodexAuth(path string, resp *TokenResponse) error {
 		auth["expires_at"] = time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second).Unix()
 	}
 
-	return writeAuthFile(path, auth)
+	return json.MarshalIndent(auth, "", "  ")
 }
 
 // CodexVerifyURL is the authenticated endpoint VerifyCodexToken probes. It is
 // a variable (like CodexTokenURL) so tests can point it at a local server.
-var CodexVerifyURL = "https://api.openai.com/v1/me"
+//
+// The access token of a ChatGPT login (auth_mode "chatgpt", the only Codex
+// credential the probe sees: API-key logins are skipped) is accepted by the
+// ChatGPT backend that Codex itself talks to. This read-only usage endpoint,
+// which `caam limits codex` already reads, answers 200 for a working token and
+// 401 for an invalid one. The API platform's /v1/me, probed before,
+// refuses every ChatGPT-login token with 403 at its edge ("route
+// authentication policy does not accept this credential"), so it could
+// neither confirm nor reject such a login (issue #127).
+var CodexVerifyURL = "https://chatgpt.com/backend-api/wham/usage"
+
+// codexVerifyHosts is the allowlist for CodexVerifyURL.
+var codexVerifyHosts = []string{"chatgpt.com"}
 
 const (
 	// codexVerifyAttempts bounds the probe to one retry: a second attempt is
@@ -142,9 +172,9 @@ const (
 )
 
 // TokenVerifyError reports a non-2xx answer from the token verification
-// endpoint. The status code is preserved so callers can tell a definitive
-// rejection (401/403) apart from a transient failure (429/5xx) instead of
-// collapsing every non-200 answer into "token rejected".
+// endpoint. Preserve the distinction between an access-token rejection (401),
+// an inconclusive refusal of the request (403), and a retryable failure
+// (429/5xx). A failed probe is not necessarily a failed credential.
 type TokenVerifyError struct {
 	StatusCode int
 	// Attempts is how many requests were made before giving up (1 or 2).
@@ -158,18 +188,24 @@ func (e *TokenVerifyError) Error() string {
 	return fmt.Sprintf("token verification failed with status %d", e.StatusCode)
 }
 
-// Rejected reports whether the provider definitively refused the credential.
+// Rejected reports an authentication refusal by the verification endpoint.
+// A 403 can be a permission, policy, or edge-proxy denial for a working Codex
+// login (issue #127). It is neither proof of token rejection nor acceptance,
+// and must not trigger re-login advice or overwrite saved verification state.
+// Even a 401 only exercises the access token, never the refresh grant.
 func (e *TokenVerifyError) Rejected() bool {
-	return e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden
+	return e.StatusCode == http.StatusUnauthorized
 }
 
-// Transient reports whether the failure says nothing about the credential
-// itself: rate limiting or a server-side error.
+// Transient reports whether the probe may be retried: rate limiting or a
+// server-side error. An inconclusive 403 is deliberately not retryable.
 func (e *TokenVerifyError) Transient() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
-// VerifyCodexToken probes whether an access token is accepted by the API.
+// VerifyCodexToken probes whether an access token is accepted by the ChatGPT
+// backend at CodexVerifyURL. It is a single read-only GET that never touches
+// the refresh token.
 //
 // A nil return means the token was accepted (2xx). Any other status is
 // returned as a *TokenVerifyError carrying that status; transient statuses
@@ -177,11 +213,11 @@ func (e *TokenVerifyError) Transient() bool {
 // reported. Transport failures and context cancellation are returned wrapped
 // as "request failed: ..." and carry no status.
 func VerifyCodexToken(ctx context.Context, token string) error {
-	if err := validateTokenEndpoint(CodexVerifyURL, []string{"api.openai.com"}); err != nil {
+	if err := validateTokenEndpoint(CodexVerifyURL, codexVerifyHosts); err != nil {
 		return err
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := newTokenHTTPClient(10 * time.Second)
 	var last *TokenVerifyError
 	for attempt := 1; attempt <= codexVerifyAttempts; attempt++ {
 		status, retryAfter, err := codexVerifyOnce(ctx, client, token)
@@ -211,6 +247,7 @@ func codexVerifyOnce(ctx context.Context, client *http.Client, token string) (in
 		return 0, "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {

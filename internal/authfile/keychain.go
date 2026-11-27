@@ -29,7 +29,10 @@ import (
 // files it names, which is also what makes shallow profiles keep working: they
 // run under their own HOME, which has no login keychain.
 func claudeKeychainPath(fileSet AuthFileSet) string {
-	if fileSet.Tool != "claude" || !keychain.Enabled() {
+	// Explicit config directories use their own native keychain namespace.
+	// The default login item must never be mirrored into that account, even
+	// when the override happens to name the legacy ~/.claude directory.
+	if fileSet.Tool != "claude" || os.Getenv("CLAUDE_CONFIG_DIR") != "" || !keychain.Enabled() {
 		return ""
 	}
 	credPath := claudeFileSetPath(fileSet, claudeCredentialsFile)
@@ -68,29 +71,91 @@ func pullClaudeKeychain(fileSet AuthFileSet) error {
 	return nil
 }
 
-// pushClaudeKeychain writes the just-restored credentials file into the login
-// keychain, which is what actually changes the account Claude Code uses.
-//
-// A failure here is fatal to the switch: reporting success while the keychain
-// still holds the previous account is exactly the silent no-op of issue #98.
+// pushClaudeKeychain checks Restore's final publication postcondition. The
+// recoverable batch now publishes the item itself; a second write here could
+// overwrite a native rotation after the rollback copies have been released.
 func pushClaudeKeychain(fileSet AuthFileSet) error {
 	credPath := claudeKeychainPath(fileSet)
 	if credPath == "" {
 		return nil
 	}
-	if !fileExists(credPath) {
-		// An API-key or helper-based profile carries no OAuth blob, and the
-		// restore left the live files alone; leave the keychain alone too, so
-		// the bridge stays exactly as (in)active as the file path it mirrors.
+	live, err := readRetiredClaudeCredential(credPath)
+	if err != nil {
+		return err
+	}
+	current, err := readClaudeKeychainForPublication()
+	if errors.Is(err, keychain.ErrNoKeychain) {
 		return nil
 	}
-	if err := keychain.PushMirror(credPath); err != nil {
-		if errors.Is(err, keychain.ErrNoKeychain) {
-			return nil
-		}
-		return fmt.Errorf("write Claude credentials to the macOS login keychain: %w", err)
+	if err != nil {
+		return err
+	}
+	if !sameClaudeAuthority(live, current) {
+		return fmt.Errorf("Claude keychain or credential changed after publication; left untouched")
 	}
 	return nil
+}
+
+func prepareClaudeKeychainPublication(fileSet AuthFileSet) (*claudeRestoreAuthority, error) {
+	path := claudeKeychainPath(fileSet)
+	if path == "" {
+		return nil, nil
+	}
+	// The restore batch matches its credential destination against this path,
+	// and that destination has its parent symlinks resolved (#120).
+	authority, err := prepareClaudeRestoreAuthority(resolveLiveParent(path), readClaudeKeychainForPublication, func(data []byte) error {
+		keychain.ForgetMirrors()
+		if data == nil {
+			return keychain.DeleteClaude()
+		}
+		return keychain.WriteClaude(data)
+	})
+	if errors.Is(err, keychain.ErrNoKeychain) {
+		// An isolated HOME can use file-backed credentials without a login
+		// keychain. Only initial preparation may omit the publication authority.
+		keychain.ForgetMirrors()
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Restore's subsequent pull must not reuse a status command's cached disk
+	// mirror when the authoritative grant rotated since that inspection.
+	keychain.ForgetMirrors()
+	return authority, nil
+}
+
+// A missing item is an available, empty authority that can receive a login.
+// Keep an unavailable keychain typed so later checks on a captured authority
+// cannot mistake its disappearance for proof that the item is still absent.
+func readClaudeKeychainForPublication() ([]byte, error) {
+	data, err := keychain.ReadClaude()
+	if errors.Is(err, keychain.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read Claude keychain for credential publication: %w", err)
+	}
+	return data, nil
+}
+
+// Retirement preflight reads, but does not mirror or mutate, the authoritative
+// keychain. The callback also detects a native keychain rotation before Apply.
+func claudeRetirementMirror(fileSet AuthFileSet, path string) func() ([]byte, error) {
+	bridge := claudeKeychainPath(fileSet)
+	if bridge == "" || filepath.Clean(bridge) != filepath.Clean(path) {
+		return nil
+	}
+	return func() ([]byte, error) {
+		data, err := keychain.ReadClaude()
+		if errors.Is(err, keychain.ErrNoKeychain) || errors.Is(err, keychain.ErrNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read Claude keychain before credential retirement: %w", err)
+		}
+		return data, nil
+	}
 }
 
 // clearClaudeKeychain removes the Claude item as part of a logout.
@@ -100,6 +165,82 @@ func clearClaudeKeychain(fileSet AuthFileSet) error {
 	}
 	if err := keychain.DeleteClaude(); err != nil {
 		return fmt.Errorf("remove Claude credentials from the macOS login keychain: %w", err)
+	}
+	return nil
+}
+
+const agyTokenFile = "antigravity-oauth-token"
+
+// agyKeychainPath returns the Antigravity token path the macOS login keychain
+// should be bridged to, or "" when the bridge does not apply (issue #140).
+// Explicit GEMINI_HOME overrides (isolated or shallow profiles) stay file-backed
+// and never mirror or overwrite the host login keychain.
+func agyKeychainPath(fileSet AuthFileSet) string {
+	if fileSet.Tool != "agy" || os.Getenv("GEMINI_HOME") != "" || !keychain.Enabled() {
+		return ""
+	}
+	var tokenPath string
+	for _, spec := range fileSet.Files {
+		if filepath.Base(spec.Path) == agyTokenFile {
+			tokenPath = spec.Path
+			break
+		}
+	}
+	if tokenPath == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	if filepath.Clean(tokenPath) != filepath.Join(home, ".gemini", "antigravity-cli", agyTokenFile) {
+		return ""
+	}
+	return tokenPath
+}
+
+// pullAgyKeychain refreshes the live ~/.gemini/antigravity-cli/antigravity-oauth-token
+// mirror from the macOS login keychain before file-based reads.
+func pullAgyKeychain(fileSet AuthFileSet) error {
+	tokenPath := agyKeychainPath(fileSet)
+	if tokenPath == "" {
+		return nil
+	}
+	if _, err := keychain.EnsureAgyMirror(tokenPath); err != nil {
+		if errors.Is(err, keychain.ErrNoKeychain) || errors.Is(err, keychain.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("read Antigravity credentials from the macOS login keychain: %w", err)
+	}
+	return nil
+}
+
+// pushAgyKeychain writes the restored antigravity-oauth-token back into the
+// macOS login keychain so desktop agy uses the activated profile (issue #140).
+func pushAgyKeychain(fileSet AuthFileSet) error {
+	tokenPath := agyKeychainPath(fileSet)
+	if tokenPath == "" {
+		return nil
+	}
+	if !fileExists(tokenPath) {
+		return nil
+	}
+	if err := keychain.PushAgyMirror(tokenPath); err != nil {
+		if errors.Is(err, keychain.ErrNoKeychain) {
+			return nil
+		}
+		return fmt.Errorf("write Antigravity credentials to the macOS login keychain: %w", err)
+	}
+	return nil
+}
+
+// clearAgyKeychain removes the Antigravity item from the login keychain on logout.
+func clearAgyKeychain(fileSet AuthFileSet) error {
+	if agyKeychainPath(fileSet) == "" {
+		return nil
+	}
+	if err := keychain.DeleteAgy(); err != nil {
+		return fmt.Errorf("remove Antigravity credentials from the macOS login keychain: %w", err)
 	}
 	return nil
 }

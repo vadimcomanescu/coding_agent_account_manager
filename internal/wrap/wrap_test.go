@@ -3,18 +3,81 @@ package wrap
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	claudeidentity "github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
 )
+
+func TestWrapperRejectsExpiredCursorSessionBeforeChangingAuth(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("CURSOR_CONFIG_DIR", filepath.Join(root, "cursor-config"))
+	vault := authfile.NewVault(filepath.Join(root, "custom-vault"))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(-time.Hour).Unix())))
+	expired := []byte(fmt.Sprintf(`{"accessToken":%q}`, "e30."+payload+".synthetic"))
+	authPath := vault.BackupPath("cursor", "expired", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(authPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authPath, expired, 0600); err != nil {
+		t.Fatal(err)
+	}
+	livePath := authfile.CursorAuthFiles().Files[0].Path
+	for _, f := range authfile.CursorAuthFiles().Files {
+		if filepath.Base(f.Path) == "auth.json" {
+			livePath = f.Path
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(livePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	live := []byte(`{"apiKey":"synthetic-live-owner"}`)
+	if err := os.WriteFile(livePath, live, 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldExec := ExecCommand
+	called := false
+	ExecCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		called = true
+		return exec.CommandContext(ctx, "caam-test-must-not-launch")
+	}
+	t.Cleanup(func() { ExecCommand = oldExec })
+	cfg := DefaultConfig()
+	cfg.Provider = "cursor"
+	cfg.InitialProfile = "expired"
+	cfg.Stdout = &bytes.Buffer{}
+	cfg.Stderr = &bytes.Buffer{}
+	result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+	if result.Err == nil || result.ExitCode == 0 || len(result.ProfilesUsed) != 0 || called {
+		t.Fatalf("expired session reached execution: result=%+v called=%v", result, called)
+	}
+	after, err := os.ReadFile(livePath)
+	if err != nil || !bytes.Equal(after, live) {
+		t.Fatalf("failed selection changed live login: %v", err)
+	}
+	profiles, err := vault.List("cursor")
+	if err != nil || len(profiles) != 1 || profiles[0] != "expired" {
+		t.Fatalf("failed selection changed vault: profiles=%v err=%v", profiles, err)
+	}
+}
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
@@ -83,53 +146,691 @@ func TestWrapper_Run_NoProfiles(t *testing.T) {
 }
 
 func TestWrapper_Run_WithProfile(t *testing.T) {
-	// Create temp vault with a profile
-	tmpDir := t.TempDir()
-	vault := authfile.NewVault(tmpDir)
-
-	// Create a fake profile
-	profileDir := filepath.Join(tmpDir, "claude", "test@example.com")
-	if err := os.MkdirAll(profileDir, 0700); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	vault, cfg, _ := newRetryFixture(t, "work")
+	setRetryProcess(t, func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return retryProcess(ctx, 0, "completed\n", "", "")
+	})
+	result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+	if result.Err != nil || result.ExitCode != 0 || strings.Join(result.ProfilesUsed, ",") != "work" {
+		t.Fatalf("valid profile did not execute successfully: %+v", result)
 	}
-	if err := os.WriteFile(filepath.Join(profileDir, ".claude.json"), []byte(`{}`), 0600); err != nil {
-		t.Fatalf("write file: %v", err)
+}
+
+func newRetryFixture(t *testing.T, names ...string) (*authfile.Vault, Config, string) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+	t.Setenv("CODEX_HOME", filepath.Join(root, "codex"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("CAAM_KEYCHAIN", "0")
+	spoolDir := filepath.Join(root, "stdin")
+	if err := os.MkdirAll(spoolDir, 0700); err != nil {
+		t.Fatal(err)
 	}
-
-	// Create health storage
-	healthPath := filepath.Join(tmpDir, "health.json")
-	healthStore := health.NewStorage(healthPath)
-
-	// Create temp database
-	dbPath := filepath.Join(tmpDir, "caam.db")
-	db, err := caamdb.OpenAt(dbPath)
-	if err != nil {
-		t.Fatalf("open db: %v", err)
+	t.Setenv("TMPDIR", spoolDir)
+	vault := authfile.NewVault(filepath.Join(root, "vault"))
+	for _, name := range names {
+		writeWrapSwitchFile(t, vault.BackupPath("codex", name, "auth.json"), retryCredentials(name))
 	}
-	defer db.Close()
-
+	livePath := filepath.Join(os.Getenv("CODEX_HOME"), "auth.json")
+	writeWrapSwitchFile(t, livePath, retryCredentials(names[0]))
 	cfg := DefaultConfig()
-	cfg.Provider = "claude"
-	cfg.Args = []string{"--version"} // Simple command that should work
-	cfg.NotifyOnSwitch = false
+	cfg.Provider = "codex"
+	cfg.InitialProfile = names[0]
+	cfg.Bin = "test-native-codex"
+	cfg.Algorithm = rotation.AlgorithmRoundRobin
+	cfg.SwitchOptions = &authfile.SwitchOptions{BackupMode: "smart"}
+	cfg.MaxRetries = 2
+	cfg.InitialDelay, cfg.MaxDelay, cfg.CooldownDuration = 0, 0, 0
+	cfg.Jitter, cfg.NotifyOnSwitch = false, false
+	cfg.Stdin, cfg.ReplayStdin = strings.NewReader(""), true
+	cfg.Stdout, cfg.Stderr = &bytes.Buffer{}, &bytes.Buffer{}
+	return vault, cfg, livePath
+}
 
-	stdout := &bytes.Buffer{}
-	stderr := &bytes.Buffer{}
-	cfg.Stdout = stdout
-	cfg.Stderr = stderr
+func retryCredentials(name string) []byte {
+	return []byte(fmt.Sprintf(`{"auth_mode":"apikey","OPENAI_API_KEY":%q}`, "synthetic-"+name))
+}
 
-	w := NewWrapper(vault, db, healthStore, cfg)
+func setRetryProcess(t *testing.T, command func(context.Context, string, ...string) *exec.Cmd) {
+	t.Helper()
+	old := ExecCommand
+	ExecCommand = command
+	t.Cleanup(func() { ExecCommand = old })
+}
 
-	// This will fail because claude isn't installed, but that's OK
-	// We're testing the wrapper logic, not the actual CLI
-	result := w.Run(context.Background())
+func retryProcess(ctx context.Context, exitCode int, stdout, stderr, input string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWrapRetryProcess$", "--")
+	cmd.Env = append(os.Environ(),
+		"CAAM_WRAP_RETRY_PROCESS="+strconv.Itoa(exitCode),
+		"CAAM_WRAP_RETRY_STDOUT="+base64.StdEncoding.EncodeToString([]byte(stdout)),
+		"CAAM_WRAP_RETRY_STDERR="+base64.StdEncoding.EncodeToString([]byte(stderr)),
+		"CAAM_WRAP_RETRY_INPUT="+base64.StdEncoding.EncodeToString([]byte(input)))
+	return cmd
+}
 
-	// Check that profile was used
-	if len(result.ProfilesUsed) == 0 {
-		t.Error("No profiles used")
+func TestWrapRetryProcess(t *testing.T) {
+	code, ok := os.LookupEnv("CAAM_WRAP_RETRY_PROCESS")
+	if !ok {
+		return
 	}
-	if len(result.ProfilesUsed) > 0 && result.ProfilesUsed[0] != "test@example.com" {
-		t.Errorf("ProfilesUsed[0] = %q, want test@example.com", result.ProfilesUsed[0])
+	decode := func(key string) []byte {
+		b, err := base64.StdEncoding.DecodeString(os.Getenv(key))
+		if err != nil {
+			os.Exit(96)
+		}
+		return b
+	}
+	input, err := io.ReadAll(os.Stdin)
+	if err != nil || !bytes.Equal(input, decode("CAAM_WRAP_RETRY_INPUT")) {
+		fmt.Fprintln(os.Stderr, "helper received different stdin")
+		os.Exit(97)
+	}
+	if os.Getenv("CAAM_WRAP_RETRY_CHECK_ENV") == "1" {
+		for _, key := range []string{"OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"} {
+			if _, present := os.LookupEnv(key); present {
+				fmt.Fprintln(os.Stderr, "ambient credential override survived")
+				os.Exit(98)
+			}
+		}
+		if os.Getenv("GEMINI_API_KEY") != "unrelated-synthetic" {
+			os.Exit(99)
+		}
+	}
+	_, _ = os.Stdout.Write(decode("CAAM_WRAP_RETRY_STDOUT"))
+	_, _ = os.Stderr.Write(decode("CAAM_WRAP_RETRY_STDERR"))
+	exitCode, err := strconv.Atoi(code)
+	if err != nil {
+		os.Exit(96)
+	}
+	os.Exit(exitCode)
+}
+
+func TestWrapperHeadlessRetryPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		budget     int
+		failures   int
+		childCode  int
+		childError string
+		wantUsed   string
+		wantCode   int
+		wantLimit  bool
+	}{
+		{"zero retries", 0, 3, 42, "rate limit exceeded\n", "beta", 42, true},
+		{"one retry", 1, 1, 42, "rate limit exceeded\n", "beta,alpha", 0, true},
+		{"two retries", 2, 2, 42, "rate limit exceeded\n", "beta,alpha,gamma", 0, true},
+		{"exhausted without database", 10, 10, 42, "rate limit exceeded\n", "beta,alpha,gamma", 42, true},
+		{"unrelated failure", 2, 3, 23, "invalid argument\n", "beta", 23, false},
+		{"successful quota text", 2, 3, 0, "rate limit exceeded\n", "beta", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vault, cfg, livePath := newRetryFixture(t, "beta", "alpha", "gamma")
+			cfg.MaxRetries = tc.budget
+			cfg.Args = []string{"exec", "synthetic prompt"}
+			calls := 0
+			setRetryProcess(t, func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				if name != cfg.Bin || strings.Join(args, ",") != strings.Join(cfg.Args, ",") {
+					t.Fatalf("lost executable/arguments: %s %v", name, args)
+				}
+				want := strings.Split(tc.wantUsed, ",")
+				if calls >= len(want) {
+					t.Fatal("retried an exhausted account")
+				}
+				assertWrapSwitchFile(t, livePath, retryCredentials(want[calls]))
+				calls++
+				code, stderr := 0, ""
+				if calls <= tc.failures {
+					code, stderr = tc.childCode, tc.childError
+				}
+				return retryProcess(ctx, code, "native output\n", stderr, "")
+			})
+			result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+			if result.Err != nil || result.ExitCode != tc.wantCode || result.RateLimitHit != tc.wantLimit || strings.Join(result.ProfilesUsed, ",") != tc.wantUsed || result.RetryCount != calls-1 {
+				t.Fatalf("unexpected retry result: %+v (calls=%d)", result, calls)
+			}
+			if got := cfg.Stdout.(*bytes.Buffer).String(); got != strings.Repeat("native output\n", calls) {
+				t.Fatalf("stdout was not preserved: %q", got)
+			}
+		})
+	}
+}
+
+func TestWrapperReplaysInputAndClearsAmbientCredentials(t *testing.T) {
+	vault, cfg, _ := newRetryFixture(t, "alpha", "beta")
+	input := "first line\nsecond\x00line\n"
+	cfg.Stdin = strings.NewReader(input)
+	t.Setenv("OPENAI_API_KEY", "ambient-synthetic")
+	t.Setenv("CODEX_API_KEY", "ambient-synthetic")
+	t.Setenv("OPENAI_BASE_URL", "https://example.invalid")
+	t.Setenv("GEMINI_API_KEY", "unrelated-synthetic")
+	calls := 0
+	setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		calls++
+		code, stderr := 0, ""
+		if calls == 1 {
+			code, stderr = 42, "rate limit exceeded\n"
+		}
+		cmd := retryProcess(ctx, code, "", stderr, input)
+		cmd.Env = append(cmd.Env, "CAAM_WRAP_RETRY_CHECK_ENV=1")
+		return cmd
+	})
+	result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+	if result.Err != nil || result.ExitCode != 0 || calls != 2 || result.RetryCount != 1 {
+		t.Fatalf("input/environment did not survive retry: %+v, calls=%d", result, calls)
+	}
+	assertNoRetrySpool(t)
+}
+
+func TestWrapperDoesNotReplayConsumedUnbufferedInput(t *testing.T) {
+	vault, cfg, _ := newRetryFixture(t, "alpha", "beta")
+	cfg.Stdin, cfg.ReplayStdin = strings.NewReader("one prompt"), false
+	calls := 0
+	setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		calls++
+		return retryProcess(ctx, 42, "", "rate limit exceeded\n", "one prompt")
+	})
+	result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+	if result.Err == nil || !strings.Contains(result.Err.Error(), "stdin") || calls != 1 || result.RetryCount != 0 || result.ExitCode != 42 {
+		t.Fatalf("unsafe stdin was retried: %+v calls=%d", result, calls)
+	}
+}
+
+func TestWrapperPreparationFailuresDoNotActivate(t *testing.T) {
+	readErr := errors.New("synthetic input failure")
+	for _, tc := range []struct {
+		name      string
+		configure func(*Config)
+	}{
+		{"invalid retry configuration", func(cfg *Config) { cfg.MaxRetries = -1 }},
+		{"invalid detector", func(cfg *Config) { cfg.CustomPatterns = []string{"["} }},
+		{"input read error", func(cfg *Config) { cfg.Stdin = retryReaderFunc(func([]byte) (int, error) { return 0, readErr }) }},
+		{"oversized input", func(cfg *Config) {
+			cfg.Stdin = io.LimitReader(retryReaderFunc(func(p []byte) (int, error) { clear(p); return len(p), nil }), maxReplayInputBytes+1)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vault, cfg, livePath := newRetryFixture(t, "alpha", "beta")
+			cfg.InitialProfile = "beta"
+			tc.configure(&cfg)
+			setRetryProcess(t, func(context.Context, string, ...string) *exec.Cmd {
+				t.Fatal("process reached after failed preflight")
+				return nil
+			})
+			result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+			if result.Err == nil || result.ExitCode == 0 || len(result.ProfilesUsed) != 0 {
+				t.Fatalf("invalid preflight reported success: %+v", result)
+			}
+			assertWrapSwitchFile(t, livePath, retryCredentials("alpha"))
+			assertNoRetrySpool(t)
+		})
+	}
+}
+
+func TestWrapperCancellationUnblocksInputBeforeActivation(t *testing.T) {
+	vault, cfg, livePath := newRetryFixture(t, "alpha", "beta")
+	cfg.InitialProfile = "beta"
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	started := make(chan struct{})
+	cfg.Stdin = &retryBlockingInput{ReadCloser: reader, started: started}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { <-started; cancel() }()
+	setRetryProcess(t, func(context.Context, string, ...string) *exec.Cmd {
+		t.Fatal("canceled input launched a process")
+		return nil
+	})
+	result := NewWrapper(vault, nil, nil, cfg).Run(ctx)
+	if !errors.Is(result.Err, context.Canceled) || len(result.ProfilesUsed) != 0 {
+		t.Fatalf("cancellation was lost: %+v", result)
+	}
+	assertWrapSwitchFile(t, livePath, retryCredentials("alpha"))
+	assertNoRetrySpool(t)
+}
+
+func TestWrapperProcessErrorsAreNotRetried(t *testing.T) {
+	for _, failedStart := range []bool{true, false} {
+		t.Run(fmt.Sprintf("start=%v", failedStart), func(t *testing.T) {
+			vault, cfg, _ := newRetryFixture(t, "alpha", "beta")
+			outputErr := errors.New("synthetic output failure")
+			if !failedStart {
+				cfg.Stdout = retryWriterFunc(func([]byte) (int, error) { return 0, outputErr })
+			}
+			calls := 0
+			setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+				calls++
+				if failedStart {
+					return exec.CommandContext(ctx, filepath.Join(t.TempDir(), "missing-binary"))
+				}
+				return retryProcess(ctx, 42, "output\n", "rate limit exceeded\n", "")
+			})
+			result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+			if result.Err == nil || result.ExitCode == 0 || calls != 1 || result.RetryCount != 0 {
+				t.Fatalf("process error was hidden or retried: %+v calls=%d", result, calls)
+			}
+			if failedStart && len(result.ProfilesUsed) != 0 {
+				t.Fatalf("failed start counted as launch: %+v", result)
+			}
+			if !failedStart && !errors.Is(result.Err, outputErr) {
+				t.Fatalf("output error was lost: %v", result.Err)
+			}
+		})
+	}
+}
+
+func TestWrapperRetryAfterAndBackoffCancellation(t *testing.T) {
+	t.Run("retry after", func(t *testing.T) {
+		vault, cfg, _ := newRetryFixture(t, "alpha", "beta")
+		var first time.Time
+		calls := 0
+		setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			calls++
+			if calls == 1 {
+				first = time.Now()
+				return retryProcess(ctx, 42, "", "rate limit exceeded\nRetry-After: 1\n", "")
+			}
+			if time.Since(first) < 900*time.Millisecond {
+				t.Fatal("retry ignored server delay")
+			}
+			return retryProcess(ctx, 0, "", "", "")
+		})
+		result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+		if result.Err != nil || result.ExitCode != 0 || calls != 2 {
+			t.Fatalf("Retry-After retry failed: %+v calls=%d", result, calls)
+		}
+	})
+	t.Run("cancel before next activation", func(t *testing.T) {
+		vault, cfg, livePath := newRetryFixture(t, "alpha", "beta")
+		cfg.InitialDelay, cfg.MaxDelay = time.Hour, time.Hour
+		cfg.NotifyOnSwitch = true
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cfg.Stderr = retryWriterFunc(func(p []byte) (int, error) {
+			if bytes.Contains(p, []byte("waiting")) {
+				cancel()
+			}
+			return len(p), nil
+		})
+		calls := 0
+		setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+			calls++
+			return retryProcess(ctx, 42, "", "rate limit exceeded\n", "")
+		})
+		result := NewWrapper(vault, nil, nil, cfg).Run(ctx)
+		if !errors.Is(result.Err, context.Canceled) || calls != 1 || result.RetryCount != 0 {
+			t.Fatalf("backoff cancellation was lost: %+v calls=%d", result, calls)
+		}
+		assertWrapSwitchFile(t, livePath, retryCredentials("alpha"))
+	})
+}
+
+func TestWrapperRefreshesAutomaticInitialSelection(t *testing.T) {
+	for _, measured := range []bool{true, false} {
+		t.Run(fmt.Sprintf("measured=%v", measured), func(t *testing.T) {
+			vault, cfg, livePath := newRetryFixture(t, "alpha", "beta")
+			cfg.InitialProfile = ""
+			cfg.MaxRetries = 0
+			cfg.Selector = rotation.NewSelector(rotation.AlgorithmRoundRobin, nil, nil)
+			refreshes := 0
+			cfg.BeforeSelection = func(_ context.Context, candidates []string) error {
+				refreshes++
+				if strings.Join(candidates, ",") != "alpha,beta" {
+					t.Fatalf("initial candidates = %v, want alpha and beta", candidates)
+				}
+				snapshot := make(map[string]*rotation.UsageInfo)
+				if measured {
+					snapshot["alpha"] = &rotation.UsageInfo{
+						ProfileName:      "alpha",
+						SecondaryPercent: 100,
+					}
+					snapshot["beta"] = &rotation.UsageInfo{
+						ProfileName:      "beta",
+						SecondaryPercent: 20,
+						AvailScore:       80,
+					}
+				}
+				cfg.Selector.SetUsageData(snapshot)
+				return nil
+			}
+			calls := 0
+			setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+				calls++
+				return retryProcess(ctx, 0, "", "", "")
+			})
+
+			result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+			if refreshes != 1 {
+				t.Fatalf("automatic initial selection refreshed %d times, want 1", refreshes)
+			}
+			if measured {
+				if result.Err != nil || result.ExitCode != 0 || calls != 1 ||
+					strings.Join(result.ProfilesUsed, ",") != "beta" {
+					t.Fatalf("automatic selection ignored measured quota: result=%+v calls=%d", result, calls)
+				}
+				assertWrapSwitchFile(t, livePath, retryCredentials("beta"))
+				return
+			}
+			if result.Err == nil || result.ExitCode == 0 || calls != 0 || len(result.ProfilesUsed) != 0 {
+				t.Fatalf("automatic selection treated missing quota as headroom: result=%+v calls=%d", result, calls)
+			}
+			assertWrapSwitchFile(t, livePath, retryCredentials("alpha"))
+			assertWrapSwitchFile(t, vault.BackupPath("codex", "alpha", "auth.json"), retryCredentials("alpha"))
+			assertWrapSwitchFile(t, vault.BackupPath("codex", "beta", "auth.json"), retryCredentials("beta"))
+		})
+	}
+}
+
+func TestWrapperRefreshFailureAfterBackoffDoesNotActivate(t *testing.T) {
+	for _, cancelRefresh := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%v", cancelRefresh), func(t *testing.T) {
+			vault, cfg, livePath := newRetryFixture(t, "alpha", "beta")
+			cfg.MaxRetries = 1
+			cfg.InitialDelay, cfg.MaxDelay = 5*time.Millisecond, 5*time.Millisecond
+			cfg.Selector = rotation.NewSelector(rotation.AlgorithmRoundRobin, nil, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			refreshErr := errors.New("synthetic quota refresh failure")
+			calls, refreshes := 0, 0
+			var selectedAt time.Time
+			cfg.BeforeSelection = func(ctx context.Context, candidates []string) error {
+				refreshes++
+				if calls != 1 {
+					t.Fatalf("refresh ran before the explicit first attempt or after a retry: calls=%d", calls)
+				}
+				if strings.Join(candidates, ",") != "beta" {
+					t.Fatalf("retry candidates = %v, want only beta", candidates)
+				}
+				assertWrapSwitchFile(t, livePath, retryCredentials("alpha"))
+				switch refreshes {
+				case 1:
+					cfg.Selector.SetUsageData(map[string]*rotation.UsageInfo{
+						"beta": {
+							ProfileName:      "beta",
+							SecondaryPercent: 20,
+							AvailScore:       80,
+						},
+					})
+					selectedAt = time.Now()
+					return nil
+				case 2:
+					if time.Since(selectedAt) < cfg.InitialDelay {
+						t.Fatal("selected profile was refreshed before its backoff")
+					}
+					if cancelRefresh {
+						cancel()
+						return ctx.Err()
+					}
+					return refreshErr
+				default:
+					t.Fatalf("unexpected extra refresh: %d", refreshes)
+					return nil
+				}
+			}
+			setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+				calls++
+				if calls == 1 {
+					return retryProcess(ctx, 42, "", "rate limit exceeded\n", "")
+				}
+				return retryProcess(ctx, 0, "", "", "")
+			})
+
+			result := NewWrapper(vault, nil, nil, cfg).Run(ctx)
+			wantErr := refreshErr
+			if cancelRefresh {
+				wantErr = context.Canceled
+			}
+			if !errors.Is(result.Err, wantErr) || result.ExitCode == 0 ||
+				calls != 1 || refreshes != 2 || result.RetryCount != 0 ||
+				!result.RateLimitHit || strings.Join(result.ProfilesUsed, ",") != "alpha" {
+				t.Fatalf("refresh failure advanced retry: result=%+v calls=%d refreshes=%d", result, calls, refreshes)
+			}
+			assertWrapSwitchFile(t, livePath, retryCredentials("alpha"))
+			assertWrapSwitchFile(t, vault.BackupPath("codex", "beta", "auth.json"), retryCredentials("beta"))
+		})
+	}
+}
+
+func TestWrapperUsesSuppliedRotationPolicy(t *testing.T) {
+	vault, cfg, _ := newRetryFixture(t, "beta", "alpha", "gamma")
+	cfg.Selector = rotation.NewSelector(rotation.AlgorithmSmart, nil, nil)
+	cfg.Selector.SetPolicy(rotation.PolicyDrain)
+	soon, later := time.Now().Add(time.Hour), time.Now().Add(24*time.Hour)
+	cfg.Selector.SetUsageData(map[string]*rotation.UsageInfo{
+		"alpha": {ProfileName: "alpha", PrimaryPercent: 20, AvailScore: 80, ResetsAt: &later},
+		"beta":  {ProfileName: "beta", PrimaryPercent: 90, AvailScore: 10, ResetsAt: &later},
+		"gamma": {ProfileName: "gamma", PrimaryPercent: 80, AvailScore: 20, ResetsAt: &soon},
+	})
+	calls := 0
+	setRetryProcess(t, func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		calls++
+		if calls == 1 {
+			return retryProcess(ctx, 42, "", "rate limit exceeded\n", "")
+		}
+		return retryProcess(ctx, 0, "", "", "")
+	})
+	result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+	if result.Err != nil || result.ExitCode != 0 || strings.Join(result.ProfilesUsed, ",") != "beta,gamma" {
+		t.Fatalf("caller current account or drain policy was lost: %+v", result)
+	}
+}
+
+func assertNoRetrySpool(t *testing.T) {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(os.TempDir(), "caam-run-stdin-*"))
+	if err != nil || len(files) != 0 {
+		t.Fatalf("stdin spool was not cleaned up: %v %v", files, err)
+	}
+}
+
+type retryReaderFunc func([]byte) (int, error)
+
+func (f retryReaderFunc) Read(p []byte) (int, error) { return f(p) }
+
+type retryWriterFunc func([]byte) (int, error)
+
+func (f retryWriterFunc) Write(p []byte) (int, error) { return f(p) }
+
+type retryBlockingInput struct {
+	io.ReadCloser
+	started chan struct{}
+	once    sync.Once
+}
+
+func (r *retryBlockingInput) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	return r.ReadCloser.Read(p)
+}
+
+func TestWrapperRateLimitPreservesLatestLiveCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		liveOwner string
+		malformed bool
+	}{
+		{name: "native rotation survives failover", liveOwner: "alice"},
+		{name: "external login is backed up under its own identity", liveOwner: "carol"},
+		{name: "malformed backup leaves running login intact", liveOwner: "alice", malformed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			vault := authfile.NewVault(filepath.Join(root, "vault"))
+			credentials := func(token string, expiry int64) []byte {
+				return []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":%d}}`, token, "refresh-"+token, expiry))
+			}
+			identity := func(name string) []byte {
+				return []byte(fmt.Sprintf(`{"oauthAccount":{"accountUuid":%q,"emailAddress":%q}}`, "id-"+name, name+"@example.com"))
+			}
+			oldAlice := credentials("alice-old", 2000000000000)
+			rotated := credentials(tc.liveOwner+"-rotated", 2000003600000)
+			bob := credentials("bob", 2000007200000)
+			if tc.malformed {
+				bob = []byte(`{"claudeAiOauth":{"accessToken":null}}`)
+			}
+			for name, data := range map[string][]byte{"alice": oldAlice, "bob": bob} {
+				writeWrapSwitchFile(t, vault.BackupPath("claude", name, ".credentials.json"), data)
+				writeWrapSwitchFile(t, vault.BackupPath("claude", name, ".claude.json"), identity(name))
+				if name != "bob" || !tc.malformed {
+					metadata, err := json.Marshal(map[string]any{"claude_identity": wrapSwitchIdentityBinding(t, data, name)})
+					if err != nil {
+						t.Fatal(err)
+					}
+					writeWrapSwitchFile(t, vault.BackupPath("claude", name, "meta.json"), metadata)
+				}
+			}
+			// Native token rotation does not create a CAAM identity cache. The
+			// failover must verify the new exact token pair before updating Alice
+			// or identifying Carol's independent recovery snapshot.
+			rotatedBinding := wrapSwitchIdentityBinding(t, rotated, tc.liveOwner)
+			verificationCalls := 0
+			vault.ClaudeIdentityVerifier = func(_ context.Context, captured []byte) (*claudeidentity.ClaudeIdentityBinding, error) {
+				verificationCalls++
+				if !rotatedBinding.MatchesCredentials(captured) {
+					return nil, fmt.Errorf("unexpected credential generation in test identity verifier")
+				}
+				return rotatedBinding, nil
+			}
+			livePath := filepath.Join(home, ".claude", ".credentials.json")
+			identityPath := filepath.Join(home, ".claude.json")
+			writeWrapSwitchFile(t, livePath, oldAlice)
+			writeWrapSwitchFile(t, identityPath, identity("alice"))
+
+			calls := 0
+			originalExec := ExecCommand
+			t.Cleanup(func() { ExecCommand = originalExec })
+			ExecCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				if name != "claude" {
+					t.Fatalf("unexpected executable: %s", name)
+				}
+				calls++
+				mode := "success"
+				if calls == 1 {
+					assertWrapSwitchFile(t, livePath, oldAlice)
+					// Simulate the native CLI rotating tokens, or another login
+					// replacing the account, before it reports the rate limit.
+					writeWrapSwitchFile(t, livePath, rotated)
+					writeWrapSwitchFile(t, identityPath, identity(tc.liveOwner))
+					mode = "limited"
+				} else {
+					assertWrapSwitchFile(t, livePath, bob)
+				}
+				cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWrapSwitchProcess$", "--")
+				cmd.Env = append(os.Environ(), "CAAM_WRAP_SWITCH_PROCESS="+mode)
+				return cmd
+			}
+			cfg := DefaultConfig()
+			cfg.Provider = "claude"
+			cfg.Algorithm = rotation.AlgorithmRoundRobin
+			cfg.MaxRetries = 1
+			cfg.InitialDelay = 0
+			cfg.Jitter = false
+			cfg.Stdin = strings.NewReader("")
+			cfg.NotifyOnSwitch = false
+			cfg.Stdout = &bytes.Buffer{}
+			cfg.Stderr = &bytes.Buffer{}
+			result := NewWrapper(vault, nil, nil, cfg).Run(context.Background())
+			wantUsed := "alice,bob"
+			if tc.malformed {
+				wantUsed = "alice"
+			}
+			if !result.RateLimitHit || strings.Join(result.ProfilesUsed, ",") != wantUsed {
+				t.Fatalf("failover was not exercised: %+v", result)
+			}
+			wantCalls := 2
+			wantLive := bob
+			if tc.malformed {
+				wantCalls = 1
+				wantLive = rotated
+				if result.Err == nil || result.ExitCode == 0 {
+					t.Fatalf("malformed target reported success: %+v", result)
+				}
+			} else if result.Err != nil || result.ExitCode != 0 {
+				t.Fatalf("failover failed: %+v", result)
+			}
+			if calls != wantCalls {
+				t.Fatalf("native executions = %d, want %d", calls, wantCalls)
+			}
+			if result.RetryCount != wantCalls-1 {
+				t.Fatalf("retry count = %d, want %d actual additional launches", result.RetryCount, wantCalls-1)
+			}
+			if !tc.malformed && verificationCalls == 0 {
+				t.Fatal("failover did not verify the independently rotated live credential")
+			}
+			assertWrapSwitchFile(t, livePath, wantLive)
+			wantAlice := oldAlice
+			if !tc.malformed && tc.liveOwner == "alice" {
+				wantAlice = rotated
+			}
+			assertWrapSwitchFile(t, vault.BackupPath("claude", "alice", ".credentials.json"), wantAlice)
+			assertWrapSwitchFile(t, vault.BackupPath("claude", "bob", ".credentials.json"), bob)
+			profiles, err := vault.List("claude")
+			if err != nil {
+				t.Fatal(err)
+			}
+			backups := 0
+			for _, name := range profiles {
+				if authfile.IsSystemProfile(name) {
+					backups++
+					assertWrapSwitchFile(t, vault.BackupPath("claude", name, ".credentials.json"), rotated)
+				}
+			}
+			wantBackup := tc.liveOwner == "carol" && !tc.malformed
+			if (backups == 1) != wantBackup || backups > 1 {
+				t.Errorf("recovery backups = %d, want backup %v", backups, wantBackup)
+			}
+		})
+	}
+}
+
+func TestWrapSwitchProcess(t *testing.T) {
+	switch os.Getenv("CAAM_WRAP_SWITCH_PROCESS") {
+	case "limited":
+		fmt.Fprintln(os.Stderr, "Error: rate limit exceeded")
+		os.Exit(1)
+	case "success":
+		fmt.Fprintln(os.Stdout, "request completed")
+		os.Exit(0)
+	}
+}
+
+func wrapSwitchIdentityBinding(t *testing.T, credentials []byte, account string) *claudeidentity.ClaudeIdentityBinding {
+	t.Helper()
+	fingerprint, err := claudeidentity.ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &claudeidentity.ClaudeIdentityBinding{
+		Identity: claudeidentity.Identity{Provider: "claude", AccountID: "id-" + account,
+			OrganizationID: "organization-" + account, Email: account + "@example.com"},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+	}
+}
+
+func writeWrapSwitchFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertWrapSwitchFile(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("unexpected credential content at %s", path)
 	}
 }
 
@@ -550,8 +1251,7 @@ func TestWrapper_RecordSession_WithRetries(t *testing.T) {
 	w.recordSession(result)
 }
 
-// Test runOnce with unknown provider
-func TestWrapper_RunOnce_UnknownProvider(t *testing.T) {
+func TestWrapper_Run_UnknownProvider(t *testing.T) {
 	tmpDir := t.TempDir()
 	vault := authfile.NewVault(tmpDir)
 
@@ -561,15 +1261,14 @@ func TestWrapper_RunOnce_UnknownProvider(t *testing.T) {
 
 	w := NewWrapper(vault, nil, nil, cfg)
 
-	exitCode, rateLimitHit, err := w.runOnce(context.Background(), "test")
-
-	if err == nil {
+	result := w.Run(context.Background())
+	if result.Err == nil {
 		t.Error("Expected error for unknown provider")
 	}
-	if exitCode != 1 {
-		t.Errorf("ExitCode = %d, want 1", exitCode)
+	if result.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 1", result.ExitCode)
 	}
-	if rateLimitHit {
+	if result.RateLimitHit {
 		t.Error("rateLimitHit should be false for unknown provider")
 	}
 }

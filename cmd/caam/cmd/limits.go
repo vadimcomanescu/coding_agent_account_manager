@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
@@ -30,18 +34,23 @@ This command queries the provider's API to get current rate limit utilization,
 which is useful for deciding when to switch accounts. It also parses local logs
 to estimate token burn rate and predict when limits will be hit.
 
-Live limit fetching is available for providers with usage APIs (claude, codex).
+Live limit fetching is available for providers with usage APIs (claude, codex, grok, cursor).
 
 Examples:
-  caam limits                     # Show limits for all supported providers (claude, codex)
+  caam limits                     # Show limits for all supported providers
   caam limits claude              # Show Claude limits only
   caam limits codex               # Show Codex limits only
+  caam limits grok                # Show Grok billing for each saved profile
+  caam limits cursor              # Show Cursor limit status for each saved profile
   caam limits --profile work      # Show limits for a specific profile
   caam limits --format json       # Output as JSON
   caam limits --best              # Show the best profile for rotation
   caam limits claude --model fable --best   # Best profile for Fable work specifically
+  caam limits codex --rank earliest-reset-headroom --format json   # Which seat to spend next
   caam limits claude --cached     # Offline: read the snapshot Claude Code cached on disk
   caam limits claude --profile work --source isolated   # Read a specific credential store
+  caam limits grok --profile work --source live         # Read the same account's current host login
+  caam limits cursor --profile work --source live --format json
 
 Claude reports a separate weekly allowance per model on top of the 5-hour and
 weekly windows. The SCOPED column shows the per-model allowance closest to its
@@ -59,6 +68,13 @@ name, and refuses to report a verdict when an unselected namespace holds a
 strictly healthier credential. Pass --source vault|isolated|shallow to choose
 explicitly. Credentials are never copied between namespaces.
 
+For Grok and Cursor, --source live reads the host's current file-backed login.
+It requires a provider and --profile, and verifies that the live credential
+belongs to that saved account. Unknown or different identities are refused.
+This follows native token rotation without repeatedly backing up the login.
+It does not change the vault or the live credential. Cursor uses its platform
+credential path; Grok honors GROK_HOME.
+
 Offline mode (--cached)
 -----------------------
 --cached answers the same question without the network and without presenting
@@ -70,7 +86,34 @@ The snapshot only moves when that account itself runs a session, so a profile
 you are not currently using can be hours or days stale — or have no cache at
 all. Every row therefore reports its snapshot's age in an AS OF column, and a
 profile with nothing cached is reported as "no cached data" and excluded from
---best rather than being shown as 0% used.`,
+--best rather than being shown as 0% used.
+
+Rank modes (--rank)
+-------------------
+--best answers "which seat is idlest", which is the right question for
+rotating away from a seat you are burning and the wrong one for handing a seat
+to new work: the idlest seat is usually the reserve you meant to keep.
+
+--rank earliest-reset-headroom answers the second question instead. Among
+seats whose included allowance is still under the headroom ceiling it prefers
+the one whose allowance refreshes SOONEST, so quota that is about to be lost
+is spent first and a later-resetting seat is preserved. Seats running on paid
+credits rank last, and a seat whose limits could not be read — or that is
+missing the model-scoped row a named --model needs — is reported ineligible
+with a reason rather than being treated as spare capacity. When nothing is
+selectable the command exits non-zero and says why, because falling through to
+a static pin is the failure this mode exists to prevent.
+
+It sorts on the reset time of the longest allowance a seat reports (its weekly
+cap, not the five-hour window that rolls over by itself), which is the quota
+actually at risk of expiring unused. That differs from "caam precheck --policy
+drain", which ranks on the soonest reset of any window.
+
+--rank availability names the historical --best ordering explicitly.
+
+The ceiling defaults to stealth.rotation.drain_headroom_ceiling (95 if unset)
+and --headroom overrides it for one call. This is a read-only ranking: it
+activates nothing and never touches a running session.`,
 	RunE: runLimits,
 }
 
@@ -83,24 +126,79 @@ func init() {
 	limitsCmd.Flags().Bool("recommend", false, "show smart rotation recommendations")
 	limitsCmd.Flags().Bool("forecast", false, "show usage forecasts and optimal switch times")
 	limitsCmd.Flags().String("model", "", "model the work will run on (e.g. opus, fable); scores and eligibility then honor that model's own quota")
-	limitsCmd.Flags().String("source", "", "credential namespace to read: vault (default), isolated, or shallow")
+	limitsCmd.Flags().String("source", "", "credential namespace: vault (default), isolated, shallow, or live (grok/cursor; requires --profile)")
 	limitsCmd.Flags().Bool("cached", false, "read the usage snapshot Claude Code cached on disk instead of querying the API (offline, presents no token; claude only)")
+	addLimitsRankFlags(limitsCmd)
 }
 
 func runLimits(cmd *cobra.Command, args []string) error {
+	// Initialize log scanners for burn rate calculation.
+	scanner := logs.NewMultiScanner()
+	scanner.Register("claude", logs.NewClaudeScanner())
+	scanner.Register("codex", logs.NewCodexScanner())
+	scanner.Register("gemini", logs.NewGeminiScanner())
+
+	return runLimitsWithFetcher(cmd, args, usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner)))
+}
+
+func runLimitsWithFetcher(cmd *cobra.Command, args []string, fetcher *usage.MultiProfileFetcher) error {
 	profileArg, _ := cmd.Flags().GetString("profile")
 	format, _ := cmd.Flags().GetString("format")
 	showBest, _ := cmd.Flags().GetBool("best")
 	threshold, _ := cmd.Flags().GetFloat64("threshold")
+	if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold < 0 || threshold > 1 {
+		cmd.SilenceUsage = true
+		return fmt.Errorf("--threshold must be a finite number between 0 and 1")
+	}
 	showRecommend, _ := cmd.Flags().GetBool("recommend")
 	showForecast, _ := cmd.Flags().GetBool("forecast")
 	model, _ := cmd.Flags().GetString("model")
 	source, _ := cmd.Flags().GetString("source")
 	cached, _ := cmd.Flags().GetBool("cached")
 
+	rankMode, _ := cmd.Flags().GetString("rank")
+	rankMode = strings.TrimSpace(rankMode)
+
 	source = strings.ToLower(strings.TrimSpace(source))
 	if source != "" && !ValidCredNamespace(source) {
-		return fmt.Errorf("unknown --source %q (want one of: %s)", source, strings.Join(credNamespaces, ", "))
+		return fmt.Errorf("unknown --source %q (want one of: %s)", source, credentialSourceNames)
+	}
+	if source == credNamespaceLive {
+		if len(args) != 1 || (strings.ToLower(args[0]) != "grok" && strings.ToLower(args[0]) != "cursor") {
+			return fmt.Errorf("--source live requires one provider: grok or cursor")
+		}
+		if strings.TrimSpace(profileArg) == "" {
+			return fmt.Errorf("--source live requires --profile to verify the live account against its saved identity")
+		}
+		if cached {
+			return fmt.Errorf("--source live is unavailable with --cached: Grok and Cursor have no offline usage cache")
+		}
+	}
+
+	// --best and --rank answer different questions ("which seat is idlest"
+	// versus "which seat should new work spend"). Asking both at once has no
+	// single right answer, so say so instead of silently picking one.
+	if rankMode != "" && showBest {
+		return fmt.Errorf("--rank and --best are alternatives: --best is the idlest-seat answer, --rank ranks seats for new work (use --rank availability for the --best ordering)")
+	}
+
+	// Validate the rank flags before spending a minute on API calls.
+	var rankOpts usage.RankOptions
+	if rankMode != "" {
+		// Ranking asks "which of these interchangeable seats should new work
+		// spend". Seats of different providers are not interchangeable, and a
+		// reset time on a Claude seat says nothing about a Codex one, so a
+		// mixed pool has no meaningful order. Require the provider.
+		if len(args) == 0 {
+			cmd.SilenceUsage = true
+			return fmt.Errorf("--rank needs a provider (%s): seats of different providers are not interchangeable, so ranking them together has no meaning",
+				strings.Join(limitsProviders, " or "))
+		}
+		var err error
+		if rankOpts, err = rankOptionsFromFlags(cmd, strings.ToLower(args[0]), model); err != nil {
+			cmd.SilenceUsage = true
+			return err
+		}
 	}
 
 	// Live limit fetching only has API support for a subset of providers (those
@@ -137,14 +235,6 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	now := time.Now()
 	var sourceNotes []string
 
-	// Initialize log scanners for burn rate calculation
-	scanner := logs.NewMultiScanner()
-	scanner.Register("claude", logs.NewClaudeScanner())
-	scanner.Register("codex", logs.NewCodexScanner())
-	scanner.Register("gemini", logs.NewGeminiScanner())
-
-	fetcher := usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner))
-
 	allResults := make([]usage.ProfileUsage, 0)
 
 	for _, provider := range providers {
@@ -153,6 +243,10 @@ func runLimits(cmd *cobra.Command, args []string) error {
 			// name means before reading anything (issue #100).
 			res, err := resolveProfileCredential(lookup, provider, profileArg, source)
 			if err != nil {
+				if source == credNamespaceLive {
+					cmd.SilenceUsage = true
+					return err
+				}
 				if format != "json" {
 					fmt.Fprintf(out, "%s/%s: %v\n", provider, profileArg, err)
 				}
@@ -195,6 +289,7 @@ func runLimits(cmd *cobra.Command, args []string) error {
 				}
 				continue
 			}
+			credentials := make(map[string]string, len(names))
 			for _, name := range names {
 				if cached {
 					// An offline read needs no credential at all — that is
@@ -206,7 +301,12 @@ func runLimits(cmd *cobra.Command, args []string) error {
 				if !c.Found() {
 					continue
 				}
-				allResults = append(allResults, fetcher.FetchAllProfiles(ctx, provider, map[string]string{name: c.Token})...)
+				credentials[name] = c.Token
+			}
+			if len(credentials) > 0 {
+				// Fetch the namespace as one batch so every profile shares the
+				// provider's burn-rate log scan (issue #139).
+				allResults = append(allResults, fetcher.FetchAllProfiles(ctx, provider, credentials)...)
 			}
 			continue
 		}
@@ -219,11 +319,13 @@ func runLimits(cmd *cobra.Command, args []string) error {
 			}
 			continue
 		}
+		sourceNotes = append(sourceNotes, nativeProfilesWithoutCredentialNotes(vaultDir, provider, credentials)...)
 		if len(credentials) == 0 {
 			continue
 		}
 
 		results := fetcher.FetchAllProfiles(ctx, provider, credentials)
+		recordCodexUsageVerdicts(vaultDir, provider, results)
 		allResults = append(allResults, results...)
 	}
 
@@ -241,6 +343,10 @@ func runLimits(cmd *cobra.Command, args []string) error {
 		sortResultsForModel(allResults, model)
 	}
 
+	if rankMode != "" {
+		return runLimitsRank(cmd, out, format, allResults, rankOpts)
+	}
+
 	if showBest {
 		return renderBestProfile(out, format, allResults, threshold, model)
 	}
@@ -250,7 +356,7 @@ func runLimits(cmd *cobra.Command, args []string) error {
 	}
 
 	if showForecast {
-		return renderForecast(out, format, allResults)
+		return renderForecast(out, format, allResults, model)
 	}
 
 	return renderLimits(out, format, allResults, model)
@@ -276,7 +382,7 @@ func sortResultsForModel(results []usage.ProfileUsage, model string) {
 }
 
 // limitsProviders are the providers with live limit/usage API support.
-var limitsProviders = []string{"claude", "codex"}
+var limitsProviders = []string{"claude", "codex", "grok", "cursor"}
 
 func isLimitsProvider(p string) bool {
 	for _, lp := range limitsProviders {
@@ -339,15 +445,78 @@ func cachedProfileUsage(provider, name, claudeJSON string, now time.Time) usage.
 		if !errors.Is(err, usage.ErrNoCachedUsage) {
 			msg = err.Error()
 		}
-		row.Usage = &usage.UsageInfo{
-			Provider: provider, ProfileName: name, Source: usage.SourceCache,
-			Error: msg,
+		// A decoded snapshot can retain useful measurements and its original
+		// age while refusing quota-based selection. Keep that evidence and its
+		// degraded status rather than replacing the whole row with an error.
+		if info == nil {
+			info = &usage.UsageInfo{}
 		}
-		return row
+		if info.Error == "" {
+			info.Error = msg
+		}
 	}
+	info.Provider = provider
 	info.ProfileName = name
+	info.Source = usage.SourceCache
 	row.Usage = info
 	return row
+}
+
+// nativeProfilesWithoutCredentialNotes names the saved grok/cursor profiles
+// that LoadProfileCredentials skipped because the vault copy has no usable
+// auth.json. A backup taken by an older caam can hold only cli-config.json;
+// without this note such a profile vanishes from the table and the command
+// reports "No profiles found" (GH #109).
+func nativeProfilesWithoutCredentialNotes(vaultDir, provider string, loaded map[string]string) []string {
+	if provider != "grok" && provider != "cursor" {
+		return nil
+	}
+	entries, err := os.ReadDir(filepath.Join(vaultDir, provider))
+	if err != nil {
+		return nil
+	}
+	var notes []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() || strings.HasPrefix(name, ".") || authfile.IsSystemProfile(name) {
+			continue
+		}
+		if _, ok := loaded[name]; ok {
+			continue
+		}
+		notes = append(notes, fmt.Sprintf(
+			"%s/%s: skipped, the saved profile has no auth.json with an access token (re-run `caam backup %s %s` while logged in to that account)",
+			provider, name, provider, name))
+	}
+	return notes
+}
+
+// cursorTeamPoolNotes describes the team on-demand pool for cursor rows that
+// report one. The pool is shared by the whole team, so it can run out while
+// the member's own included usage and on-demand figures still look fine.
+func cursorTeamPoolNotes(results []usage.ProfileUsage) []string {
+	var notes []string
+	for _, r := range results {
+		if r.Provider != "cursor" || r.Usage == nil || r.Usage.Billing == nil {
+			continue
+		}
+		b := r.Usage.Billing
+		if b.TeamPoolCapCents == nil || *b.TeamPoolCapCents <= 0 {
+			continue
+		}
+		dollars := func(c int64) string { return fmt.Sprintf("$%d.%02d", c/100, c%100) }
+		used := "unknown"
+		if b.TeamPoolUsedCents != nil {
+			used = dollars(*b.TeamPoolUsedCents)
+		}
+		remaining := ""
+		if b.TeamPoolRemainingCents != nil {
+			remaining = fmt.Sprintf(", %s left", dollars(*b.TeamPoolRemainingCents))
+		}
+		notes = append(notes, fmt.Sprintf("cursor/%s: team on-demand pool %s of %s used%s",
+			r.ProfileName, used, dollars(*b.TeamPoolCapCents), remaining))
+	}
+	return notes
 }
 
 func getVaultDir() string {
@@ -419,15 +588,18 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, mode
 					status = "no cached data"
 				case r.Usage.Error != "":
 					status = "error: " + truncate(r.Usage.Error, 20)
+				case r.Usage.QuotaStatus == usage.QuotaDegraded:
+					status = "degraded"
+				case r.Usage.QuotaStatus == usage.QuotaUnavailable:
+					status = "unavailable"
 				default:
 					status = "ok"
 				}
 
-				// A row with no data scores nothing. Running the availability
-				// scorer over empty windows would return a perfect 100 and
-				// present an account caam knows nothing about as the idlest
-				// one on the table.
-				if !noData {
+				// A row with no numeric quota scores nothing. Running the
+				// availability scorer over an unmeasured window would return
+				// a perfect 100 and present that account as the idlest one.
+				if !noData && r.Usage.NumericQuotaKnown() {
 					score = strconv.Itoa(r.Usage.AvailabilityScoreForModel(model))
 					scoped = formatScopedLimit(r.Usage.ScopedLimit(model))
 				}
@@ -463,6 +635,12 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, mode
 		}
 
 		tw.Flush()
+		if notes := cursorTeamPoolNotes(results); len(notes) > 0 {
+			fmt.Fprintln(w)
+			for _, note := range notes {
+				fmt.Fprintln(w, note)
+			}
+		}
 		if offline {
 			fmt.Fprintln(w)
 			fmt.Fprintln(w, "Figures are as cached by Claude Code and only move when that account itself runs a")
@@ -479,11 +657,14 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage, mode
 // already rolled over when the figures were read is marked, so an honest 0%
 // from a stale snapshot is not mistaken for a measured one.
 func formatWindowPercent(w *usage.UsageWindow) string {
-	if w == nil {
+	if w == nil || w.Unmeasured {
 		return "-"
 	}
 	if w.Rolled {
 		return "0% (rolled)"
+	}
+	if w.Label != "" {
+		return fmt.Sprintf("%s %d%%", w.Label, w.UsedPercent)
 	}
 	return fmt.Sprintf("%d%%", w.UsedPercent)
 }
@@ -516,10 +697,15 @@ func formatScopedLimit(w *usage.UsageWindow) string {
 // scopedLabel names the model a window is scoped to, for windows the provider
 // reported without a display name.
 func scopedLabel(w *usage.UsageWindow) string {
-	if w == nil || w.Label == "" {
-		return "model quota"
+	if w != nil {
+		if w.Label != "" {
+			return w.Label
+		}
+		if w.ModelID != "" {
+			return w.ModelID
+		}
 	}
-	return w.Label
+	return "model quota"
 }
 
 // formatBurnRate formats tokens per hour in a compact way.
@@ -533,28 +719,29 @@ func formatBurnRate(tokensPerHour float64) string {
 }
 
 func renderBestProfile(w io.Writer, format string, results []usage.ProfileUsage, threshold float64, model string) error {
-	// Ranked here, since a caller's rows can arrive in profile-name order (a
-	// JSON read of shallow profiles is never sorted), and the first row is
-	// the fallback below.
-	results = append([]usage.ProfileUsage(nil), results...)
-	sortResultsForModel(results, model)
-
-	// Filter to profiles that are available
-	var available []usage.ProfileUsage
+	// Filter to profiles that are available. A degraded or unavailable row is
+	// not available: its percentage was not measured, so it is not the best
+	// seat and it is not a reason to switch.
+	var usable, available []usage.ProfileUsage
 	for _, r := range results {
-		if r.Usage != nil && r.Usage.Error == "" && !r.Usage.IsNearLimitForModel(threshold, model) {
+		if r.Usage == nil || !r.Usage.NumericQuotaKnown() || r.Usage.IsNearLimitForModel(1, model) {
+			continue
+		}
+		usable = append(usable, r)
+		if !r.Usage.IsNearLimitForModel(threshold, model) {
 			available = append(available, r)
 		}
 	}
 
 	if len(available) == 0 {
-		// Fall back to best score even if above threshold, but never to an
-		// account with a spent window: it can run nothing.
-		if len(results) > 0 && results[0].Usage != nil && results[0].Usage.Error == "" &&
-			results[0].Usage.AvailabilityScoreForModel(model) > 0 {
-			available = results[:1]
-		}
+		// The threshold is advisory. A hard provider cap is not: fallback
+		// may choose a busy account only while every applicable quota remains.
+		available = usable
 	}
+	// Cached and explicit-source reads arrive in profile-name order. Sort
+	// this owned candidate slice rather than relying on a fetcher's ordering
+	// or changing the caller's rows.
+	sortResultsForModel(available, model)
 
 	format = strings.ToLower(strings.TrimSpace(format))
 
@@ -644,12 +831,45 @@ type Recommendation struct {
 // Forecast represents a usage forecast for a profile.
 type Forecast struct {
 	Profile           string `json:"profile"`
-	CurrentPrimary    int    `json:"current_primary_percent"`
-	CurrentSecondary  int    `json:"current_secondary_percent"`
+	CurrentPrimary    *int   `json:"current_primary_percent"`
+	CurrentSecondary  *int   `json:"current_secondary_percent"`
+	CurrentScoped     *int   `json:"current_scoped_percent,omitempty"`
+	ScopedLabel       string `json:"scoped_label,omitempty"`
+	CurrentLoad       int    `json:"current_load_percent"`
+	BindingWindow     string `json:"binding_window"`
 	PrimaryResetsIn   string `json:"primary_resets_in"`
 	SecondaryResetsIn string `json:"secondary_resets_in"`
-	SafeToUseIn       string `json:"safe_to_use_in,omitempty"`
+	ScopedResetsIn    string `json:"scoped_resets_in,omitempty"`
+	NextResetIn       string `json:"next_reset_in,omitempty"`
 	Recommendation    string `json:"recommendation"`
+}
+
+// limitsBindingWindow identifies the measured restriction relevant to this
+// work. ScopedLimit already considers every overlapping model allowance.
+func limitsBindingWindow(u *usage.UsageInfo, model string) (*usage.UsageWindow, string) {
+	if u == nil {
+		return nil, ""
+	}
+	scoped := u.ScopedLimit(model)
+	var binding *usage.UsageWindow
+	var label string
+	for _, candidate := range []struct {
+		window *usage.UsageWindow
+		label  string
+	}{{u.PrimaryWindow, "Primary"}, {u.SecondaryWindow, "Secondary"}, {scoped, scopedLabel(scoped)}} {
+		w := candidate.window
+		if w == nil || w.Unmeasured {
+			continue
+		}
+		if binding == nil || max(w.Utilization, float64(w.UsedPercent)/100) > max(binding.Utilization, float64(binding.UsedPercent)/100) {
+			binding, label = w, candidate.label
+		}
+	}
+	return binding, label
+}
+
+func limitsWindowPercent(w *usage.UsageWindow) int {
+	return max(w.UsedPercent, int(w.Utilization*100))
 }
 
 func renderRecommendations(w io.Writer, format string, results []usage.ProfileUsage, threshold float64, model string) error {
@@ -668,7 +888,7 @@ func renderRecommendations(w io.Writer, format string, results []usage.ProfileUs
 
 	case "table", "":
 		if len(recs) == 0 {
-			fmt.Fprintln(w, "No recommendations - all profiles are healthy.")
+			fmt.Fprintln(w, "No rotation recommendations from the available quota measurements.")
 			return nil
 		}
 
@@ -689,7 +909,7 @@ func renderRecommendations(w io.Writer, format string, results []usage.ProfileUs
 			fmt.Fprintf(w, "%s %s: %s\n", urgencyIcon, rec.Action, rec.Profile)
 			fmt.Fprintf(w, "   Reason: %s\n", rec.Reason)
 			if rec.SwitchIn != "" {
-				fmt.Fprintf(w, "   Switch in: %s\n", rec.SwitchIn)
+				fmt.Fprintf(w, "   Next reported reset in: %s (refresh usage before selecting)\n", rec.SwitchIn)
 			}
 			fmt.Fprintln(w)
 		}
@@ -716,10 +936,10 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 		// Find profiles that need attention
 		var nearLimit, healthy []usage.ProfileUsage
 		for _, p := range profiles {
-			if p.Usage == nil || p.Usage.Error != "" {
+			if p.Usage == nil || !p.Usage.NumericQuotaKnown() {
 				continue
 			}
-			if p.Usage.IsNearLimitForModel(threshold, model) {
+			if p.Usage.IsNearLimitForModel(1, model) || p.Usage.IsNearLimitForModel(threshold, model) {
 				nearLimit = append(nearLimit, p)
 			} else {
 				healthy = append(healthy, p)
@@ -728,36 +948,20 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 
 		// Generate recommendations
 		for _, p := range nearLimit {
-			primary := 0
-			if p.Usage.PrimaryWindow != nil {
-				primary = p.Usage.PrimaryWindow.UsedPercent
-			}
+			binding, label := limitsBindingWindow(p.Usage, model)
+			load := limitsWindowPercent(binding)
 
 			urgency := "soon"
-			if primary >= 90 {
+			if load >= 90 {
 				urgency = "now"
-			} else if primary >= thresholdPct {
-				urgency = "soon"
 			}
 
 			switchIn := ""
-			if ttl := p.Usage.TimeUntilReset(); ttl > 0 {
+			if ttl := time.Until(p.Usage.EarliestResetForModel(model)); ttl > 0 {
 				switchIn = formatLimitsDuration(ttl)
 			}
 
-			reason := fmt.Sprintf("Primary usage at %d%% (threshold: %d%%)", primary, thresholdPct)
-			if p.Usage.SecondaryWindow != nil && p.Usage.SecondaryWindow.UsedPercent >= thresholdPct {
-				reason += fmt.Sprintf(", secondary at %d%%", p.Usage.SecondaryWindow.UsedPercent)
-			}
-			// Say so when a per-model quota is what makes the profile
-			// unusable: at 0% general usage the primary figure alone reads as
-			// "plenty left" (issue #97).
-			if scoped := p.Usage.ScopedLimit(model); scoped != nil && scoped.UsedPercent >= thresholdPct {
-				reason += fmt.Sprintf(", %s exhausted at %d%%", scopedLabel(scoped), scoped.UsedPercent)
-				if primary < thresholdPct {
-					urgency = "now"
-				}
-			}
+			reason := fmt.Sprintf("%s usage at %d%% (threshold: %d%%)", label, load, thresholdPct)
 
 			rec := Recommendation{
 				Action:      "Switch from",
@@ -765,7 +969,7 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 				Reason:      reason,
 				Urgency:     urgency,
 				SwitchIn:    switchIn,
-				CurrentLoad: primary,
+				CurrentLoad: load,
 			}
 			recs = append(recs, rec)
 		}
@@ -780,17 +984,15 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 				}
 			}
 
-			bestPrimary := 0
-			if best.Usage.PrimaryWindow != nil {
-				bestPrimary = best.Usage.PrimaryWindow.UsedPercent
-			}
+			binding, label := limitsBindingWindow(best.Usage, model)
+			load := limitsWindowPercent(binding)
 
 			rec := Recommendation{
 				Action:      "Switch to",
 				Profile:     fmt.Sprintf("%s/%s", provider, best.ProfileName),
-				Reason:      fmt.Sprintf("Has %d%% availability (primary at %d%%)", best.Usage.AvailabilityScoreForModel(model), bestPrimary),
+				Reason:      fmt.Sprintf("Measured %s usage at %d%% (availability score: %d)", label, load, best.Usage.AvailabilityScoreForModel(model)),
 				Urgency:     "none",
-				CurrentLoad: bestPrimary,
+				CurrentLoad: load,
 			}
 			recs = append(recs, rec)
 		}
@@ -799,10 +1001,10 @@ func generateLimitsRecommendations(results []usage.ProfileUsage, threshold float
 	return recs
 }
 
-func renderForecast(w io.Writer, format string, results []usage.ProfileUsage) error {
+func renderForecast(w io.Writer, format string, results []usage.ProfileUsage, model string) error {
 	format = strings.ToLower(strings.TrimSpace(format))
 
-	forecasts := generateForecasts(results)
+	forecasts := generateForecasts(results, model)
 
 	switch format {
 	case "json":
@@ -821,13 +1023,27 @@ func renderForecast(w io.Writer, format string, results []usage.ProfileUsage) er
 
 		fmt.Fprintln(w, "Usage Forecasts")
 		fmt.Fprintln(w, "────────────────────────────────────────────────────────────────")
+		percent := func(p *int) string {
+			if p == nil {
+				return "not reported"
+			}
+			return fmt.Sprintf("%d%%", *p)
+		}
 
 		for _, f := range forecasts {
 			fmt.Fprintf(w, "%s\n", f.Profile)
-			fmt.Fprintf(w, "  Current: Primary %d%%, Secondary %d%%\n", f.CurrentPrimary, f.CurrentSecondary)
-			fmt.Fprintf(w, "  Resets:  Primary in %s, Secondary in %s\n", f.PrimaryResetsIn, f.SecondaryResetsIn)
-			if f.SafeToUseIn != "" {
-				fmt.Fprintf(w, "  Safe to use in: %s\n", f.SafeToUseIn)
+			fmt.Fprintf(w, "  Current: Primary %s, Secondary %s\n", percent(f.CurrentPrimary), percent(f.CurrentSecondary))
+			if f.CurrentPrimary != nil {
+				fmt.Fprintf(w, "  Primary reset: %s\n", f.PrimaryResetsIn)
+			}
+			if f.CurrentSecondary != nil {
+				fmt.Fprintf(w, "  Secondary reset: %s\n", f.SecondaryResetsIn)
+			}
+			if f.CurrentScoped != nil {
+				fmt.Fprintf(w, "  %s: %s, reset: %s\n", f.ScopedLabel, percent(f.CurrentScoped), f.ScopedResetsIn)
+			}
+			if f.NextResetIn != "" {
+				fmt.Fprintf(w, "  Next reported reset in: %s (refresh usage before selecting)\n", f.NextResetIn)
 			}
 			fmt.Fprintf(w, "  Recommendation: %s\n", f.Recommendation)
 			fmt.Fprintln(w)
@@ -840,11 +1056,17 @@ func renderForecast(w io.Writer, format string, results []usage.ProfileUsage) er
 	}
 }
 
-func generateForecasts(results []usage.ProfileUsage) []Forecast {
+func generateForecasts(results []usage.ProfileUsage, model string) []Forecast {
 	var forecasts []Forecast
+	reset := func(w *usage.UsageWindow) string {
+		if w.ResetsAt.IsZero() || !w.ResetsAt.After(time.Now()) {
+			return "unknown; refresh usage"
+		}
+		return formatLimitsDuration(time.Until(w.ResetsAt))
+	}
 
 	for _, r := range results {
-		if r.Usage == nil || r.Usage.Error != "" {
+		if r.Usage == nil || !r.Usage.NumericQuotaKnown() {
 			continue
 		}
 
@@ -853,35 +1075,88 @@ func generateForecasts(results []usage.ProfileUsage) []Forecast {
 		}
 
 		if r.Usage.PrimaryWindow != nil {
-			f.CurrentPrimary = r.Usage.PrimaryWindow.UsedPercent
-			f.PrimaryResetsIn = formatLimitsDuration(time.Until(r.Usage.PrimaryWindow.ResetsAt))
+			percent := limitsWindowPercent(r.Usage.PrimaryWindow)
+			f.CurrentPrimary = &percent
+			f.PrimaryResetsIn = reset(r.Usage.PrimaryWindow)
 		}
 
 		if r.Usage.SecondaryWindow != nil {
-			f.CurrentSecondary = r.Usage.SecondaryWindow.UsedPercent
-			f.SecondaryResetsIn = formatLimitsDuration(time.Until(r.Usage.SecondaryWindow.ResetsAt))
+			percent := limitsWindowPercent(r.Usage.SecondaryWindow)
+			f.CurrentSecondary = &percent
+			f.SecondaryResetsIn = reset(r.Usage.SecondaryWindow)
+		}
+		if scoped := r.Usage.ScopedLimit(model); scoped != nil {
+			percent := limitsWindowPercent(scoped)
+			f.CurrentScoped = &percent
+			f.ScopedLabel = scopedLabel(scoped)
+			f.ScopedResetsIn = reset(scoped)
+		}
+		binding, label := limitsBindingWindow(r.Usage, model)
+		f.CurrentLoad, f.BindingWindow = limitsWindowPercent(binding), label
+		if ttl := time.Until(r.Usage.EarliestResetForModel(model)); ttl > 0 {
+			f.NextResetIn = formatLimitsDuration(ttl)
 		}
 
-		// Determine when safe to use
-		if f.CurrentPrimary >= 80 {
-			// Need to wait for reset
-			f.SafeToUseIn = f.PrimaryResetsIn
-			f.Recommendation = fmt.Sprintf("Wait for primary window reset (%s)", f.PrimaryResetsIn)
-		} else if f.CurrentPrimary >= 50 {
-			f.Recommendation = "Use sparingly - approaching limit"
-		} else if f.CurrentPrimary >= 30 {
-			f.Recommendation = "Good availability - moderate usage"
-		} else {
-			f.Recommendation = "Excellent availability - safe for heavy usage"
-		}
-
-		// Adjust for secondary window
-		if f.CurrentSecondary >= 80 {
-			f.Recommendation += " (watch secondary limit)"
+		// A reported reset is not proof that every overlapping restriction
+		// will permit new work then. Report current evidence, not readiness.
+		switch {
+		case f.CurrentLoad >= 100:
+			f.Recommendation = "Quota exhausted; refresh usage before starting new work"
+		case f.CurrentLoad >= 80:
+			f.Recommendation = "Limited headroom; prefer another measured account and refresh after a reset"
+		case f.CurrentLoad >= 50:
+			f.Recommendation = "Some headroom; monitor usage closely"
+		case f.CurrentLoad >= 30:
+			f.Recommendation = "Measured quota has moderate headroom"
+		default:
+			f.Recommendation = "Measured quota has substantial headroom"
 		}
 
 		forecasts = append(forecasts, f)
 	}
 
 	return forecasts
+}
+
+// recordCodexUsageVerdicts stores what the provider said about each vault
+// Codex credential during a live usage read, so ls/status reflect it (issue
+// #108). An answered usage request is an acceptance. A 401 is recorded as a
+// rejection only while the access token is unexpired by its own claim: an
+// expired access token beside a working refresh token is routine, and the
+// 401 then says nothing about the account. Anything else (403, which an edge
+// proxy can send, network, 5xx, decode errors) is not a verdict and records
+// nothing. Best-effort.
+func recordCodexUsageVerdicts(vaultDir, provider string, results []usage.ProfileUsage) {
+	if provider != "codex" || len(results) == 0 {
+		return
+	}
+	store := healthStore
+	if store == nil {
+		store = health.NewStorage("")
+	}
+	for _, r := range results {
+		if r.Usage == nil || r.ProfileName == "" {
+			continue
+		}
+		authPath := filepath.Join(vaultDir, provider, r.ProfileName, "auth.json")
+		data, err := os.ReadFile(authPath)
+		if err != nil {
+			continue
+		}
+		fingerprint := health.CodexCredentialFingerprint(data)
+		switch {
+		case r.Usage.Error == "":
+			_ = store.RecordProviderVerification(provider, r.ProfileName, health.ProviderVerification{
+				Accepted: true, Fingerprint: fingerprint, At: r.Usage.FetchedAt,
+				AccessTokenOnly: true,
+			})
+		case r.Usage.Error == usage.ErrorUnauthorized && r.Usage.HTTPStatus == http.StatusUnauthorized:
+			if !codexAccessTokenLive(authPath) {
+				continue
+			}
+			_ = store.RecordProviderVerification(provider, r.ProfileName, health.ProviderVerification{
+				Reason: "access_token_rejected", Fingerprint: fingerprint, At: r.Usage.FetchedAt,
+			})
+		}
+	}
 }

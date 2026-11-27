@@ -103,17 +103,34 @@ func TestParsersSeparateRenewalFromReauth(t *testing.T) {
 		}
 	})
 
-	t.Run("gemini", func(t *testing.T) {
+	t.Run("gemini with its own OAuth client", func(t *testing.T) {
 		dir := t.TempDir()
 		writeJSON(t, filepath.Join(dir, "oauth_creds.json"), map[string]any{
-			"access_token": "a", "refresh_token": "r", "expiry": lapsed.Format(time.RFC3339),
+			"access_token": "a", "refresh_token": "r", "client_id": "c", "client_secret": "s", "expiry": lapsed.Format(time.RFC3339),
 		})
 		info, err := ParseGeminiExpiry(dir)
 		if err != nil {
 			t.Fatalf("ParseGeminiExpiry: %v", err)
 		}
 		if info.SelfRefreshing {
-			t.Error("SelfRefreshing = true, want false")
+			t.Error("SelfRefreshing = true, want false: caam refreshes a cache that carries its client")
+		}
+		if !info.Renewable {
+			t.Error("Renewable = false, want true")
+		}
+	})
+
+	t.Run("gemini native cache", func(t *testing.T) {
+		dir := t.TempDir()
+		writeJSON(t, filepath.Join(dir, "oauth_creds.json"), map[string]any{
+			"access_token": "a", "refresh_token": "r", "expiry_date": lapsed.UnixMilli(),
+		})
+		info, err := ParseGeminiExpiry(dir)
+		if err != nil {
+			t.Fatalf("ParseGeminiExpiry: %v", err)
+		}
+		if !info.SelfRefreshing {
+			t.Error("SelfRefreshing = false, want true: only Gemini CLI holds the client that renews this cache")
 		}
 		if !info.Renewable {
 			t.Error("Renewable = false, want true")
@@ -213,6 +230,21 @@ func TestCredentialSignals(t *testing.T) {
 			name:       "no expiry evidence but capped",
 			health:     &ProfileHealth{RateLimitedUntil: now.Add(time.Hour)},
 			refreshDue: nil, launchUsable: ptr(false), loginReq: nil,
+		},
+		{
+			name:       "Cursor API key without minted access token",
+			health:     &ProfileHealth{TokenRenewable: true, SelfRefreshing: true},
+			refreshDue: ptr(false), launchUsable: ptr(true), loginReq: ptr(false),
+		},
+		{
+			name:       "Cursor API key without token but capped",
+			health:     &ProfileHealth{TokenRenewable: true, SelfRefreshing: true, RateLimitedUntil: now.Add(time.Hour)},
+			refreshDue: ptr(false), launchUsable: ptr(false), loginReq: ptr(false),
+		},
+		{
+			name:       "renewable credential without refresh timing evidence",
+			health:     &ProfileHealth{TokenRenewable: true},
+			refreshDue: nil, launchUsable: ptr(true), loginReq: ptr(false),
 		},
 	}
 

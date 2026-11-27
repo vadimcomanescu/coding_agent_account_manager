@@ -3,15 +3,20 @@ package setup
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/tailscale"
@@ -38,6 +43,15 @@ type DiscoveredMachine struct {
 	Role          Role   // coordinator or agent
 	IsReachable   bool   // Whether we can connect
 	IsLocal       bool   // Whether this is the local machine
+}
+
+// endpointName is the machine's name in the agent config: its WezTerm domain,
+// which Tailscale matching does not rename, or the --host name.
+func (m *DiscoveredMachine) endpointName() string {
+	if m.WezTermDomain != "" {
+		return m.WezTermDomain
+	}
+	return m.Name
 }
 
 // MachineOverride provides manual address/config overrides for a machine.
@@ -78,6 +92,11 @@ type Options struct {
 	// Remotes limits setup to these domain names. Empty means all.
 	Remotes []string
 
+	// Hosts are additional coordinator hosts, as [user@]host[:port] or a
+	// ~/.ssh/config alias. With hosts, a WezTerm config is optional (tmux
+	// users need none).
+	Hosts []string
+
 	// ManualOverrides maps WezTerm domain names to manual address/config overrides.
 	// Use this when discovery produces wrong results or for machines not on tailnet.
 	ManualOverrides map[string]MachineOverride
@@ -85,8 +104,23 @@ type Options struct {
 	// DryRun shows what would be done without making changes.
 	DryRun bool
 
+	// AgentConfigPath is where the local agent config is written.
+	// Defaults to agent.DefaultConfigPath().
+	AgentConfigPath string
+
+	// RotateTokens issues new coordinator tokens instead of keeping the
+	// tokens already recorded for redeployed hosts.
+	RotateTokens bool
+
 	// Logger for structured logging.
 	Logger *slog.Logger
+}
+
+func (o *Orchestrator) agentConfigPath() string {
+	if o.opts.AgentConfigPath != "" {
+		return o.opts.AgentConfigPath
+	}
+	return agent.DefaultConfigPath()
 }
 
 // DefaultOptions returns the default setup options.
@@ -118,6 +152,7 @@ type ScriptOptions struct {
 	LocalPort     int
 	RemotePort    int
 	Remotes       []string
+	Hosts         []string
 }
 
 // NewOrchestrator creates a new setup orchestrator.
@@ -135,29 +170,34 @@ func NewOrchestrator(opts Options) *Orchestrator {
 func (o *Orchestrator) Discover(ctx context.Context) error {
 	o.logger.Info("discovering machines...")
 
-	// Find WezTerm config
+	// Find WezTerm config. It is optional when hosts are given explicitly.
+	hostsOnly := len(o.opts.Hosts) > 0
 	configPath := o.opts.WezTermConfig
 	if configPath == "" {
 		configPath = wezterm.FindConfigPath()
-		if configPath == "" {
-			return fmt.Errorf("WezTerm config not found; specify path with --wezterm-config or create ~/.wezterm.lua")
+	}
+	o.weztermConfig = &wezterm.Config{}
+	switch {
+	case configPath == "" && !hostsOnly:
+		return fmt.Errorf("WezTerm config not found; name coordinator hosts with --host (tmux users need no WezTerm), or point to wezterm.lua with --wezterm-config")
+	case configPath != "":
+		o.logger.Info("parsing WezTerm config", "path", configPath)
+		cfg, err := wezterm.ParseConfig(configPath)
+		switch {
+		case err == nil:
+			o.weztermConfig = cfg
+		case hostsOnly:
+			o.addWarning("", "WEZTERM_CONFIG_ERROR", fmt.Sprintf("ignoring WezTerm config %s: %v", configPath, err))
+		default:
+			return fmt.Errorf("failed to parse WezTerm config: %w", err)
 		}
 	}
 
-	o.logger.Info("parsing WezTerm config", "path", configPath)
-
-	// Parse WezTerm config
-	cfg, err := wezterm.ParseConfig(configPath)
-	if err != nil {
-		return fmt.Errorf("failed to parse WezTerm config: %w", err)
-	}
-	o.weztermConfig = cfg
-
-	if len(cfg.SSHDomains) == 0 {
-		return fmt.Errorf("no SSH domains found in WezTerm config; add ssh_domains entries to your WezTerm config file")
+	if len(o.weztermConfig.SSHDomains) == 0 && !hostsOnly {
+		return fmt.Errorf("no SSH domains found in WezTerm config; add ssh_domains entries or name coordinator hosts with --host")
 	}
 
-	o.logger.Info("found SSH domains", "count", len(cfg.SSHDomains))
+	o.logger.Info("found SSH domains", "count", len(o.weztermConfig.SSHDomains), "hosts", len(o.opts.Hosts))
 
 	// Check Tailscale availability
 	if o.opts.UseTailscale {
@@ -338,8 +378,87 @@ func (o *Orchestrator) discoverRemotes(ctx context.Context) error {
 			"user", machine.Username)
 	}
 
+	hostMachines, err := hostsToMachines(o.opts.Hosts, sshConfigHosts())
+	if err != nil {
+		return err
+	}
+	for _, m := range hostMachines {
+		duplicate := false
+		for _, existing := range machines {
+			if strings.EqualFold(existing.endpointName(), m.Name) || strings.EqualFold(existing.Name, m.Name) {
+				duplicate = true
+			}
+		}
+		if duplicate {
+			o.addWarning(m.Name, "DUPLICATE_HOST", "named by --host and by a WezTerm domain; using the WezTerm domain")
+			continue
+		}
+		machines = append(machines, m)
+		o.logger.Info("remote from --host", "name", m.Name, "address", m.PublicIP, "user", m.Username, "port", m.Port)
+	}
+
 	o.remoteMachines = machines
 	return nil
+}
+
+// sshConfigHosts returns the hosts in ~/.ssh/config by alias, so --host can
+// name them the way ssh does.
+func sshConfigHosts() map[string]*sync.Machine {
+	hosts := map[string]*sync.Machine{}
+	machines, err := sync.DiscoverFromSSHConfig()
+	if err != nil {
+		return hosts
+	}
+	for _, m := range machines {
+		hosts[strings.ToLower(m.Name)] = m
+	}
+	return hosts
+}
+
+// hostsToMachines turns --host specs ([user@]host[:port], or an alias from
+// ~/.ssh/config, whose HostName, User, Port and IdentityFile apply unless
+// the spec sets user or port) into coordinator machines.
+func hostsToMachines(specs []string, sshConfig map[string]*sync.Machine) ([]*DiscoveredMachine, error) {
+	var machines []*DiscoveredMachine
+	for _, spec := range specs {
+		spec = strings.TrimSpace(spec)
+		if spec == "" {
+			continue
+		}
+		user, hostPort, hasUser := strings.Cut(spec, "@")
+		if !hasUser {
+			user, hostPort = "", spec
+		}
+		host, port := hostPort, 0
+		if h, p, err := net.SplitHostPort(hostPort); err == nil {
+			n, err := strconv.Atoi(p)
+			if err != nil || n <= 0 || n > 65535 {
+				return nil, fmt.Errorf("--host %q: invalid port %q", spec, p)
+			}
+			host, port = h, n
+		}
+		host = strings.Trim(host, "[]")
+		if host == "" || strings.ContainsAny(host, " /") {
+			return nil, fmt.Errorf("--host %q: expected [user@]host[:port]", spec)
+		}
+
+		m := &DiscoveredMachine{Name: host, PublicIP: host, Username: user, Port: port, Role: RoleCoordinator}
+		if alias, ok := sshConfig[strings.ToLower(host)]; ok {
+			m.PublicIP = alias.Address
+			if m.Username == "" {
+				m.Username = alias.SSHUser
+			}
+			if m.Port == 0 {
+				m.Port = alias.Port
+			}
+			m.IdentityFile = alias.SSHKeyPath
+		}
+		if m.Port == 0 {
+			m.Port = 22
+		}
+		machines = append(machines, m)
+	}
+	return machines, nil
 }
 
 // addWarning adds a discovery warning.
@@ -419,32 +538,31 @@ func (o *Orchestrator) BuildSetupScript(opts ScriptOptions) (string, error) {
 		b.WriteString(" --remotes ")
 		b.WriteString(shellQuote(strings.Join(opts.Remotes, ",")))
 	}
+	for _, host := range opts.Hosts {
+		b.WriteString(" --host ")
+		b.WriteString(shellQuote(host))
+	}
 	b.WriteString("\n\n")
 
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		configDir = filepath.Join(os.Getenv("HOME"), ".config")
-	}
-	configPath := filepath.Join(configDir, "caam", "distributed-agent.json")
+	configPath := o.agentConfigPath()
 
 	b.WriteString("# 2) Inspect and edit the local agent config\n")
 	b.WriteString(fmt.Sprintf("CONFIG_PATH=%s\n", shellQuote(configPath)))
-	b.WriteString("echo \"Edit $CONFIG_PATH to set chrome_profile and accounts\"\n\n")
+	b.WriteString("echo \"Sign in to the agent's Google accounts with: caam auth-agent signin\"\n")
+	b.WriteString("echo \"Then add them to the rotation: caam auth-agent accounts add --config $CONFIG_PATH <email>...\"\n\n")
 
 	b.WriteString("# 3) Check coordinator service status on remotes\n")
 	for _, m := range o.remoteMachines {
 		sshCmd := buildSSHCommand(m, opts)
-		b.WriteString(fmt.Sprintf("%s -- %s\n", sshCmd, shellQuote("systemctl --user status caam-coordinator --no-pager")))
+		b.WriteString(fmt.Sprintf("%s -- %s\n", sshCmd, shellQuote("systemctl --user status "+deploy.CoordinatorServiceName+" --no-pager")))
 	}
 	b.WriteString("\n")
 
-	b.WriteString("# 4) Smoke test coordinator status endpoints\n")
+	// The API listens on remote loopback with a token, so query it on the host.
+	b.WriteString("# 4) Smoke test the authenticated coordinator API on each remote\n")
 	for _, m := range o.remoteMachines {
-		addr := m.PublicIP
-		if opts.UseTailscale && m.TailscaleIP != "" {
-			addr = m.TailscaleIP
-		}
-		b.WriteString(fmt.Sprintf("curl -fsS http://%s:%d/status\n", addr, opts.RemotePort))
+		sshCmd := buildSSHCommand(m, opts)
+		b.WriteString(fmt.Sprintf("%s -- %s\n", sshCmd, shellQuote(`PATH="$HOME/.local/bin:$HOME/bin:$PATH" caam auth-coordinator status`)))
 	}
 	b.WriteString("\n")
 	b.WriteString("# 5) Start the local auth agent\n")
@@ -505,13 +623,17 @@ type SetupResult struct {
 	Errors            []error
 }
 
-// Setup performs the full setup process.
+// Setup performs the full setup process: each remote gets a coordinator with
+// its own API token, and every successfully verified coordinator is recorded
+// in the local agent config with that token and an SSH tunnel endpoint.
 func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress)) (*SetupResult, error) {
 	result := &SetupResult{}
 
 	if len(o.remoteMachines) == 0 {
 		return nil, fmt.Errorf("no remote machines to setup")
 	}
+
+	var endpoints []*agent.CoordinatorEndpoint
 
 	// Deploy coordinators to remote machines
 	for _, machine := range o.remoteMachines {
@@ -529,6 +651,7 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 			o.logger.Info("[dry-run] would deploy coordinator",
 				"machine", machine.Name,
 				"address", o.getAddress(machine))
+			endpoints = append(endpoints, o.coordinatorEndpoint(machine, dryRunTokenPlaceholder))
 			p.Status = "success"
 			p.Message = "dry-run: skipped"
 			p.Finished = time.Now()
@@ -538,7 +661,11 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 			continue
 		}
 
-		deployResult, err := o.deployCoordinator(ctx, machine)
+		token, err := o.coordinatorToken(machine)
+		if err != nil {
+			return nil, err
+		}
+		deployResult, err := o.deployCoordinator(ctx, machine, token)
 		if err != nil {
 			p.Status = "failed"
 			p.Message = err.Error()
@@ -548,8 +675,9 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 				"error", err)
 		} else {
 			p.Status = "success"
-			p.Message = "deployed successfully"
+			p.Message = "deployed and verified"
 			o.logger.Info("deployment succeeded", "machine", machine.Name)
+			endpoints = append(endpoints, o.coordinatorEndpoint(machine, token))
 		}
 		p.Finished = time.Now()
 
@@ -562,8 +690,12 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 		}
 	}
 
-	// Generate local agent config
-	localConfigPath, err := o.generateLocalConfig()
+	// Record verified coordinators in the local agent config. A failed
+	// deployment keeps whatever entry that host already had.
+	if len(endpoints) == 0 {
+		return result, nil
+	}
+	localConfigPath, err := o.generateLocalConfig(endpoints)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Errorf("local config: %w", err))
 	} else {
@@ -573,8 +705,54 @@ func (o *Orchestrator) Setup(ctx context.Context, progress func(*SetupProgress))
 	return result, nil
 }
 
+// dryRunTokenPlaceholder stands in for tokens that a real run generates.
+const dryRunTokenPlaceholder = "<generated during setup>"
+
+// coordinatorToken returns the API token to deploy for a machine. Re-running
+// setup keeps a host's existing token, so a running auth-agent service keeps
+// working after coordinators are redeployed; RotateTokens forces new ones.
+func (o *Orchestrator) coordinatorToken(m *DiscoveredMachine) (string, error) {
+	if !o.opts.RotateTokens {
+		if existing, err := agent.LoadFileConfig(o.agentConfigPath()); err == nil {
+			for _, c := range existing.Coordinators {
+				if c != nil && strings.EqualFold(c.Name, m.endpointName()) && len(c.Token) >= 32 {
+					return c.Token, nil
+				}
+			}
+		}
+	}
+	return generateToken()
+}
+
+// generateToken returns a random coordinator API token.
+func generateToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate coordinator token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// coordinatorEndpoint describes how the local agent reaches a deployed
+// coordinator: over its own SSH connection to the host the deployment used,
+// to the loopback-only API, authenticated with the host's token.
+func (o *Orchestrator) coordinatorEndpoint(m *DiscoveredMachine, token string) *agent.CoordinatorEndpoint {
+	return &agent.CoordinatorEndpoint{
+		Name:        m.endpointName(),
+		URL:         "http://" + coordinator.ListenAddress(coordinator.DefaultBindAddress, o.opts.RemotePort),
+		DisplayName: m.Name,
+		Token:       token,
+		SSH: &agent.SSHTunnel{
+			Host:         o.getAddress(m),
+			Port:         m.Port,
+			User:         m.Username,
+			IdentityFile: m.IdentityFile,
+		},
+	}
+}
+
 // deployCoordinator deploys a coordinator to a remote machine.
-func (o *Orchestrator) deployCoordinator(ctx context.Context, m *DiscoveredMachine) (*deploy.DeployResult, error) {
+func (o *Orchestrator) deployCoordinator(ctx context.Context, m *DiscoveredMachine, token string) (*deploy.DeployResult, error) {
 	syncMachine := o.toSyncMachine(m)
 
 	deployer := deploy.NewDeployer(syncMachine, o.logger)
@@ -585,97 +763,109 @@ func (o *Orchestrator) deployCoordinator(ctx context.Context, m *DiscoveredMachi
 
 	config := deploy.DefaultCoordinatorConfig()
 	config.Port = o.opts.RemotePort
+	config.AuthToken = token
 
 	return deployer.DeployCoordinator(ctx, config)
 }
 
-// generateLocalConfig generates the local agent configuration.
-func (o *Orchestrator) generateLocalConfig() (string, error) {
-	// Build coordinator endpoints
-	var coordinators []*agent.CoordinatorEndpoint
-	for _, m := range o.remoteMachines {
-		addr := o.getAddress(m)
-		coordinators = append(coordinators, &agent.CoordinatorEndpoint{
-			Name:        m.WezTermDomain,
-			URL:         fmt.Sprintf("http://%s:%d", addr, o.opts.RemotePort),
-			DisplayName: m.Name,
-		})
-	}
+// generateLocalConfig merges coordinator endpoints into the local agent
+// config. Endpoints replace existing entries with the same name; other
+// coordinators and user settings (accounts, Chrome profile, strategy) are
+// preserved.
+func (o *Orchestrator) generateLocalConfig(endpoints []*agent.CoordinatorEndpoint) (string, error) {
+	configPath := o.agentConfigPath()
 
-	config := struct {
-		Port          int                          `json:"port"`
-		Coordinators  []*agent.CoordinatorEndpoint `json:"coordinators"`
-		PollInterval  string                       `json:"poll_interval"`
-		Accounts      []string                     `json:"accounts"`
-		Strategy      string                       `json:"strategy"`
-		ChromeProfile string                       `json:"chrome_profile"`
-	}{
-		Port:          o.opts.LocalPort,
-		Coordinators:  coordinators,
-		PollInterval:  "2s",
-		Accounts:      []string{},
-		Strategy:      "lru",
-		ChromeProfile: "",
+	fc := agent.FileConfig{
+		Port:         o.opts.LocalPort,
+		PollInterval: "2s",
+		Strategy:     "lru",
+		Accounts:     []string{},
 	}
-
-	data, err := json.MarshalIndent(config, "", "  ")
-	if err != nil {
-		return "", err
+	existing, err := agent.LoadFileConfig(configPath)
+	switch {
+	case err == nil:
+		fc = existing
+		if fc.Port == 0 || (o.opts.LocalPort != 0 && o.opts.LocalPort != DefaultOptions().LocalPort) {
+			fc.Port = o.opts.LocalPort
+		}
+		if fc.Accounts == nil {
+			fc.Accounts = []string{}
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		// Never clobber a config we cannot read; the user may have edited it.
+		return "", fmt.Errorf("existing agent config %s: %w", configPath, err)
 	}
-
-	// Determine config path
-	configDir, err := os.UserConfigDir()
-	if err != nil {
-		configDir = filepath.Join(os.Getenv("HOME"), ".config")
-	}
-
-	configPath := filepath.Join(configDir, "caam", "distributed-agent.json")
+	fc.Coordinators = mergeEndpoints(fc.Coordinators, endpoints)
 
 	if o.opts.DryRun {
 		o.logger.Info("[dry-run] would write local agent config",
 			"path", configPath)
+		data, err := json.MarshalIndent(redactedAgentConfig(fc), "", "  ")
+		if err != nil {
+			return "", err
+		}
 		fmt.Println("--- distributed-agent.json ---")
 		fmt.Println(string(data))
 		fmt.Println("---")
 		return configPath, nil
 	}
 
-	// Create directory
-	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
+	if err := agent.WriteFileConfig(configPath, fc); err != nil {
 		return "", err
 	}
 
-	// Atomic write: write to temp file, sync, then rename
-	tmpPath := configPath + ".tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-	if err != nil {
-		return "", fmt.Errorf("create temp config file: %w", err)
-	}
-
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("write temp config file: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("sync temp config file: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("close temp config file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("rename temp config file: %w", err)
-	}
-
-	o.logger.Info("wrote local agent config", "path", configPath)
+	o.logger.Info("wrote local agent config", "path", configPath, "coordinators", len(fc.Coordinators))
 	return configPath, nil
+}
+
+// mergeEndpoints replaces existing coordinators by name and appends new ones.
+func mergeEndpoints(existing, updates []*agent.CoordinatorEndpoint) []*agent.CoordinatorEndpoint {
+	merged := make([]*agent.CoordinatorEndpoint, 0, len(existing)+len(updates))
+	replaced := make(map[string]bool, len(updates))
+	for _, cur := range existing {
+		if cur == nil {
+			continue
+		}
+		replacement := cur
+		for _, u := range updates {
+			if strings.EqualFold(u.Name, cur.Name) {
+				replacement = u
+				replaced[strings.ToLower(u.Name)] = true
+				break
+			}
+		}
+		merged = append(merged, replacement)
+	}
+	for _, u := range updates {
+		if !replaced[strings.ToLower(u.Name)] {
+			merged = append(merged, u)
+		}
+	}
+	return merged
+}
+
+// redactedAgentConfig hides coordinator tokens for display.
+func redactedAgentConfig(fc agent.FileConfig) agent.FileConfig {
+	shown := fc
+	shown.CoordinatorToken = redactToken(fc.CoordinatorToken)
+	shown.Coordinators = make([]*agent.CoordinatorEndpoint, 0, len(fc.Coordinators))
+	for _, c := range fc.Coordinators {
+		shown.Coordinators = append(shown.Coordinators, &agent.CoordinatorEndpoint{
+			Name:        c.Name,
+			URL:         c.URL,
+			DisplayName: c.DisplayName,
+			Token:       redactToken(c.Token),
+			SSH:         c.SSH,
+		})
+	}
+	return shown
+}
+
+func redactToken(token string) string {
+	if token == "" || token == dryRunTokenPlaceholder {
+		return token
+	}
+	return "[REDACTED]"
 }
 
 // getAddress returns the best address to use for a machine.
@@ -706,7 +896,11 @@ func (o *Orchestrator) PrintDiscoveryResults() {
 
 	fmt.Printf("\nRemote Machines (%d):\n", len(o.remoteMachines))
 	for _, m := range o.remoteMachines {
-		fmt.Printf("\n  %s (%s):\n", m.Name, m.WezTermDomain)
+		source := "--host"
+		if m.WezTermDomain != "" {
+			source = "WezTerm domain " + m.WezTermDomain
+		}
+		fmt.Printf("\n  %s (%s):\n", m.Name, source)
 		fmt.Printf("    Public IP: %s\n", m.PublicIP)
 		if m.TailscaleIP != "" {
 			fmt.Printf("    Tailscale IP: %s (preferred)\n", m.TailscaleIP)

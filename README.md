@@ -38,6 +38,66 @@ caam status --json
 caam activate claude alice@gmail.com --json
 ```
 
+The `robot` commands emit JSON without a `--json` flag:
+
+```bash
+caam robot validate claude work        # Check saved credentials locally
+caam robot limits claude --model opus  # Read measured quotas for saved profiles
+caam robot precheck claude             # Plan from usable credentials and measured quota
+caam robot precheck claude --no-fetch  # Explicit credential/cooldown-only advice
+caam robot act activate claude work    # Install the selected credentials
+caam robot act refresh codex work      # Refresh through CAAM when supported
+caam robot docs                        # Every command and flag, exit/error codes, JSON Schemas
+caam robot docs schemas ls             # JSON Schema of 'caam ls --json'
+```
+
+`caam robot docs` is generated from the running binary (commands, flags,
+examples, robot error codes, and JSON Schemas for robot outputs and
+`status`/`ls`/`activate --json`), with `version` and `schema_version`.
+
+`validate` and `robot validate` share the same passive assessment. A Claude
+snapshot containing only account labels or ordinary settings is invalid;
+missing, incomplete, null, or malformed credentials cannot become valid merely
+because their expiry is unknown. Activation checks the snapshot before changing
+live credentials or settings. Genuine opaque credentials can have unknown expiry,
+and an expired access token remains eligible when its credential is renewable
+and has not been rejected by the provider.
+
+Robot `next` and `precheck` exclude unusable credentials and system snapshots.
+`--include-cooldown` only relaxes the cooldown filter. An unnamed robot backup
+creates an `_backup_*` snapshot without replacing a matching named account as
+the active profile. A failed validation or a precheck with no usable account
+returns `success: false` and a nonzero exit status.
+
+Robot `limits` and default `precheck` fetch quotas for the selected vault's
+saved profiles. Both accept `--model` and a positive `--timeout` (default
+`30s`); omitting the model conservatively includes every scoped restriction.
+Precheck recommendations require available measured quota as well as usable
+credentials. Failed reads, unsupported providers, and exhausted general or
+applicable model quotas stay blocked. `--no-fetch` explicitly skips quota
+checks and reports `quota_checked: false`; it does not read a quota cache.
+
+Robot quota rows distinguish `quota_known` from `quota_available`. Numeric
+`primary_percent`, `secondary_percent`, and `binding_percent` are present only
+for usable measurements, including real zero usage. A weekly-only account
+therefore has no `primary_percent`. The nested `usage` object preserves quota
+details and diagnostics. `availability_score` is a ranking score, not a
+remaining-quota percentage; consumers must check the quota flags. When no
+profile can be measured, `robot limits` returns `QUOTA_UNAVAILABLE` with its
+diagnostic rows. Measured exhausted accounts are still valid limits results.
+
+`robot limits --forecast` keeps forecast failure separate from quota failure.
+Without an attributable percentage burn rate, it reports `forecast_error`
+and omits depletion timing; shared machine logs cannot supply a saved account's
+rate. `resets_in` is informational and does not promise that all restrictions
+will lift then. Refresh measurements before making a later selection.
+
+Passive validation does not prove provider acceptance. `--active` explicitly
+fails for saved vault profiles. Robot refresh reports `REFRESH_UNSUPPORTED`
+when renewal belongs to the native CLI or requires a new login, and
+`REFRESH_SKIPPED` when a stale snapshot cannot safely be refreshed. Neither
+outcome claims that credentials were renewed.
+
 ---
 
 ## The Problem
@@ -151,9 +211,9 @@ Passthrough symlinks (and the Claude asset links) are refreshed on every `caam e
 
 ### 3. Shallow Profiles (Concurrent Multi-Account Multiplexing)
 
-A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel agent sessions across N accounts on the same machine.
+A "shallow" `$HOME` per identity: provider authentication files stay private while development tools and shared resources are linked back to your real `~/`. On macOS, Claude profiles also keep `Library` private to exclude Keychains. Designed for orchestrators that fan N parallel agent sessions across N accounts on the same machine.
 
-**Supported providers:** `claude`, `codex`, and `agy` (Antigravity). Each provider keeps only *its own* identity files real and private; everything else symlinks back to your real `~/`. The provider is inferred from `--from-vault <tool>/<profile>`, or set explicitly with `--tool claude|codex|agy` (defaults to `claude`). On spawn, caam repoints `HOME` at the shallow profile and pins the provider's home var (`CODEX_HOME` / `GEMINI_HOME`) so a stray inherited value can't pull the real identity back in.
+**Supported providers:** `claude`, `codex`, and `agy` (Antigravity). Each provider keeps its own identity files real and private, using the layouts below. The provider is inferred from `--from-vault <tool>/<profile>`, or set explicitly with `--tool claude|codex|agy` (defaults to `claude`). On spawn, caam repoints `HOME` at the shallow profile and pins the provider's home var (`CODEX_HOME` / `GEMINI_HOME`) so a stray inherited value can't pull the real identity back in.
 
 **Daily flow.** Day to day this is the whole loop:
 
@@ -195,17 +255,39 @@ Layout under `~/orch-homes/<name>/` — **claude** (the `codex` and `agy` real-f
 |------|------------------|-----|
 | `.claude/.credentials.json` | **real file** | The whole point: per-identity OAuth token. |
 | `.claude/.credentials.lock` | **real file** | Per-identity flock target so two sessions don't serialize on a shared lock. |
+| `.claude/.caam-identity.json`, `.claude/meta.json` | **private when present** | Cached account and organization proof is bound to the exact access and refresh tokens. Neither metadata filename is inherited from the real HOME, including when the profile has no proof yet. |
+| `.claude/auth.json`, `.claude/.claude.json` | **private when present** | Alternate authentication and nested account state must belong to the profile. Host copies are never linked into new profiles. |
+| `.claude/settings.json` | **real file** | Workflow policy is refreshed from the canonical user settings; API-key helpers and credential environment remain private to this account. Existing links to the user's settings are converted to private files before launch. |
 | `.claude.json` | **real file** | Claude Code rewrites this on every run (it holds the login identity); a symlink would mutate the user's real settings under the shallow identity. Seeded from your real `~/.claude.json` minus the account-bound keys (`oauthAccount`, usage/entitlement caches), and the shared preference keys (theme, editor mode, notification channel, user/project `mcpServers`, project trust and `allowedTools`) are refreshed from the real file on every `shallow-spawn` — the main lane is the source of truth for configuration; pass `--no-sync-config` to keep a profile's own values. |
 | `.claude/projects/`, `.claude/todos/`, `.claude/shell-snapshots/` | symlink → `~/.claude/...` | Conversation history is shared. |
+| `Library/` (macOS only) | **real directory** | Shares non-Keychain children of `~/Library`; `Library/Keychains` is excluded so Claude Code's HOME-based lookup does not select the host login Keychain. |
 | `.bashrc`, `.zshrc`, `.gitconfig`, `.ssh/`, `.cargo/`, `.bun/`, `.config/`, `.docker/`, ... | symlink → `~/...` | Dev tooling, shell, git, ssh — all pass through. |
 
 Per-provider real (private) files — everything else under the provider's home is symlinked through, so non-auth state (sessions, history, caches) stays shared:
 
 | Provider | Real / private files | Spawn pins |
 |----------|----------------------|------------|
-| `claude` | `.claude/.credentials.json`, `.claude/.credentials.lock`, `.claude.json` | scrubs `CLAUDE_CONFIG_DIR` |
+| `claude` | `.claude/.credentials.json`, `.claude/.credentials.lock`, `.claude/settings.json`, `.claude.json`; optional `.claude/.caam-identity.json`, `.claude/meta.json`, `.claude/auth.json`, `.claude/.claude.json` | (none; `$HOME/.claude` is the config dir) |
 | `codex`  | `.codex/auth.json`, `.codex/config.toml` (file credential store enforced; shared tables refreshed from your real config on every spawn, hook/project/notice state kept private) | `CODEX_HOME=<profile>/.codex` |
 | `agy`    | `.gemini/antigravity-cli/antigravity-oauth-token` (+ optional `.gemini/google_accounts.json`, `.gemini/oauth_creds.json`, `.gemini/antigravity-cli/settings.json`) | `GEMINI_HOME=<profile>/.gemini` |
+
+Every shallow spawn, whatever its provider, scrubs every inherited provider-home override (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_HOME`) plus `CAAM_HOME`/`XDG_DATA_HOME` before applying its own pins, so a shallow session started from inside another shallow session cannot inherit the outer profile's identity (issue #106).
+
+Claude creation preserves a cached provider proof from `--from-vault` or
+`--from-file` only when it matches the exact copied token pair. This works
+offline, including for expired access tokens with a previously verified proof.
+The copied `.claude.json` account label is derived from that proof; unverified
+labels are omitted while unrelated settings remain intact. If saved vault
+metadata identifies a different token generation, creation refuses the copy:
+use `caam verify identity claude <profile> --repair` to verify the saved owner.
+
+Normal spawn repairs recognized older links to host identity caches and nested
+state before launching, including with `--no-sync-config`. A cached proof is
+retained only if it matches the profile's private credentials. An inherited
+`auth.json` alias is removed from the profile without changing the host file;
+existing private alternate credentials remain untouched. Links to unrecognized
+locations fail closed. `--print-env` refuses these unsafe layouts without
+repairing them.
 
 **Smart fallback:** if a candidate (e.g. `~/.cargo`) doesn't exist in your real `~/`, no symlink is created — no broken links for users who don't have a given tool installed.
 
@@ -222,8 +304,8 @@ caam shallow-spawn <name>                     # open the profile's own provider 
 caam shallow-spawn <name> --create            # first run of a NEW identity: provision an empty profile, then start it
 caam shallow-spawn <name> --create --tool codex   # ...with a codex layout instead of claude
 caam shallow-spawn <name> -- <cmd> [args...]  # or run any other command under the profile
-caam shallow-spawn <name> --print-env         # print HOME=... (and CODEX_HOME/GEMINI_HOME) without exec
-                                              # strict dry run: never creates a missing profile, never guards
+caam shallow-spawn <name> --print-env         # shell unset/export commands, including credential removals
+caam shallow-spawn <name> --print-env --json  # data-only set/unset object for wrappers
 caam shallow-spawn <name> --allow-agent-view -- claude   # keep Claude Code Agent View enabled (see note below)
 caam shallow-spawn <name> --no-sync-config    # don't refresh shared config from your real HOME before starting
 caam shallow-profile sync-config <name>       # ...or reconcile it on demand (--all for every profile)
@@ -231,6 +313,140 @@ caam shallow-spawn <name> --effort xhigh -- codex ...    # codex only: injects `
 ```
 
 The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests).
+
+#### Exporting a shallow environment
+
+`--print-env` emits safely quoted POSIX `unset` and `export` commands. It removes
+the same conflicting ambient credentials and home/vault overrides as a direct
+shallow launch before setting the selected profile's paths. Wrappers that parsed
+the old assignment-only output should use `--print-env --json` and apply **both**
+the `unset` list and the `set` map. Shell output targets POSIX shells; wrappers
+for other shells should use JSON.
+
+To keep a shell export scoped to one session, evaluate it inside a subshell and
+check success before launching the provider:
+
+```bash
+(
+  env_script=$(caam shallow-spawn alice --print-env) &&
+    eval "$env_script" &&
+    claude
+)
+```
+
+Export is read-only: it does not create or repair profiles, refresh shared
+policy, migrate CAAM stores, run token-health checks, or start a child.
+Claude settings, identity metadata, and alternate auth documents must already
+be valid private files; unsafe links
+or malformed documents are refused before any environment is printed. Run
+`caam shallow-spawn alice -- true` with the same base override to perform normal
+preparation, resolving any reported configuration errors before exporting.
+Missing private settings remain absent. On errors, shell output contains a
+failing `false` command; JSON mode leaves stdout empty and returns an error.
+Explicit setup-token input cannot be combined with environment export.
+
+#### One-launch Claude setup tokens
+
+Shallow launches remove inherited `CLAUDE_CODE_OAUTH_TOKEN` and
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR` values. An ambient credential must
+never silently replace the selected profile's identity. To deliberately use a
+`claude setup-token` credential for one launch, pass it through a dedicated
+inherited read descriptor with `--claude-oauth-token-fd N` (issue #131).
+
+For example, in **Bash**, replace `read-claude-setup-token` below with your
+existing secret-manager command. That command must write only the raw token
+to stdout, optionally followed by one newline, and then close stdout:
+
+```bash
+caam shallow-profile create seat-01 --tool claude   # once, if it does not exist
+caam shallow-spawn seat-01 --claude-oauth-token-fd 3 -- claude \
+  3< <(read-claude-setup-token)
+```
+
+The process substitution supplies an anonymous pipe; stdin remains available
+to Claude. The flag takes a **descriptor number, never the token itself**.
+Place it before `--`. A launcher written in Go can pass a pipe as
+`exec.Cmd.ExtraFiles[0]` and select descriptor `3`; a Python launcher can use
+`subprocess`'s `pass_fds` with its read descriptor. Do not concurrently read
+from or reuse that descriptor. CAAM temporarily makes a pipe nonblocking,
+restores its original status flags, and closes its copy before executing the
+child. The producer must finish within five seconds of the read starting.
+
+CAAM accepts one nonempty token of at most 16 KiB, with an optional terminal
+LF or CRLF. It rejects whitespace, control characters, additional lines,
+closed or unreadable descriptors, devices, directories, and descriptors
+`0`, `1`, and `2`. Errors never include token contents. Passing a descriptor
+to an existing regular file is supported, but the pipe example avoids
+creating a credential file.
+
+The override requires **both a Claude shallow profile and a direct `claude`
+command**, including an absolute path whose basename is `claude`. Omitting
+the command uses the profile's default Claude executable. Shell wrappers,
+`env` wrappers, other providers, and `--print-env` with this flag are refused
+before reading the credential. An explicitly authorized token is placed in
+that child's `CLAUDE_CODE_OAUTH_TOKEN`; CAAM never stores it in profile
+metadata, settings, or the vault, and never adds it to arguments or prints
+it. The next launch again uses the profile's stored identity unless it
+receives its own explicit descriptor. Every nested shallow launch, including
+Codex and agy, removes the outer launch's Claude OAuth token and descriptor
+variable.
+
+The token is still a credential in Claude's process environment and is
+available to its descendants in the normal way. This feature controls
+CAAM's credential selection; it does not sandbox the selected executable or
+prevent that executable from using or recording a credential it receives.
+
+This input is supported on **Unix systems, including Linux and macOS**.
+Native Windows uses handles rather than inherited Unix descriptor numbers,
+so CAAM rejects the flag there. Use the Linux build inside WSL for this
+workflow. There is no fallback to ambient credentials or a persistent token
+store.
+
+#### macOS: upgrading existing Claude shallow profiles
+
+Claude shallow profiles use a private `Library` directory on macOS, with
+non-Keychain children linked from your real HOME and `Library/Keychains`
+excluded. Older caam builds linked the entire `Library` directory, allowing
+Claude Code to select the real login Keychain instead of the profile's
+credentials.
+
+Normal `shallow-spawn` repairs that old layout before starting a child,
+including with `--no-sync-config`. It stages the complete replacement before
+moving the old symlink to `.caam-legacy-Library`, without modifying the
+symlink's target. If a private `Library` already contains a `Keychains`
+entry or an existing symlink resolving into the host Keychain, launch stops
+and the entry is left untouched. New host entries are also checked before
+they are linked into a profile: aliases into Keychains and links that cannot
+be resolved stop creation or spawn. Existing private files and directories
+keep their contents.
+
+`--print-env` remains read-only and does not repair existing profiles. It
+refuses an unsafe macOS Claude `Library` layout before printing any environment
+variables, so a wrapper cannot bypass the normal spawn guard. Safe profiles,
+including one with no `Library` directory, are left unchanged.
+After installing a build containing the fix for [issue #130](https://github.com/Dicklesworthstone/coding_agent_account_manager/issues/130),
+run this once for each existing macOS Claude profile before launching from
+its printed environment:
+
+```bash
+caam shallow-spawn <name> -- true
+```
+
+Use the same `--base` or `CAAM_SHALLOW_HOMES_DIR` override as your usual
+launcher, if you have one. Linux and other providers retain their existing
+layouts.
+
+> **macOS Keychain note (#138):** Because macOS Claude shallow profiles withhold
+> `Library/Keychains` to prevent Claude Code from reading the host login
+> Keychain, tools launched inside a shallow Claude session that rely on the
+> default macOS Keychain (`security default-keychain`, `gh` with keyring
+> storage, `git`'s `osxkeychain` credential helper, and interactive Claude
+> `/login`) have no default keychain unless your real
+> `~/Library/Preferences/com.apple.security.plist` pins absolute keychain paths.
+> Do **not** click "Reset To Defaults" if macOS prompts during `/login`. Instead,
+> seed Claude shallow credentials with
+> `caam shallow-profile create <name> --from-vault claude/<profile>`, and use
+> `GH_TOKEN` / SSH remotes for `gh` and `git` inside shallow Claude sessions.
 
 **Worked example — 3-way Claude orchestration on a VPS:**
 
@@ -294,23 +510,30 @@ and `caam shallow-profile sync-config <name> [--all]` does it on demand:
 
 | Provider | Refreshed | Never touched |
 |----------|-----------|---------------|
+| claude (`.claude/settings.json`) | Shared workflow policy, including permissions, hooks, MCP configuration and explicitly shared environment keys | Account helpers, credential environment and `profile_keys` overrides |
 | claude (`.claude.json`) | preferences (theme, editor mode, notification channel, auto-updates), user-scope `mcpServers`, per-project trust / `allowedTools` / MCP settings | `oauthAccount`, usage caches, prompt history, per-project session state |
 | codex (`.codex/config.toml`) | root settings (`model`, `model_reasoning_effort`, `personality`, `notify`, …) and whole tables: `[mcp_servers.*]`, `[features]`, `[skills]`, `[hooks]`, `[model_providers.*]` | `[hooks.state.*]` (hook trust), `[projects.*]` (workspace trust), `[notice.*]` (dismissed notices), and `auth.json` |
 
-Two rules keep it safe to run on every spawn:
+The providers preserve their respective configuration formats:
 
 - **Sections are replaced as a unit, never merged key by key.** For an MCP
   server that is the whole point: `[mcp_servers.kernel]` and its subtables are
   dropped and re-inserted together, so a stale `command`/`args` pair cannot
   survive beside a new `url`.
-- **Nothing is deleted.** A table your profile has and your real HOME does not
-  is left alone; the real side wins only where it has an opinion.
+- **Claude removals propagate.** An existing canonical document is authoritative
+  for shared policy. Removed permissions, MCP entries and project approvals are
+  removed from the profile too. A missing canonical file preserves the profile's
+  policy, and account and runtime state remain private.
+- **Codex retains profile-only tables.** A table your profile has and your real
+  HOME does not is left alone; the real side wins where it defines a setting.
 
 `cli_auth_credentials_store = "file"` is re-enforced on every codex sync, so a
-profile can never be talked into a shared keychain. The edit is a structural
-splice over the raw file rather than a parse-and-rewrite, so comments, key
-order and formatting survive and an untouched region stays byte-identical —
-and a second sync writes nothing. Pass `--no-sync-config` to skip it.
+profile can never be talked into a shared keychain. Codex uses structural edits
+that preserve comments, key order and formatting; Claude writes private JSON
+documents. A second sync writes nothing. Pass `--no-sync-config` to skip policy
+refresh. Claude settings must still be valid and private: old links to host
+settings are detached even with this flag, and preparation failures stop the
+launch. `--print-env` stays read-only.
 
 > **Claude Agent View is disabled by default in shallow sessions (issue #49).** Claude Code's Agent View feature (the `--bg` background-supervisor daemon) runs a **long-lived, cross-session** supervisor process that is **not** bound to the shallow profile's `HOME`. On resume, a shallow `claude` session would reconnect to an already-running supervisor bound to a *different* identity (typically the VM's primary Claude auth), silently bypassing shallow-spawn's per-identity auth isolation and using the wrong account. caam cannot control that daemon's lifecycle, so `caam shallow-spawn <name> -- claude` injects `CLAUDE_CODE_DISABLE_AGENT_VIEW=1` into the child environment by default. This keeps the session foreground and honoring the per-identity `~/.claude/.credentials.json`.
 >
@@ -330,7 +553,7 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 |------|--------------|---------------|
 | **Claude Code** | OAuth: `~/.claude/.credentials.json` + `~/.claude.json` + `~/.config/claude-code/auth.json` + (macOS) `~/Library/Application Support/Claude/config.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
 | **Codex CLI** | `~/.codex/auth.json` (file store enforced) | `codex login` (or `--device-auth`) |
-| **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
+| **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ (macOS) login Keychain service `gemini` / account `antigravity`, `+ ~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
 | **Grok Build** (xAI) | OAuth/OIDC: `~/.grok/auth.json` (+ `~/.grok/config.toml`); respects `GROK_HOME` | `grok login` (browser OIDC) |
 
@@ -345,14 +568,189 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 - `~/.claude/settings.json` — API key mode via `apiKeyHelper`
 - `~/Library/Application Support/Claude/config.json` — macOS: Claude Desktop's encrypted OAuth token cache (only its `oauth:tokenCache*` fields are tracked, so recent Claude Code builds can't reassert the previous account after a switch)
 
-**macOS login keychain:** on a Mac, Claude Code keeps the OAuth blob as a generic password in the login keychain (service `Claude Code-credentials`) and only falls back to `~/.claude/.credentials.json` when the keychain is unreachable. caam treats the keychain as authoritative and that file as its 0600 mirror: `backup` reads the item into the profile, `activate` writes the profile's token back into it, and `logout` removes it. A locked keychain, or a denied access prompt, fails `backup` and `activate` loudly rather than reporting a switch that did not happen. `caam doctor` reports the item's readability; `CAAM_KEYCHAIN=0` turns the bridge off and falls back to the file. Shallow profiles are unaffected — `security` derives the keychain from `HOME`, so a shallow lane has no login keychain and Claude Code uses that lane's own credentials file.
+**macOS login keychain:** on a Mac, Claude Code keeps the OAuth blob as a generic password in the login keychain (service `Claude Code-credentials`) and only falls back to `~/.claude/.credentials.json` when the keychain is unreachable. caam treats the keychain as authoritative and that file as its 0600 mirror: `backup` reads the item into the profile, `activate` writes the profile's token back into it, and `logout` removes it. A locked keychain, or a denied access prompt, fails `backup` and `activate` loudly rather than reporting a switch that did not happen. `caam doctor` reports the item's readability; `CAAM_KEYCHAIN=0` turns the bridge off and falls back to the file. On macOS, Claude shallow profiles use a private `Library` directory that excludes `Keychains`, keeping the real login Keychain out of Claude Code's HOME-based lookup. Normal `shallow-spawn` repairs older layouts; wrappers using `--print-env` need the [one-time normal spawn described above](#macos-upgrading-existing-claude-shallow-profiles).
 
 **Login Command:** Inside Claude Code, type `/login`
+
+#### Account and organization identity
+
+A personal subscription and a Team subscription can share an email address.
+CAAM distinguishes them using **both the account UUID and organization UUID**;
+emails and organization names are display labels. Give the profiles distinct
+names, for example `personal-max` and `work-team`:
+
+```bash
+caam backup claude personal-max       # after signing in to the personal org
+caam backup claude work-team          # after signing in to the Team org
+caam ls claude                        # includes ORGANIZATION name and UUID
+caam activate claude work-team
+```
+
+For an unrecognized OAuth credential, backup, activation, or keepalive can
+make a bounded request to `/api/oauth/profile` to identify the access token.
+CAAM binds that result to a fingerprint of the complete access/refresh token
+pair. Saved profiles retain the binding in `meta.json`; native credentials
+can have a private `.caam-identity.json` cache alongside them. These records
+contain identity and a fingerprint, not another copy of the tokens.
+
+An unchanged, previously verified token pair can be recognized and activated
+offline, including after restarting CAAM or after the access token expires.
+When activation keeps a newer verified live credential, it still persists
+identity bindings for both the saved and live credential generations, allowing
+offline identification after restart without replacing either token pair.
+Rotation or replacement invalidates that cached proof for the new pair.
+Verification proves recorded ownership; it does not guarantee that a token
+is currently usable or independently validate the refresh token. Listing
+profiles does not call the identity endpoint. `caam ls --json` includes
+`identity.organization_id` and, for a verified binding,
+`identity.identity_verified: true`.
+
+Inspect or repair a suspect **saved vault profile without activating it**:
+
+```bash
+caam verify identity claude work-team                  # offline cached proof
+caam verify identity claude work-team --online --json  # check this saved token
+caam verify identity claude work-team --repair         # persist proof and correct labels
+caam verify identity claude _backup_20261103 --online --copy-to recovered-team
+```
+
+Repair uses an exact cached proof when available, including for an expired
+access token; otherwise it requests provider verification. `--online` always
+requests a fresh check and reports expiry, rejection, or endpoint unavailability
+explicitly. Repair updates only the selected profile's identity metadata and
+`oauthAccount` label, preserving its credentials, other settings, operator
+description and tags. It leaves native sessions and keychains untouched. A
+token that verifies as a different recorded account or organization is reported
+as a conflict and cannot be rebound by repair. Concurrent source changes abort
+publication, and automatic recovery snapshots remain immutable, including when
+activated. Passive
+`caam validate` and `caam verify` also report broken saved identity bindings
+without calling the provider or assuming that another login is required.
+
+Legacy Claude OAuth profiles are verified automatically before activation.
+An exact saved proof can be reused offline, including after token expiry;
+otherwise the selected token must pass provider verification. Unavailable,
+expired, rejected or conflicting unverified credentials stop activation before
+the live login is changed. `--force` only overrides a cooldown, not this identity
+check. A backup can still preserve an unverified grant with its unsupported
+account label omitted, but that snapshot cannot be activated until verified.
+Overwriting a legacy named profile requires proving that both credential
+generations belong to the same account and organization.
+
+Profile names are operator labels, not proof of ownership. Activation reports
+the verified account and organization, and JSON output includes `identity`.
+Existing legacy labels appear as `[unverified]` in the organization column.
+Listing remains offline and uses exact credentials or verified UUIDs. Duplicate
+named profiles holding the same tokens are ambiguous rather than resolved by
+alphabetical order. Conflicting primary metadata, native caches or saved copies
+of the same token are refused and reported without exposing credentials.
+
+`--copy-to <new-label>` provides non-destructive recovery. It verifies the saved
+modern OAuth grant, then atomically creates a new user profile without replacing
+an existing destination. The copy contains the exact credential bytes, a clean
+verified `oauthAccount`, operator labels and source provenance. Other historical
+authentication artifacts and state stay in the original snapshot. Neither
+`--copy-to` nor `--repair` can rebind a recorded account or organization; ambiguous
+evidence must be resolved independently. In-place repair of `_original` and
+automatic recovery profiles remains prohibited. Repeated copying to the same
+destination fails rather than overwriting it.
+
+Concurrent Claude sessions can still rewrite shared files after CAAM returns.
+Such labels cannot change CAAM's token-based account selection. Activation checks
+for credential and identity changes before publication and checks the installed
+identity again before reporting success. A detected concurrent change stops the
+operation and preserves the other writer's files; stop the conflicting session
+and retry. Use isolated profiles when multiple accounts must run concurrently.
+
+The first-use `_original` snapshot and automatic recovery snapshots preserve
+the captured credential bytes. Correcting or omitting unsupported account
+labels does not replace those credentials or assert that an expired grant is
+currently usable.
+
+Participating CAAM commands use a private per-vault process lock to serialize
+managed mutations. Captured source generations are rechecked after lock waits
+and during publication, using the existing recoverable file publication path.
+Claude processes do not acquire CAAM's lock: running sessions can retain
+credentials in memory or write shared state after a switch, and CAAM does not
+retarget those processes. Use isolated or shallow profiles for
+simultaneous accounts. Distributed browser recovery currently declines
+organization-specific requests because its email-based browser configuration
+cannot reliably select a Claude organization; activate a verified profile
+explicitly instead. See [issue #132](https://github.com/Dicklesworthstone/coding_agent_account_manager/issues/132)
+and the [identity inventory](docs/CLAUDE_AUTH_INVENTORY.md#claude-001-identity-extraction-from-credentials).
+
+#### Shared workflow settings and private account settings
+
+CAAM applies the same `claude_settings` policy to vault activation, isolated
+profiles and shallow profiles. The default mode, `shared`, takes workflow
+settings from your canonical user configuration and account fields from the
+selected profile. This lets permissions, hooks, MCP entries and preferences
+follow your current workflow while API-key helpers, authentication selectors
+and credential environment remain with their account.
+
+Configure it in `$XDG_CONFIG_HOME/caam/config.json` (default
+`~/.config/caam/config.json`):
+
+```json
+{
+  "claude_settings": {
+    "mode": "shared",
+    "profile_keys": ["hooks"],
+    "shared_env_keys": ["EDITOR", "ANTHROPIC_MODEL"]
+  }
+}
+```
+
+`profile_keys` keeps named top-level settings specific to each profile.
+Environment variables are account-specific unless explicitly listed in
+`shared_env_keys`; known credential and routing variables cannot be shared.
+Use `"mode": "per-profile"` to retain each profile's entire settings document.
+The policy is validated and preserved when CAAM saves its configuration.
+
+An existing shared document is authoritative, including deletions: removing a
+rule or approval does not leave a stale copy in another profile. A missing
+shared document allows the profile's saved policy to bootstrap a new machine.
+With `CLAUDE_CONFIG_DIR` set, `settings.json` and `.claude.json` in that directory
+are canonical, even when absent; CAAM does not borrow ignored legacy settings.
+Without the override, the sources are `~/.claude/settings.json` and
+`~/.claude.json`.
+
+Isolated Claude profiles use one native configuration directory consistently
+for environment exports, imports, health checks and launch. Existing XDG
+authentication in the profile's `xdg_config/claude-code` directory takes
+precedence; a profile with only legacy authentication keeps `home/.claude`.
+New profiles use the XDG directory. A newer token in an ignored directory
+does not change the selected account. Known conflicting account IDs stop the
+operation so the operator can resolve the profile explicitly.
+
+Settings preparation is required before native execution. Invalid policy
+stops the launch; it cannot silently leave an outdated policy in effect.
+API-key enrollment merges the account's helper into its existing policy, and
+logout clears account fields while retaining workflow settings. Environment
+inspection does not prepare, migrate or refresh files:
+
+```bash
+caam env claude work                 # safely quoted shell assignments
+caam env claude work --json          # {"set": {...}, "unset": [...]}
+caam env claude work --unset --json  # {"set": {}, "unset": [...]}
+```
+
+Profile execution, native login commands, shallow sessions, and `caam env`
+clear inherited credentials that would override the selected provider's
+file-backed login. For example, a Claude OAuth profile clears an inherited
+`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`, while a Codex vault launch
+clears an inherited `OPENAI_API_KEY`. Other providers' keys remain available
+to workflow tools. Explicit API-key profile modes retain their documented
+enrollment or helper inputs; saved Codex and Gemini keys take precedence over
+ambient keys. Callers of the Go runner can also supply deliberate environment
+overrides. `caam env --json` describes removals in `unset`, and
+shell output applies them before exporting the profile paths. `--unset`
+clears those path overrides; it cannot restore earlier environment values.
 
 **Notes:** Claude Max has a 5-hour rolling usage window. When you hit it, you'll see rate limit messages. Switch accounts to continue.
 
 **Limitations:**
-- **Email/Identity Detection:** Claude's current auth format does not expose email or account ID. Profile names default to timestamp-based auto-names (`auto-YYYYMMDD-HHMMSS`) unless you specify a name when backing up.
+- **Identity without verification:** Claude OAuth tokens are opaque, and `.claude.json` can describe a different login. Account and organization matching requires a token-bound provider result or an exact credential match; unverified local labels are not ownership proof. See [account and organization identity](#account-and-organization-identity).
 - **Automatic Token Refresh:** Claude Code manages token refresh internally. CAAM cannot refresh Claude tokens—use `/login` in Claude Code if tokens expire.
 - **Usage API:** Claude's usage API is undocumented and may not be reliable.
 
@@ -382,6 +780,35 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 
 **Notes:** For CAAM, Gemini Ultra behaves like Claude Max and GPT Pro: OAuth tokens are stored locally and can be swapped instantly.
 
+### Cursor Agent
+
+CAAM reads the access JWT expiry from Cursor's `auth.json`: on Linux,
+`$XDG_CONFIG_HOME/cursor/auth.json` (default `~/.config/cursor/auth.json`);
+on macOS, `~/.cursor/auth.json`; on Windows, `%APPDATA%\Cursor\auth.json`.
+Browser/session logins cannot auto-refresh, even when `refreshToken` is
+present. CAAM warns seven days before expiry; an expired session requires a
+new login. Active profile matching uses `auth.json` when present, so changing
+models or settings does not lose the active marker.
+
+For a saved vault profile, replace the expiring login and save it again:
+
+```bash
+caam activate cursor <profile>
+cursor-agent login
+caam backup cursor <profile>
+```
+
+For an isolated profile created with `caam profile add`, use
+`caam login cursor <profile>`. That command operates on the isolated profile,
+not a vault-only profile.
+
+A stored `apiKey` lets cursor-agent re-mint its access token automatically;
+that token's deadline does not require a relogin. For unattended runs,
+`CURSOR_API_KEY` can supply the key without saving it in a config file, and
+`AGENT_CLI_CREDENTIAL_STORE=memory` keeps minted tokens off disk. CAAM's
+saved-profile health uses only that profile's stored key, never an ambient
+environment key belonging to a different account.
+
 ### Grok Build (xAI)
 
 **Auth Files:**
@@ -390,7 +817,11 @@ and a second sync writes nothing. Pass `--no-sync-config` to skip it.
 
 **Login Command:** `grok login` (browser OIDC via xAI accounts)
 
-**Notes:** Respects `GROK_HOME` (documented override for the config directory, default `~/.grok`). Grok Build tokens expire after 7 days; run `grok login` to refresh — CAAM cannot refresh them.
+**Notes:** Respects `GROK_HOME` (config directory override, default `~/.grok`).
+The native Grok CLI renews its OAuth access token when needed. Use
+`caam keepalive grok` to run that renewal path for idle live logins; CAAM does
+not replay refresh tokens from saved vault copies. A rejected or missing
+refresh credential requires `grok login` in the live home.
 
 **Caveats:**
 - **`GROK_DEPLOYMENT_KEY` precedence:** in enterprise/deployment setups this environment variable takes precedence over `auth.json`, so a swapped profile is silently ignored while it is set.
@@ -447,12 +878,13 @@ carol@gmail.com
 | `caam backup <tool> <email>` | Save current auth files to vault |
 | `caam activate <tool> <email>` | Restore auth files from vault (instant switch!) |
 | `caam status [tool]` | Show which profile is currently active |
-| `caam ls [tool]` | List all saved profiles in vault |
+| `caam ls [tool]` | List all saved profiles in vault. TYPE is `vault` or `vault+iso` (an isolated profile of the same name exists, so `caam exec` works too); isolated-only profiles are listed after the table. `--json` adds `type`, `isolated` and `isolated_only` |
 | `caam delete <tool> <email>` | Remove a saved profile |
 | `caam paths [tool]` | Show auth file locations for each tool |
 | `caam clear <tool>` | Remove auth files (logout state) |
 | `caam alias <tool> <profile> <alias>` | Create a short alias for a profile |
-| `caam rename <tool> <old> <new>` | Copy profile to a new name (non-destructive) |
+| `caam rename <tool> <old> <new>` | Copy a vault profile to a new name (non-destructive). Isolated profiles are not renamed; save an isolated Claude login to the vault with `caam backup claude <name> --from-profile <isolated>` |
+| `caam keepalive [claude\|grok\|live-profile ...]` | Renew idle native logins in their owning homes; `--dry-run`, `--json`, `--print-systemd` |
 | `caam uninstall` | Restore originals from `_original` and remove caam data/config |
 
 **Aliases:** `caam switch` is the activation alias and works like `caam activate`. Note that `caam use <provider> <profile>` is a separate command that sets the *default* profile for a provider (it does not switch active auth files).
@@ -502,8 +934,8 @@ sel=$(caam ls claude | fzf --prompt 'claude> ') && [ -n "$sel" ] && caam activat
 
 ### Smart Profile Management
 
-Claude reports a separate weekly allowance per model (Opus, Fable) alongside the
-5-hour and weekly windows, and an account can exhaust one of those while its
+Claude reports a separate weekly allowance per model (Opus, Fable) alongside its
+applicable session and weekly windows, and an account can exhaust one of those while its
 general windows still read as idle. caam treats a spent per-model allowance as a
 ceiling like any other, so such an account is not offered for work on that
 model. Pass `--model` to `caam limits` or `caam precheck` — or just run
@@ -520,6 +952,7 @@ choice; with no model given, every per-model allowance counts.
 | `caam limits <tool> [--model <name>]` | Live rate-limit usage, including each account's per-model allowance |
 | `caam limits claude --cached` | The same view offline, from the snapshot Claude Code caches on disk (no network, no token presented) |
 | `caam limits <tool> --profile <name> --source vault\|isolated\|shallow` | Read a specific credential namespace |
+| `caam limits <tool> --rank earliest-reset-headroom` | Rank seats for **new** work: spend the included quota that refreshes soonest, preserve the rest |
 | `caam cooldown set <provider/profile>` | Mark profile as rate-limited (default: 60min cooldown) |
 | `caam cooldown list` | List active cooldowns with remaining time |
 | `caam cooldown clear <provider/profile>` | Clear cooldown for a specific profile |
@@ -528,12 +961,116 @@ choice; with no model given, every per-model allowance counts.
 | `caam project show [tool]` | Show resolved associations for current directory (`get` is an alias; `--json` for machine-readable output) |
 | `caam project list` | List all project associations (`--json` supported) |
 
+#### Claude accounts without a session limit
+
+[Anthropic documents](https://support.claude.com/en/articles/17728952-what-is-the-ultra-plan)
+that verified Ultra accounts have no five-hour session limit, while weekly
+all-model and Fable limits still apply. Unverified accounts can retain a session
+limit. As of November 3, 2026, [issue #133](https://github.com/Dicklesworthstone/coding_agent_account_manager/issues/133)
+has no captured usage API response from a verified Ultra account; the exact
+representation of an inapplicable session remains unconfirmed.
+
+Both live and cached usage parsing accept an omitted or null `five_hour`
+window and skip an explicit null `utilization` or `limits[].percent`.
+Weekly and model-scoped measurements remain available. A numeric zero stays a
+real measurement even when its reset is null. CAAM does not infer unlimited
+usage from a plan name, `is_active: false`, or an absent session window.
+Missing percentage fields inside present objects, wrong JSON types, and values
+outside 0–100 still fail validation.
+
+At least one measured general session or weekly quota is required. Model-only
+data, unfamiliar measured general limits, unrecognized scopes, contradictory
+general groups, and multiple measured entries for the same general window
+produce a degraded result with an error. Known quotas and cache timestamps are
+retained for inspection, but these rows cannot supply quota-aware selection,
+`limits --best`, or `limits --rank` with evidence of headroom. A new kind with an identified model
+scope still constrains that model; its duration remains unknown. The documented
+five-hour and seven-day durations are used only for recognized windows and
+compatible groups. A reset timestamp alone never establishes a new duration.
+
+When a measured general window appears both at the top level and in `limits[]`,
+the percentages and any known reset instants must agree. A missing reset can
+be filled from the other representation. Conflicting measured values make the
+result degraded; CAAM does not assume an undocumented rounding rule or silently
+discard the more restrictive value.
+
+Every overlapping model constraint is retained, including a session and weekly
+limit with the same display name. Matching uses the provider's model identifier
+as well as its display name. JSON output adds `scoped_windows` for the complete
+collection and `model_id` when supplied; `model_windows` continues to show the
+most constrained window per display name. Quota checks and reset selection use
+the complete collection, including after a JSON round trip.
+
+`limits --best` chooses the highest-scoring usable account, including for
+cached and explicit-source reads. `--threshold` is a finite fraction from 0 to
+1 and expresses a preference: if every account is busy, the command can still
+choose a measured account above that threshold. It never falls back to an
+account exhausted in any applicable general or model quota. With no usable
+account, JSON output is `null`.
+
+`--recommend` and `--forecast` use the most constrained applicable measurement,
+including a weekly quota when no session limit is reported. Forecast JSON keeps
+`current_primary_percent` and `current_secondary_percent` numeric for measured
+windows, including real zero usage, and uses `null` for an absent window. It
+also reports applicable model usage and the binding load. Forecast consumers
+should use the informational `next_reset_in` field instead of the former
+`safe_to_use_in`: a reported reset does not prove that every overlapping limit
+will permit work then. Refresh usage before selecting an account after a reset.
+The existing recommendation JSON field `switch_in` also describes the next
+reported reset; it is not a guarantee of future availability.
+
+`caam precheck --model` uses the same applicable quotas for its alerts and
+session forecast as for profile selection. Current usage warnings do not
+require a burn rate: a measured weekly-only account at 0% or 20% still prevents
+an incorrect "all profiles low" warning. A missing measurement also prevents
+that aggregate claim without hiding known restrictions on other accounts.
+Depletion times and timed rotation advice require a usable burn rate and a
+projected limit before the reported reset. A cached depletion estimate alone
+does not establish an ETA for the requested model.
+The forecast uses the most constrained applicable window and the available
+percentage burn rate; it does not estimate separate rates for every allowance
+or promise capacity after a reset.
+
+`caam monitor` shows `?` in brief output when a quota read fails or has no usable
+general measurement. Its JSON `usage_percent` is present for real measurements,
+including numeric zero, and omitted for unknown quota; the nested `usage`
+object retains provider details and errors. Consumers should check field
+presence instead of interpreting a missing field as zero. Credit balances
+remain separate metadata and do not establish a quota percentage.
+
+#### Claude quota credentials
+
+Live quota reads for saved vault profiles use `.credentials.json` first, then
+`auth.json`, then a supported legacy `oauthToken` in `.claude.json`. A present
+primary that is malformed or has no access token is an invalid source; it does
+not permit an older login to supply another account's quota. A legacy file
+containing only account labels, cached usage, or UI state is not a credential.
+Named reads preserve selected-source errors even when a same-name isolated
+profile is healthy; `--source` explicitly chooses another namespace.
+
+Profile settings must also permit the stored subscription OAuth login. A helper,
+environment credential, API key, cloud provider, or gateway override makes its
+subscription quota unavailable, even when an OAuth cache remains. Policy-only
+settings are supported. Inspection never executes helpers or changes credentials.
+Token expiry and renewability come from the selected grant. A saved relative
+lifetime without a recorded issuance time leaves expiry unknown.
+
 #### Offline usage: `caam limits --cached`
 
 `caam limits` answers "which account still has headroom" by querying the
 provider. Claude Code also caches the figures it last received in each
 account's own `.claude.json`, and `--cached` reads those files instead: no
 request is made and no token is presented.
+
+For the active vault profile, the cache comes from
+`$CLAUDE_CONFIG_DIR/.claude.json` when that directory is explicitly configured,
+otherwise from the current HOME. A missing or malformed selected cache does
+not fall back to a different host login's state. Explicit disagreement between
+the snapshot's account UUID and account metadata in the same file degrades the
+row and excludes it from recommendations, while preserving its recorded quotas
+and timestamp for inspection. Legacy caches without account metadata remain
+supported; descriptive metadata never fills a missing snapshot identity or
+establishes verified ownership.
 
 ```bash
 caam limits claude --cached
@@ -551,13 +1088,115 @@ both:
 - a profile with nothing cached reads `no cached data`, not `0%`, and is
   excluded from `--best` and from the recommendations. An account caam knows
   nothing about is never offered as the one with room;
-- a window whose reset time had already passed when the snapshot was written
-  reads `0% (rolled)`, so a stale zero is not mistaken for a measured one.
+- a measured window whose recorded reset has passed is marked `rolled`.
+  Its projected zero remains distinguishable from a measured zero, and the
+  account is degraded and excluded from quota-based recommendations until a
+  fresh read establishes its usage. A still-current weekly measurement cannot
+  establish how much of a new session or model allowance has since been used.
 
 In `--format json` these appear as `source: "cache"`, the window-level `rolled`
 flag, and `fetched_at` set to the snapshot's own timestamp rather than the time
 caam read it. Only Claude keeps such a cache; `--cached` on another provider is
 an error rather than an empty table.
+
+#### Picking a seat for new work: `caam limits --rank`
+
+`--best` answers *"which seat is idlest"*. That is the right question when you
+are rotating away from a seat you are burning, and the wrong one when you are
+handing a seat to a brand-new session: on a pool of subscription seats the
+idlest one is usually the reserve you meant to keep, while the seat whose
+included allowance expires tomorrow goes unspent.
+
+`--rank earliest-reset-headroom` answers the second question:
+
+```bash
+caam limits codex --rank earliest-reset-headroom --format json
+caam limits claude --rank earliest-reset-headroom --model fable
+caam limits codex --rank earliest-reset-headroom --headroom 80
+```
+
+The ordering is:
+
+1. **Included allowance with headroom**, earliest refresh first — spend quota
+   that is about to be lost, and so preserve the later-resetting seats.
+2. **Paid credits** (included allowance already spent, credits remain) — usable,
+   always last.
+3. **Not eligible**: spent with no credits, limits that could not be read, no
+   future reset time to order by, or a missing model-scoped allowance.
+
+It sorts on the reset time of the **longest** allowance a seat reports — its
+weekly cap, not the five-hour window that rolls over on its own several times a
+day, which is the quota actually at risk of expiring unused. (This is where it
+differs from `--policy drain`, which ranks on the soonest applicable reset.)
+Both policies consider every window that constrains the requested model. A
+Sonnet recommendation cannot borrow an Opus reset, and a less-used weekly
+model allowance still contributes its reset even when a busier session window
+is shown as the binding limit. With no model specified, all scopes count.
+
+An ineligible seat stays in the output with the reason it was passed over, and
+when *nothing* is selectable the command exits non-zero with `selected: null`
+and a populated `error`. That matters for a caller that spawns sessions: the
+failure this mode exists to prevent is falling through to a static pin when the
+live numbers could not be read, so it never answers confidently on missing data.
+
+A named `--model` tightens this further. An account can exhaust its weekly Fable
+or Opus allowance while its general windows still read idle, so that allowance
+counts as the binding window; and if the provider did not report a row for that
+model at all, the seat is `unknown`, not spare capacity. Pass
+`--require-model-window=false` to rank it anyway.
+
+The headroom ceiling defaults to `stealth.rotation.drain_headroom_ceiling`
+(95% used if unset) — the same setting the drain policy uses, because it is the
+same concept — and `--headroom N` overrides it for one call. 95 rather than 100
+because a seat that is 99% spent has enough left to accept a session and not
+enough to finish one.
+
+`--rank availability` names the historical `--best` ordering explicitly.
+`--best` itself is unchanged.
+
+This is a **read**. It ranks; it does not activate anything, swap a credential,
+or touch a running session.
+
+<details>
+<summary>JSON shape</summary>
+
+```json
+{
+  "rank": "earliest-reset-headroom",
+  "provider": "codex",
+  "model": "",
+  "headroom_ceiling_percent": 95,
+  "require_model_window": false,
+  "generated_at": "2026-09-10T12:24:45Z",
+  "selected": { "...": "the top-ranked eligible profile, or null" },
+  "profiles": [
+    {
+      "provider": "codex",
+      "profile": "work",
+      "rank": 1,
+      "eligible": true,
+      "tier": "included_headroom",
+      "reason": "included allowance 34% used (under the 95% ceiling), secondary resets in 20h0m",
+      "used_percent": 34,
+      "binding_window": "secondary",
+      "headroom_percent": 66,
+      "governing_window": "secondary",
+      "resets_at": "2026-09-11T08:00:00Z",
+      "resets_in_seconds": 72000,
+      "availability_score": 74,
+      "has_credits": false,
+      "plan_type": "pro"
+    }
+  ],
+  "error": ""
+}
+```
+
+`tier` is one of `included_headroom`, `paid_credits`, `exhausted`, `unknown`.
+`rank` is 1-based over the eligible profiles and `0` for ineligible ones.
+`error` is non-empty exactly when `selected` is `null`.
+
+</details>
 
 #### Credential namespaces: `caam limits --profile ... --source`
 
@@ -602,8 +1241,41 @@ copied behind your back is how two lanes end up invalidating each other.
 
 **Rotation policies** (`--policy` on `caam precheck`, `caam next`, and `caam run`, or `stealth.rotation.policy` in `~/.caam/spm_config.yaml`):
 
-- `availability` (default) — maximize immediate headroom; this is the existing behavior and remains unchanged unless you opt in to another policy.
-- `drain` (opt-in) — prefer the profile whose included quota resets soonest, among profiles under a headroom ceiling (default: 95% used; configurable via `stealth.rotation.drain_headroom_ceiling`). This drains expiring subscription quota before it is lost instead of leaving it unused while a fresher account is consumed. Profiles at/above the ceiling or without a known reset time are held in reserve, ranked by availability. Selections include an explanation, e.g. `chose work: resets in 42m, 91% used; fallback personal held in reserve`. Pair with `--usage-aware` on `caam next` so reset times are fetched.
+- `availability` (default) — maximize immediate headroom among eligible profiles.
+- `drain` (opt-in) — prefer the profile whose included quota resets soonest, among profiles under a headroom ceiling (default: 95% used; configurable via `stealth.rotation.drain_headroom_ceiling`). This drains expiring subscription quota before it is lost instead of leaving it unused while a fresher account is consumed. Measured profiles at/above the ceiling but below their provider caps, or without a known reset time, are held in reserve and ranked by availability. Selections include an explanation, e.g. `chose work: resets in 42m, 91% used; fallback personal held in reserve`. Pair with `--usage-aware` on `caam next` so reset times are fetched.
+
+Rotation policies decide which profile `caam` *switches the host to*. To rank seats for a new session without switching anything, use [`caam limits --rank`](#picking-a-seat-for-new-work-caam-limits---rank) instead — it is a read, and it ranks on the weekly allowance rather than the soonest window.
+
+Every automatic selection checks credential eligibility before ranking, including
+random, round-robin, drain, precheck, wrapper startup, and handoff. A known
+expired session without renewal credentials, or a credential the provider has
+rejected, cannot become the fallback merely because it is the only account.
+Selection fails before changing live auth when every candidate needs a new
+login. Cooldown overrides do not bypass this check. Renewable access tokens
+remain eligible after their cached expiry; unknown expiry remains unknown.
+
+When quota data is requested, every algorithm and policy also requires a
+successful measurement and unspent general and applicable model quotas. This
+applies to Claude, Codex, Grok, and Cursor, including sole candidates and forced
+round-robin retries. Failed reads cannot silently turn a quota-aware request
+into selection without quota data. Reads use the same vault and candidate
+profiles that will be activated. Commands run without `--usage-aware`, and the
+session planner's explicit `--no-fetch`, retain their existing offline behavior.
+
+`caam run --precheck` switches only to another measured account below the
+precheck threshold. If the active account cannot be measured, or no replacement
+qualifies, the run keeps the current account and prints a notice. Weekly-only
+accounts remain eligible when their session limit is legitimately absent.
+
+With `--precheck`, automatic recovery also requires fresh, measured quota.
+Headless retries and supported interactive handoffs query the remaining
+candidates before selection, then recheck the chosen account after backoff and
+before changing live authentication. A failed read cannot reuse an earlier
+positive measurement. Exhausted weekly and applicable model limits block a
+retry; the proactive threshold is a preference for the initial switch, not a
+hard ceiling on recovery. If no account is active, automatic initial selection
+also requires measured quota. Runs without `--precheck` make no added quota
+requests.
 
 **Options for `caam activate`:**
 - `--auto` — Use rotation algorithm to pick best profile
@@ -613,6 +1285,240 @@ copied behind your back is how two lanes end up invalidating each other.
 When `stealth.cooldown.enabled` is true in config, `caam activate` warns if the target profile is in cooldown and prompts for confirmation. Use `--force` to bypass.
 
 When `stealth.rotation.enabled` is true, `caam activate <tool>` automatically falls back to rotation if the default profile is in cooldown.
+
+### Replacing a Saved Credential Snapshot
+
+`caam backup <tool> <profile>` captures and validates a complete snapshot before
+replacing a saved profile. Optional credential files that no longer exist are
+absent from the new snapshot, so an old OAuth login cannot survive a later
+API-key or helper-based backup. Claude Desktop backups retain only nonblank
+credential cache fields and leave native application settings unchanged.
+
+Replacing a profile preserves its descriptions, tags and browser preferences;
+account identity is derived from the newly captured credentials. The complete
+previous directory remains recoverable at the `previous_snapshot` path recorded
+in the new profile's `meta.json`, including unknown files and old metadata.
+Private recovery directories are excluded from account listing, bundle export
+and sync, and cannot be selected as ordinary profiles.
+
+Preparation and publication stay on the destination provider's filesystem,
+including when the vault points to another mounted volume. Capture or validation
+failure leaves the previous profile unchanged. If publication fails, CAAM
+attempts to restore the previous directory and reports its retained recovery
+path if rollback cannot complete.
+
+### Preserving Credentials During Account Switches
+
+Account switching uses the same preservation operation from `activate`, `next`,
+`robot act activate`, workspaces, `run` prechecks and automatic handoff, the API,
+and the TUI. It checks the incoming snapshot before changing live authentication
+or creating recovery files. If a required preservation step fails, the switch
+stops and reports the error.
+
+When a native CLI rotates a token, CAAM saves the complete newer credential back
+to its named profile only after matching the account identity and comparing
+freshness. An uncertain, incomplete, or older live credential cannot overwrite a
+saved account. Activating an older snapshot of the current account keeps the
+newer live credential and reports `kept_live` in JSON output.
+
+The `safety` section of the SPM configuration controls additional recovery copies:
+
+```yaml
+safety:
+  auto_backup_before_switch: smart
+  max_auto_backups: 5
+```
+
+- `smart` saves live state that is not fully preserved in the vault to a unique
+  `_backup_*` snapshot, including an unsaved login or auxiliary credential files.
+- `always` creates a recovery snapshot before a switch even when the outgoing
+  named account can also be updated. `activate --backup-current` selects this
+  behavior for one invocation.
+- `never` disables automatic `_backup_*` copies. Proven newer credentials are
+  still saved to their named account. Explicit activation and workspace switching
+  retain the first-use `_original` backup.
+
+Recovery copies are immutable. Retention runs after a successful switch;
+`max_auto_backups: 0` keeps all copies. JSON activation results identify the
+outgoing profile, any automatic backup, and any profile updated with live tokens.
+An incomplete workspace switch returns an error and keeps the previously recorded
+workspace name. Automatic handoff rolls back through the same preservation
+operation, so tokens rotated during a failed login are saved before returning to
+the previous account.
+
+Rotation applies cooldown and policy checks even when only one user profile
+exists. System snapshots are never automatic rotation candidates. `next --force`
+and `activate --auto --force` can explicitly override cooldown filtering; they do
+not admit system backups. With `next --usage-aware`, force also retains the
+requirement for measured, available quota from every supported provider. `next --dry-run`
+performs selection without switching or saving credentials.
+
+### Transferring Saved Profiles with Tar Archives
+
+`caam export` and `caam import` transfer saved profiles in a `.tar.gz` archive,
+including credentials, token-bound identity metadata and associated settings:
+
+```bash
+caam export claude/work --output ./claude-work.tar.gz
+caam export --all claude --output ./claude-profiles.tar.gz
+caam import ./claude-work.tar.gz --as claude/server-work
+caam import ./claude-profiles.tar.gz --force
+```
+
+`--as` requires a single-profile archive and changes its name within the same
+provider. Existing destinations require `--force`, which retains each complete
+previous profile in a private recovery directory and reports its path. System
+profiles and private recovery directories are excluded from bulk exports.
+
+Import validates the entire archive, including paths, file sizes, checksums,
+missing or duplicate payloads and gzip completion. It privately prepares every
+incoming profile before publishing any of them, then checks all destination
+conflicts after acquiring the vault lock. Claude proof checks remain offline:
+an exact cached binding remains usable with expired tokens, a binding attached
+to different credentials is rejected even with `--force`, and unverified account
+labels are omitted while unrelated settings are preserved.
+
+Export captures profiles under the managed vault lock and assembles a complete
+archive privately before writing output. With `--output`, the parent directory
+must already exist and the destination must be outside the vault. CAAM writes
+a private sibling temporary file, syncs it and publishes it by rename, preserving
+an existing output if preparation or writing fails. Tar archives are unencrypted
+and contain credentials; keep them private.
+
+Profile publication rechecks captured generations and retains recovery copies
+when replacing an account. If a later filesystem operation fails, earlier
+profiles may already have been imported; the command reports that count and any
+retained recovery paths. This is per-profile recovery, without an archive-wide
+transaction or a guarantee of recovery from a process crash or power loss.
+
+### Portable Vault Bundles
+
+Use a bundle to transfer or recover saved profiles together with CAAM's
+configuration and metadata:
+
+```bash
+caam bundle export --encrypt
+caam bundle import ~/backup.enc.zip --dry-run
+caam bundle import ~/backup.enc.zip
+```
+
+Import verifies the archive's checksums and checks all selected source and
+destination paths before restoring files. A malformed path, a symlink that
+redirects a restore, a missing checksum, or a checksum mismatch stops the
+import. These checks also apply to `--dry-run` and `--force`.
+
+All profiles selected for restoration are privately prepared before any profile
+is published or previewed as successful. A malformed `.claude.json` in a later
+profile therefore stops the import before an earlier profile is installed.
+Filesystem failures during publication still use per-profile recovery.
+
+The default `smart` mode compares credential freshness. For Claude, automatic
+replacement also requires verified matching account **and organization UUIDs**,
+or the exact same access/refresh token pair. A shared email or profile name is
+not proof of ownership. Conflicting or unverified ownership across different
+token generations preserves the local profile and reports why it was skipped.
+The selected `.credentials.json` controls freshness even if an older
+`.claude.json` claims a later expiry; an unknown expiry does not authorize a
+replacement. A selected legacy `auth.json` never falls back to secondary state.
+
+`--mode merge` adds new profiles while preserving existing ones. `--mode replace`
+intentionally replaces selected profiles and leaves other accounts in place.
+Every replacement retains the complete previous profile in a private recovery
+directory, whose path appears in text and `--json` results. These recovery
+snapshots are excluded from account selection and later bundle exports.
+Replacing `work` cannot overwrite a separate profile named `work.bak`.
+
+Bundle identity checks stay offline. A valid binding travels with its token
+pair, including expired credentials, and an accepted native cache is promoted
+to canonical vault metadata on import. Matching canonical metadata takes
+precedence over a redundant native cache; import and export omit the redundant
+cache so later token rotations retain a single source of vault ownership.
+A broken or token-mismatched canonical binding, or a stale native cache used as
+the sole proof, stops import even with `--mode replace` or `--force`. Imported
+account labels are corrected from verified ownership or omitted when unverified,
+while unrelated settings remain intact. Export and
+import participate in the vault mutation lock and recheck captured profile
+generations while copying and publishing. A detected concurrent change returns
+an error; an independently written login is preserved during recovery.
+`--dry-run` performs the same ownership checks without creating a vault lock or
+changing profiles. These guarantees describe `caam bundle` ZIP transfers.
+
+Profile generation checks also pin the parent directories that identify the
+vault. Replacing or redirecting a parent stops publication even when the
+profile's contents are unchanged. Cleanup removes only a staging directory
+still owned by that operation. Claude account files must use their canonical
+filename casing, and credential, settings and proof limits are checked before
+decoding the selected files. When settings select a helper, API key or environment
+credential, an ignored legacy OAuth file cannot establish that login's ownership.
+
+#### Scheduled vault backups
+
+The daemon can create periodic recovery archives:
+
+```bash
+caam daemon auto-backup --enable --interval 24h --keep 5 --location ~/Backups/caam
+caam daemon start
+```
+
+Use `caam daemon auto-backup` to inspect the schedule and latest result. Restart
+an already running daemon after changing its backup configuration.
+
+Each scheduled archive is assembled privately, checked through the bundle
+importer's recovery validation, and published under a unique
+`caam_auto_backup_...zip` name without replacing an existing file. Retention
+applies only to completed automatic backups recorded in the daemon's backup
+state whose contents still match their recorded size and SHA-256 checksum.
+Manual exports, older unrecorded archives, altered files, and ambiguous entries
+are preserved. Losing the ownership state leaves extra archives in place.
+
+Scheduled archives contain credentials and are unencrypted ZIP files; keep the
+backup directory private. If the destination filesystem cannot publish an
+archive exclusively using a hard link, the backup fails and keeps the older
+recovery copies.
+
+### Synchronizing Profiles over SSH
+
+Configure a machine and select the profiles to synchronize:
+
+```bash
+caam sync add build-host dev@build.example.com --remote-path /srv/caam
+caam sync --machine build-host --provider claude --profile work
+caam sync --machine build-host --json
+caam sync log --errors
+```
+
+`--remote-path` specifies the remote CAAM **data directory**. Both discovery and
+transfer append `vault`, so `/srv/caam` selects `/srv/caam/vault`.
+
+Claude transfers and all metadata-only transfers require CAAM with **sync
+protocol 1 on both hosts**, with `caam` available to the remote SSH session.
+An older or unavailable peer produces an update error; these transfers never
+fall back to unguarded file copying.
+
+Claude and Codex default to `host-local` policy. Metadata-only sync can create
+a missing logical profile with its provider, profile name, description and tags.
+It does not copy credentials, account UUIDs, organization UUIDs, cached identity
+proof or other arbitrary metadata, and it never replaces an existing profile.
+Each machine keeps its independently obtained login. See the [FAQ's sync policy
+example](#faq) for explicit policy overrides.
+
+With Claude credential replication explicitly enabled, replacing an existing
+profile requires the exact access/refresh pair or matching verified account
+**and organization UUIDs** before freshness is considered. Shared email addresses
+and names cannot authorize replacement. Unknown ownership across different
+grants, a conflicting organization or unavailable selected-token expiry preserves
+existing profiles. These checks use captured files and cached proof offline;
+they do not refresh tokens or establish that an expired token is still usable.
+
+The guarded exchange transfers complete profiles and holds the managed vault
+locks while checking both source and destination generations through publication.
+Replacements retain the complete previous profile in a private recovery directory;
+recovery avoids overwriting an independently changed login. Results identify the
+recovery path and its location: **remote** for a push, **local** for a pull.
+JSON output includes `recovery_path` and `recovery_location` when a retained
+recovery is reported. Profile and machine errors appear in the results and cause
+a failing exit status. Recovery handles returned errors per profile; it does not
+provide a transaction across machines or a crash-recovery guarantee.
 
 ### Uninstall Notes
 
@@ -639,6 +1545,132 @@ When `stealth.rotation.enabled` is true, `caam activate <tool>` automatically fa
 
 When you have multiple accounts across multiple providers, manually tracking which account has headroom, which one just hit a limit, and which one you used recently becomes tedious. Smart Profile Management automates this decision-making so you can focus on coding instead of account juggling.
 
+### Keep idle native logins alive
+
+Claude and Grok renew their OAuth grants through their own CLIs. An idle
+account can otherwise lose its access token, fail a quota query, and stop
+receiving work from a usage-aware router. `caam keepalive` runs a minimal
+native operation in each account's live home and verifies the credential
+afterward.
+
+```bash
+# Inspect eligible homes without running CLIs, creating state, or copying files.
+caam keepalive --dry-run --json
+
+# Renew all discovered Claude and Grok live owners, or select one provider.
+caam keepalive
+caam keepalive grok
+
+# Select an exact live home; unambiguous live profile names also work.
+caam keepalive shallow:claude/alice
+caam keepalive isolated:grok/work
+caam keepalive host:grok --ttl 1h --min-gap 25m --timeout 2m
+```
+
+Discovery includes Claude host, shallow, and isolated homes, plus Grok host
+and isolated homes. It respects `CLAUDE_CONFIG_DIR`, `GROK_HOME`, and the
+same `--base` setting as shallow-profile commands. A known matching Claude
+shallow home owns its account in preference to the host copy. Conflicting
+live owners, unknown identities, malformed credentials, and unknown expiry
+are reported without running the CLI. File-based keepalive cannot verify a
+Claude login held in the macOS login keychain and reports it as blocked.
+
+Keepalive renews **one live home per account**. Apart from the
+shallow-over-host case above, when two homes hold the same account (for
+example the host home and an isolated profile), both are blocked, even if
+each was signed in separately: different token values cannot show whether a
+credential came from its own sign-in or is a copy that rotated later, and
+renewing a stale copy could replay a spent refresh token. Sign out of all
+but one of those homes. Homes for other accounts can still be selected by
+reference while the conflict remains.
+
+The default threshold is **2 hours** until expiry. While the access token
+remains valid, attempts are at least **25 minutes** apart; expired tokens
+bypass this interval. `--min-gap 0` disables the interval. Each native call
+has a **2-minute** timeout, and an exclusive lock prevents overlapping
+manual and scheduled renewals of the same grant. The minimum gap belongs
+to the account, so switching accounts in the same home does not inherit the
+previous login's throttle. Native child processes are stopped before the
+grant lock is released, and vault synchronization also has a bounded wait.
+
+Claude receives a one-word Haiku prompt in safe mode, with low effort, a
+one-turn limit, no tools, disabled user hooks and connectors, no MCP servers,
+and no session persistence in an empty working directory. This consumes a
+small amount of Claude usage; deployment-managed policies still apply. Grok runs
+`grok models`, which does not request a model turn. Authentication overrides
+are scrubbed so each CLI uses the selected live credential.
+
+| Result | Meaning |
+|--------|---------|
+| `rotated` | The CLI left a renewable, unexpired credential for the same account with a strictly later expiry. |
+| `still_valid` | The credential remains usable; the native CLI may defer rotation until closer to expiry. |
+| `rate_limited` | Claude's request was refused with HTTP 429, so the login was accepted, and the credential passed every check. Counts as success. |
+| `skipped` | The token is outside the threshold, was attempted recently, or another reference owns the same grant. |
+| `dry_run` | This live grant would be attempted. |
+| `blocked` / `failed` | Ownership or credential checks failed, the CLI could not renew, or the resulting credential is expired, missing, or invalid. |
+
+The command returns nonzero if any selected grant cannot be renewed.
+`--json` includes an overall `success`, per-grant `success` and `attempted`,
+before/after expiry, and reasons. Native output and credential secrets are
+excluded. When the native CLI exits unsuccessfully, the result adds its
+`native_exit_code` (absent if it was killed, for example by `--timeout`). For
+Claude, which keepalive runs with `--output-format json`, it also adds
+`native_api_error_status`, the HTTP status of a rejected API request (`401`
+means the login was refused; `429` means the request was rate limited), and
+`native_terminal_reason`, Claude's own short reason such as `api_error`.
+Claude's message text is never copied.
+
+A zero exit from Grok alone is insufficient: keepalive detects
+the case where Grok removes rejected credentials while exiting successfully.
+It also rejects a backwards expiry or a missing refresh credential. Metadata
+or formatting changes alone do not count as renewal.
+
+After a successful native run, an existing user vault snapshot receives the
+live credential only if its account matches and its saved expiry is
+strictly older. Known account IDs take precedence; email is a fallback.
+Unknown age, conflicting identity, concurrent changes, and system snapshots
+such as `_original` or `_backup_*` prevent copying. Settings and metadata
+remain with their existing snapshot. Copy failures appear in the JSON
+`sync` results without misreporting a successfully renewed live grant.
+
+Valid grants skipped by the TTL threshold or minimum gap can still repair
+older matching vault snapshots, without another native request. A missed
+snapshot update can therefore recover on the next scheduled check. Ownership
+is checked again under the grant lock, so a second live home created after
+initial discovery prevents a stale owner from running.
+
+`caam keepalive vault:claude/alice` and names found only in the vault are
+refused with a matching live-home hint when one can be verified. A vault
+snapshot may hold a spent refresh token and must never be staged in a
+temporary HOME for renewal.
+
+#### Schedule a systemd user timer
+
+```bash
+caam keepalive --print-systemd
+# Or obtain each unit as a JSON string:
+caam keepalive --print-systemd --json
+```
+
+Save the printed service and timer sections as
+`~/.config/systemd/user/caam-keepalive.service` and
+`~/.config/systemd/user/caam-keepalive.timer`, then enable them:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now caam-keepalive.timer
+systemctl --user list-timers caam-keepalive.timer
+journalctl --user -u caam-keepalive.service
+```
+
+The timer uses `OnCalendar=*:0/30` and `Persistent=true`, so it has a calendar
+schedule and catches up after the user manager was inactive. Generated
+units preserve selected options, live-home locations, and `PATH`, while
+excluding authentication secrets. Generate them from the normal host
+environment where the native CLIs are installed. Printing units does not
+install or start them; regenerate them if the executable or home locations
+change.
+
 ### Profile Health Scoring
 
 Each profile displays a health indicator showing its current state at a glance:
@@ -647,7 +1679,7 @@ Each profile displays a health indicator showing its current state at a glance:
 |------|--------|---------|
 | 🟢 | Healthy | Token valid for >1 hour, no recent errors |
 | 🟡 | Warning | Token expiring within 1 hour, or minor issues |
-| 🔴 | Critical | Token expired, or repeated errors in the last hour |
+| 🔴 | Critical | Token expired, the provider rejected the credential, or repeated errors in the last hour |
 | ⚪ | Unknown | No health data available yet |
 
 Health scoring combines multiple factors:
@@ -688,26 +1720,26 @@ Only Claude caches usage on disk. `caam quota <other-provider>` exits 1 and poin
 #### Refreshable tokens are not expired accounts
 
 A short-lived access token that can be renewed **without a human** is not an
-unhealthy account, and caam does not report it as one. Every provider's
-credential carries a refresh token or it does not, and that — not the raw
-expiry timestamp — decides the verdict. Codex is the case that forced the
+unhealthy account, and caam does not report it as one. Renewal depends on the
+provider's credential type: a supported refresh token, or a stored API key
+that the provider's CLI uses to obtain new access tokens. Codex is the case that forced the
 distinction: its access token routinely sits expired for days while the CLI
 renews it from the refresh token on next use, and three live accounts were
 reading `warning` in `caam ls` from an expiry months in the past.
 
 Two questions used to share one flag, and they have different answers:
 
-| Question | Consumer | Claude | Codex / Grok / Gemini (with a refresh token) |
-|----------|----------|--------|-----------------------------------------------|
-| "Should **caam** refresh this soon?" | `warnings`, the refresh daemon | no — Claude Code renews itself and caam's Claude refresh is disabled | **yes** — caam has a refresher and runs off this signal |
+| Question | Consumer | Claude / Grok | Codex / Gemini (with a refresh token) |
+|----------|----------|---------------|---------------------------------------|
+| "Should **caam** refresh this soon?" | `warnings`, the refresh daemon | no — the native CLI renews; `caam keepalive` can invoke it in its live home | **yes** — caam has a refresher and runs off this signal |
 | "Must a human log in again?" | `caam ls` status, rotation eligibility | no | **no** |
 
-`caam ls --json` and `caam status --json` therefore carry three additive
-signals per profile alongside the composite `status`:
+`caam ls --json`, `caam status --json`, `caam verify --json`, and robot
+profile reports carry three additive signals alongside the composite `status`:
 
 | Field | Meaning |
 |-------|---------|
-| `refresh_due` | caam should renew this credential soon. `false` for a self-refreshing Claude credential (caam must leave it alone) and for one with no refresh token (there is nothing to renew from — it needs a login, not a scheduler). |
+| `refresh_due` | caam should renew this credential soon. `false` for credentials the provider's CLI renews itself, and for non-renewable sessions that need a new login. |
 | `launch_usable` | a new session can start on this account right now — this is what a rotation controller should route on, not warning severity |
 | `login_required` | a human must re-authenticate: the credential has lapsed **and** carries nothing to renew itself with |
 
@@ -719,7 +1751,147 @@ until the cap clears — but it is not a login problem, so `login_required` stay
 
 A lapsed-but-renewable credential shows as `Auto-refresh` rather than
 `Expired`, and its recommendation is `caam refresh <provider> <profile>`, never
-`caam login` (a login is disruptive and would fix nothing).
+`caam login` (a login is disruptive and would fix nothing). Credentials that
+the provider's CLI renews itself do not get a caam refresh recommendation.
+
+#### Refresh preserves the credential that owns the request
+
+Codex and Gemini refresh requests capture the selected credential before
+contacting the provider. Concurrent CAAM refreshes of that source are
+serialized, and a request whose source changed while waiting or during the
+HTTP exchange is skipped. Its response cannot be merged into a replacement
+login, and its rejection cannot mark that replacement login as rejected.
+
+After successful renewal, CAAM also updates active and isolated credential
+files that held the same access and renewal tokens when the request began.
+Profile names alone do not establish a match. Destination-local settings are
+retained, and a destination that changes during the request is preserved.
+That outcome is reported as a delivery warning: the vault renewal remains
+successful and the account stays eligible in the daemon and auth pool.
+These checks coordinate CAAM refreshes and detect intervening native writes;
+they do not lock arbitrary native CLI writers out of the filesystem.
+
+The default daemon also refreshes an already-expired access token when its
+credential is renewable. Sessions requiring a new login and credentials
+renewed by their own CLI remain outside CAAM's refresh path.
+
+#### Proactive authentication pool
+
+The pool reads current credentials from the selected vault when it starts and
+before each refresh pass. It recognizes new profiles, removed profiles and
+replaced credentials without relying on a previously saved pool state. Existing
+cooldowns remain in effect while the inventory changes.
+
+Claude ownership checks stay offline during reconciliation. A saved identity
+proof that is malformed or no longer matches the access/refresh pair makes the
+profile unavailable for selection, including after a pool restart. Inspect it
+with `caam verify identity claude <profile>` before repair. A matching cached
+proof still works after access-token expiry; unverified legacy profiles retain
+their existing credential validation and native-renewal behavior.
+
+```bash
+caam pool status --json
+caam pool refresh codex/work
+caam pool refresh --all --timeout 30s
+caam daemon start --pool
+```
+
+Manual refresh waits for completed results, with bounded concurrency and a
+timeout for each exchange. A malformed, incomplete or provider-rejected
+credential produces an error and a nonzero command exit. Native renewal,
+session logins, API keys and profiles in cooldown are reported as skipped.
+Codex and Gemini OAuth credentials use CAAM's renewal path, including complete
+Gemini ADC grants that have no cached access token yet.
+
+Stopping the pool cancels queued work and waits for active refreshes and batches
+to finish. Restarting it cannot resume work from the stopped instance. If a
+profile is deleted and recreated while an old refresh is finishing, that old
+result cannot change the replacement profile's state.
+
+#### Cursor session expiry
+
+Cursor browser/session logins have a fixed expiry in the `accessToken` JWT
+inside `auth.json`. A `refreshToken` field alone does **not** make this login
+renewable. caam starts warning **seven days before expiry** so there is time
+to log in again with `cursor-agent login` and re-save a vault profile with
+`caam backup cursor <profile>` (activate it first if needed). Isolated
+profiles use `caam login cursor <profile>`. The session remains
+`launch_usable: true` before its deadline, including during the warning
+window; at expiry, `login_required` becomes `true` and `launch_usable` becomes
+`false`. A rate-limit cooldown can independently prevent launching.
+
+A non-empty `apiKey` stored in the same credential file means Cursor can
+obtain new access tokens itself. An expired cached JWT, or the absence of a
+cached JWT, does not trigger a login warning for that credential. Neither
+Cursor credential type is refreshed by caam, so `refresh_due` is `false` and
+`caam refresh cursor <profile> --force` explains why it skips the profile.
+
+Expiry uses the same platform paths as Cursor backup and activation:
+
+| Platform | File-backed credential location |
+|----------|--------------------------------|
+| Linux | `$XDG_CONFIG_HOME/cursor/auth.json`, defaulting to `~/.config/cursor/auth.json` |
+| macOS | `~/.cursor/auth.json` |
+| Windows | `%APPDATA%/Cursor/auth.json` |
+
+`CURSOR_CONFIG_DIR` changes the CLI configuration location, not the credential
+location. Isolated profiles resolve these paths under their own HOME. When
+file-backed credentials are present, unrelated changes in `cli-config.json`
+or `settings.json` no longer hide the matching active profile. A keychain-only
+login or unreadable JWT still has unknown expiry; caam does not invent a
+deadline. `ls`, `status`, `doctor`, `verify`, robot health, warnings, and the
+daemon all use these session-versus-API-key rules.
+
+The TUI, monitor, local API, and automatic selection also read the current
+credential when reporting health. Saved expiry metadata alone cannot preserve
+an old session deadline after a new login or make an API-key-backed account
+look expired after restart. The reader uses the configured vault, so a
+same-named profile in another vault cannot supply its credential state.
+
+For isolated Cursor profiles, `caam profile status` and `caam doctor --validate`
+apply the same expiry and credential checks. A present `auth.json` takes
+precedence over metadata in `cli-config.json`: malformed JSON, empty
+credentials, and a lone `refreshToken` do not count as a login. Metadata-only
+native-keychain compatibility applies when the credential file is absent;
+it supplies no expiry or proof that the provider still accepts the login.
+Passive checks make no provider request.
+
+#### Provider verification
+
+The signals above come from the credential file: its expiry and whether a
+refresh token sits beside it. A file cannot show that the provider has
+**revoked** the credential. A revoked Codex refresh token is still present,
+and the access token minted beside it can be days from expiry, so on disk it
+looks the same as a working credential. Only the provider can tell them apart.
+
+caam therefore records what the provider says whenever it contacts the
+provider for a Codex profile: a caam refresh (`caam refresh`, the refresh
+daemon, activation), the live token probe in `caam doctor` (a read of the
+ChatGPT backend's usage endpoint, which accepts a ChatGPT login's access
+token), and a live
+`caam limits codex` read. A refusal (a refresh rejected as revoked, reused or
+expired, or a 401 for an unexpired access token) marks that credential
+`login_required: true` and `launch_usable: false`, and `caam ls` shows
+🔴 `Login required` in place of the expiry. The rejection is tied to that
+specific credential, so logging in again clears it, and so does a later
+successful refresh. A successful `doctor` probe or `limits` read clears a 401
+rejection, but not a refused refresh token: the access token keeps working
+after a revocation until it expires. Rate limiting, 5xx answers, a bare 403 (which an
+edge proxy can send) and network failures tell caam nothing about the
+credential and are not recorded. Rotation scoring reads the stored record, so
+after logging in again outside caam a profile can rank lower there until the
+next provider check succeeds.
+
+`ls --json` and `status --json` rows also carry:
+
+| Field | Meaning |
+|-------|---------|
+| `verification` | `provider` when the provider has answered for the credential now on disk, `passive` when the verdict comes from the file alone |
+| `last_verified_at` | when the provider last accepted this credential (RFC 3339), omitted if it never has |
+| `provider_rejected_at`, `provider_rejection` | an outstanding rejection of this credential and its short reason code (for example `refresh_token_invalidated`) |
+
+`expires_at` is unchanged. It reports when the access token expires and does
+not claim that the account is live.
 
 ### Smart Rotation Algorithms
 
@@ -767,32 +1939,74 @@ When cooldown enforcement is enabled (`stealth.cooldown.enabled: true`), attempt
 
 ### Automatic Failover with `caam run`
 
-The `caam run` command wraps your AI CLI execution and automatically handles rate limits:
+`caam run` retries headless commands that fail with a detected rate limit. It
+starts with the current saved account, marks a rate-limited account as exhausted,
+selects an eligible alternative, waits for the configured backoff, and launches
+the same command again. Accounts exhausted during the run are not reused, even
+when the cooldown database is unavailable.
 
 ```bash
-# Instead of running claude directly:
-caam run claude -- "explain this code"
+# Native headless forms work from terminals and scripts
+caam run claude -- -p "explain this code"
+caam run codex -- exec "write tests"
+caam run gemini -- -p "summarize this file"
 
-# If Claude hits a rate limit mid-session:
-# 1. Current profile goes into cooldown
-# 2. Next best profile is automatically selected
-# 3. Command is re-executed with new account
+# Each attempt receives the same complete redirected input
+git diff | caam run claude -- -p "review this diff"
+
+# Explicit flags override configured retry and cooldown values
+caam run claude --max-retries 2 --cooldown 90m -- -p "explain this code"
+caam run codex --max-retries 0 -- exec "run once"
 ```
 
-For seamless integration, add shell aliases:
+The default is three retries after the initial launch, with a 30-second initial
+delay, a five-minute maximum delay, a multiplier of two, and jitter. Configure
+these in the `wrap` section of `~/.config/caam/config.json` (or
+`$XDG_CONFIG_HOME/caam/config.json`):
 
-```bash
-alias claude='caam run claude --'
-alias codex='caam run codex --'
-alias gemini='caam run gemini --'
+```json
+{
+  "wrap": {
+    "max_retries": 3,
+    "initial_delay": "30s",
+    "max_delay": "5m",
+    "backoff_multiplier": 2,
+    "jitter": true,
+    "cooldown_duration": "60m",
+    "providers": {
+      "claude": { "max_retries": 5 },
+      "codex": { "max_retries": 0 },
+      "gemini": { "initial_delay": "60s", "jitter": false }
+    }
+  }
+}
 ```
 
-Now you can use `claude "explain this code"` and rate limits are handled transparently.
+Provider settings inherit omitted values and honor explicit zero and false.
+Explicit CLI flags take precedence. A zero cooldown disables persistent cooldown
+recording while accounts remain excluded for that run. Invalid effective retry
+settings fail before precheck or activation.
 
-Configuration options:
-```bash
-caam run claude --max-retries 2 --cooldown 90m --algorithm smart -- "your prompt"
-```
+When CLI output includes an explicit `Retry-After` header, CAAM waits at least
+until that deadline, including when it exceeds `max_delay`. This can only honor
+headers the CLI exposes; CAAM does not intercept its network traffic.
+
+Successful commands are never retried. Ordinary failures retain their exit
+status, and cancellation stops further launches. A retry reruns the command;
+work completed by an earlier attempt remains. Child output stays on its original
+stdout/stderr streams, so output from failed attempts remains visible too.
+
+Redirected input is captured privately before execution and replayed on each
+attempt, up to 16 MiB. Provide headless input through arguments, a pipe, or file
+redirection; headless invocations from a terminal do not collect keystrokes.
+Interactive sessions retain their terminal behavior and are never replayed as
+commands. Existing interactive handoffs use the same retry budget and backoff;
+Claude's native interactive TUI continues to run directly.
+
+For the native headless options, see the
+[Claude CLI documentation](https://code.claude.com/docs/en/headless),
+[Codex non-interactive documentation](https://developers.openai.com/codex/noninteractive),
+and [Gemini headless documentation](https://geminicli.com/docs/cli/headless/).
 
 ### Project-Profile Associations
 
@@ -967,6 +2181,140 @@ claude "explain this authentication flow"
 
 ---
 
+## Web Dashboard
+
+The local dashboard shows saved accounts, current logins, credential health,
+recorded CAAM activity, and distributed coordinator status. It supports Claude,
+Codex, Cursor, Gemini, Antigravity, Grok, and OpenCode profiles.
+
+Start the API on the same machine as your browser:
+
+```bash
+caam serve
+```
+
+In another terminal, print the connection token with `caam serve --show-token`.
+From a repository checkout, start the dashboard:
+
+```bash
+cd web/dashboard
+pnpm install --frozen-lockfile
+pnpm dev
+```
+
+Open `http://localhost:3000`, connect to `http://127.0.0.1:7892`, and paste the
+token. You can also print a connection link:
+
+```bash
+caam serve --dashboard-url http://localhost:3000
+```
+
+Both services bind to loopback. The link carries the token in its URL fragment,
+which the dashboard removes from the address bar. The dashboard keeps the token
+in tab memory and clears it on disconnect or reload.
+
+Search and filter accounts, inspect health and cooldowns, and confirm activation
+of a named profile. Backup copies the current live login into a new saved
+snapshot; replacing an existing snapshot requires a separate opt-in and a
+confirmation naming that account. Failed or uncertain actions remain visible,
+and successful actions refresh the displayed state.
+
+Recorded activity reports logged activations, errors, and completed-session
+duration for the last hour, day, week, or month. A session counts in full when
+its completion is recorded. Provider quota and API-call totals are separate
+from this local activity history. Unavailable history and stale data are marked
+explicitly. Read-only sections refresh every 15 seconds and on demand.
+The recent activity page also lists switches, logins, refreshes, errors, and
+active cooldowns.
+
+See [web/dashboard/README.md](web/dashboard/README.md) for production startup,
+connection behavior, and validation commands.
+
+---
+
+## Distributed Auth Recovery
+
+When Claude Code sessions run on remote machines (WezTerm SSH domains or tmux)
+and hit their limit, caam can log them back in without you touching them: a
+**coordinator** on each remote host watches the panes, sends `/login`, and
+publishes the OAuth URL; the **auth agent** on your local machine completes
+the login in its own Chrome profile and sends the code back over SSH; the
+coordinator pastes it and resumes the session.
+
+Organization-specific Claude recovery is refused when the browser agent has
+only email-based account configuration. It cannot choose between Personal and
+Team organizations sharing an email; use a verified vault profile as described
+under [account and organization identity](#account-and-organization-identity).
+
+The coordinator reports an account only when verified evidence belongs to the
+grant held by that particular running pane. Current host credential files do
+not prove this: another session can switch those files while the pane keeps its
+older grant in memory. The built-in pane backends therefore leave account and
+organization fields unknown. Integrations can provide a pane identity resolver
+with the required process and grant provenance; its result is retained through
+retries of the same rate-limit episode and reconsidered for the next episode.
+
+```bash
+# One time, on the machine with the browser:
+caam setup distributed            # deploy coordinators to your WezTerm SSH domains
+caam setup distributed --host ubuntu@build1 --host gpu   # or name hosts (tmux, ~/.ssh/config aliases)
+caam auth-agent signin            # sign in to the Google accounts to rotate through
+caam auth-agent accounts add a@gmail.com b@gmail.com     # and put them in the rotation
+caam auth-agent service install   # run the agent at login (launchd / systemd --user)
+
+# Day to day:
+caam doctor                               # agent config, Chrome, sign-ins, accounts at their limit, service, every coordinator
+caam robot status --include-coordinators  # coordinator health and panes (JSON)
+caam auth-coordinator status              # one coordinator, run on its host
+caam update --remotes                     # keep coordinators on this version
+```
+
+The coordinator API listens on loopback with a per-host token and is reached
+only through the agent's SSH connection; codes are delivered until the
+coordinator acknowledges them and are pasted exactly once. For manual control
+of panes, see `caam wezterm recover` and `caam wezterm login-all`. Design,
+configuration keys, API, and troubleshooting:
+[docs/DISTRIBUTED_AUTH_RECOVERY.md](docs/DISTRIBUTED_AUTH_RECOVERY.md).
+
+---
+
+## Alerts
+
+caam alerts you when `caam run` switches accounts after a rate limit, and when
+the daemon cannot refresh a credential, a provider rejects a login (re-login
+required), or a Cursor session is about to expire. Repeats of the same daemon
+alert are suppressed for an hour. Channels live in `~/.caam/config.yaml`:
+
+```yaml
+alerts:
+  enabled: true            # master switch for desktop and webhook alerts
+  notifications:
+    terminal: true         # print alerts in the running command (caam run)
+    desktop: true          # notify-send on Linux, Notification Center on macOS
+    webhook: ""            # POST JSON here; includes "text"/"content" for Slack and Discord
+```
+
+```bash
+caam config set alerts.notifications.webhook https://hooks.slack.com/services/...
+caam notify test                    # send a test alert through each enabled channel
+caam notify test --channel desktop  # test one channel
+```
+
+The daemon can also announce new caam releases (opt-in; it never installs
+anything). Each release is announced once:
+
+```bash
+caam config set daemon.update_check.enabled true
+caam config set daemon.update_check.interval 24h   # minimum 1h
+caam config set daemon.update_check.channel stable # or beta
+```
+
+Then `caam update` updates this machine and `caam update --remotes` brings
+distributed-recovery coordinators to the same version (see
+[docs/DISTRIBUTED_AUTH_RECOVERY.md](docs/DISTRIBUTED_AUTH_RECOVERY.md)).
+
+---
+
 ## TUI Configuration
 
 Customize the TUI appearance and behavior through `~/.caam/config.yaml`:
@@ -1033,7 +2381,7 @@ Run `caam paths` to see current locations. If they change in a tool update, we'l
 
 **Q: Can I sync the vault across machines?**
 
-With care — and `caam sync` is now provider-aware about what is safe to move. Claude and Codex subscription OAuth uses a **rotating refresh-token family**: every refresh consumes the current refresh token, and replaying a stale copy from another machine can trip the provider's reuse detection and revoke the whole family (this bricked a real account — see issue #19). So by default those providers are **host-local**: `caam sync` replicates their profile *metadata* (so every machine knows the logical account exists) but never their credential payload — each machine keeps its own independent grant via `caam add`. Gemini, OpenCode, and Cursor keep the old bidirectional `replicate` behavior. You can override per provider or per profile in `~/.config/caam/config.json`:
+With care — and `caam sync` is now provider-aware about what is safe to move. Claude and Codex subscription OAuth uses a **rotating refresh-token family**: every refresh consumes the current refresh token, and replaying a stale copy from another machine can trip the provider's reuse detection and revoke the whole family (this bricked a real account — see issue #19). So by default those providers are **host-local**: `caam sync` can seed a missing logical profile with its description and tags, without copying credentials or identity proof. Each machine keeps its own independent grant via `caam add`; existing profiles are preserved. Gemini, OpenCode, and Cursor keep the old bidirectional `replicate` behavior. You can override per provider or per profile in `~/.config/caam/config.json`:
 
 ```json
 {
@@ -1045,6 +2393,10 @@ With care — and `caam sync` is now provider-aware about what is safe to move. 
 ```
 
 Forcing `replicate` for a rotating provider prints a loud warning whenever both machines already hold diverged copies, because converging them is exactly the revocation hazard. `caam sync status` shows the resolved policy per provider.
+
+Claude replication and metadata-only transfers require the guarded protocol on
+both hosts. See [Synchronizing Profiles over SSH](#synchronizing-profiles-over-ssh)
+for compatibility, account ownership checks and recovery reporting.
 
 **Q: What's the difference between vault profiles and isolated profiles?**
 
@@ -1099,9 +2451,19 @@ binary on your `PATH`:
 For example, on Linux x86_64:
 
 ```bash
-ver=$(curl -fsSL https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
-curl -fsSL -o caam.tar.gz "https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/latest/download/caam_${ver}_linux_amd64.tar.gz"
-tar -xzf caam.tar.gz && sudo install caam /usr/local/bin/
+(
+  set -euo pipefail
+  ver=$(curl -fsSL https://api.github.com/repos/Dicklesworthstone/coding_agent_account_manager/releases/latest | grep -oP '"tag_name":\s*"v\K[^"]+')
+  asset="caam_${ver}_linux_amd64.tar.gz"
+  base="https://github.com/Dicklesworthstone/coding_agent_account_manager/releases/download/v${ver}"
+  curl -fsSL -o "$asset" "$base/$asset"
+  curl -fsSL -o SHA256SUMS "$base/SHA256SUMS"
+  curl -fsSL -o SHA256SUMS.minisig "$base/SHA256SUMS.minisig"
+  minisign -Vm SHA256SUMS -P RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70
+  awk -v asset="$asset" '$2 == asset { print }' SHA256SUMS | sha256sum -c -
+  tar -xzf "$asset"
+  sudo install caam /usr/local/bin/
+)
 ```
 
 If you don't want to pick an asset by hand, the install script above downloads,
@@ -1133,7 +2495,78 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 The same public key is embedded in the `caam` binary itself, so `caam update`
 performs this verification in pure Go — fail-closed, with no external tools
-required.
+required for releases v0.1.18 and later. The shell installer uses an existing
+`minisign` command when available. On Linux x86-64 and ARM64, if it is missing,
+the installer downloads a temporary copy of upstream Minisign 0.12. It checks
+the archive against a SHA-256 pinned in `install.sh` **before extracting or
+executing it**, then uses that verifier with CAAM's public key above. No sudo,
+package-manager changes, or permanent Minisign installation are needed.
+
+This acquisition path works on **Ubuntu 22.04**, which has no `minisign` apt
+package, and on minimal newer Ubuntu and Debian installations. If you prefer
+a system package, Ubuntu 24.04+ provides `minisign` in `universe` and Debian
+12+ provides it through `sudo apt install minisign`. On macOS, install it with
+`brew install minisign` before running the installer. See the
+[Ubuntu package](https://packages.ubuntu.com/noble/minisign) and
+[Debian package](https://packages.debian.org/bookworm/minisign) details.
+
+The bootstrap archive is
+[`minisign-0.12-linux.tar.gz`](https://github.com/jedisct1/minisign/releases/tag/0.12),
+with SHA-256:
+
+```text
+9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73
+```
+
+That pin was checked against upstream's release signature using the public key
+published in [Minisign's documentation](https://jedisct1.github.io/minisign/):
+`RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3`.
+The installer authenticates the bootstrap with its embedded pin, rather than
+running an unauthenticated verifier to authenticate itself. Updating the pin
+requires authenticating the new upstream archive first; neither release
+metadata nor environment variables can replace it.
+
+For a manual installation on Ubuntu 22.04, download that exact archive,
+compare its SHA-256 with the pin above using `sha256sum`, and only after it
+matches extract `minisign-linux/x86_64/minisign` or
+`minisign-linux/aarch64/minisign` onto your PATH. An already trusted Minisign
+on another machine can also verify the archive's `.minisig` with upstream's
+key. Re-run the ordinary CAAM installer after placing the authenticated
+verifier on PATH. If the bootstrap cannot be authenticated, installation
+stops without executing it or falling back to a source build.
+
+Release authentication is mandatory, including in CI and noninteractive
+sessions. `--verify` adds an executable self-test after installation; it does
+not enable or disable signature verification. The former `CAAM_SKIP_VERIFY`
+setting is rejected with a verification error and must be unset.
+The previous binary's backup is retained until this self-test passes, so a
+failed binary or source-build self-test can restore the working installation.
+
+The installer and updater bind the selected archive and its signed checksum
+entry to the release version. An explicit `--version` also requires matching
+release metadata. A missing modern signature cannot fall back to the legacy
+signing policy, and invalid release names are rejected. Verification failures
+leave the installed binary untouched; the installer does not turn them into
+a source-build fallback.
+
+Download, verifier, source-build, and Go-bootstrap directories are registered
+in the installer's parent shell. Normal exits, failures, and HUP/INT/TERM
+remove only its registered directories. Cleanup checks directory identities,
+preserves replaced paths and unrelated files in `TMPDIR`, and reports removal
+failures without hiding the original installation error. As with any process,
+an uncatchable SIGKILL or host crash cannot run its exit handler.
+
+Installer regressions live in `internal/installscript`. The ordinary suite uses
+local archives and checks both CPU mappings, authentication failures, source
+builds, interruptions, and temporary-directory ownership. With `minisign` on
+PATH it also exercises the real maintainer-signed fixtures. For the live
+distribution matrix, configure a DSR check to run
+`CAAM_INSTALLER_DISTRIBUTION_TESTS=1 go test ./internal/installscript -run TestInstallerLinuxDistributionMatrix -v -timeout 45m`.
+It requires Docker or Podman with amd64 and arm64 execution support and network
+access. The matrix installs the signed v0.1.25 release on Ubuntu 22.04/24.04 and
+Debian 12/13, tests automatic verifier acquisition, reuses distro Minisign
+packages where available, and checks verification refusal and cleanup. An
+explicitly enabled matrix fails if its execution prerequisites are unavailable.
 
 **Trust model.** Releases up to v0.1.17 were built by GitHub Actions and
 signed keylessly with cosign, pinned to the release workflow's OIDC identity
@@ -1144,8 +2577,9 @@ release could ever verify (see issue #77). From v0.1.18, releases are built on
 maintainer-controlled hosts and signed with the maintainer-held minisign key
 above; what you trust is that key (and this README/binary pinning it) rather
 than GitHub's CI identity chain. Verification is strictly fail-closed in both
-the updater and the install script. For old releases (≤ v0.1.17) the legacy
-cosign verification still applies:
+the updater and the install script. For old releases (≤ v0.1.17)
+the legacy cosign verification still applies and requires `cosign` to be
+installed:
 
 ```bash
 cosign verify-blob \

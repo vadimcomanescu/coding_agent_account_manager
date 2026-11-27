@@ -9,14 +9,13 @@ set -euo pipefail
 # Options (via env vars or arguments):
 #   --version=VERSION   Install specific version (e.g., v1.2.3)
 #   --channel=CHANNEL   Release channel: stable (default) or beta
-#   --verify            Run self-test after install (caam --version)
+#   --verify            Run self-test after install (release signatures always required)
 #   --force             Force reinstall even if same version exists
 #   --dry-run           Show what would be done without installing
 #   --help              Show this help message
 #
 # Environment variables:
 #   INSTALL_DIR         Override install directory (default: auto-detect)
-#   CAAM_SKIP_VERIFY    Skip signature/checksum verification (not recommended)
 #   CAAM_NO_CACHE_BUST  Disable cache-busting query params
 #   NO_COLOR            Disable colored output
 #   CI                  Enable non-interactive mode (implies NO_COLOR)
@@ -27,10 +26,18 @@ readonly REPO_OWNER="Dicklesworthstone"
 readonly REPO_NAME="coding_agent_account_manager"
 readonly BIN_NAME="caam"
 
+# Bootstrap trust is pinned in this installer, never fetched alongside the
+# download. The 0.12 Linux archive was independently authenticated against
+# upstream's release signature and public key:
+# https://github.com/jedisct1/minisign/releases/tag/0.12
+# RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
+readonly MINISIGN_BOOTSTRAP_VERSION="0.12"
+readonly MINISIGN_BOOTSTRAP_SHA256="9a599b48ba6eb7b1e80f12f36b94ceca7c00b7a5173c95c3efc88d9822957e73"
+MINISIGN_BIN=""
+
 # Exit codes for CI/automation
+# (0 covers both "installed" and "already up to date".)
 readonly EXIT_SUCCESS=0
-readonly EXIT_UP_TO_DATE=0
-readonly EXIT_UPDATED=0
 readonly EXIT_ERROR=1
 readonly EXIT_DEPS_MISSING=2
 readonly EXIT_VERIFY_FAILED=3
@@ -46,6 +53,15 @@ DRY_RUN=false
 SHOW_HELP=false
 
 TMP_DIRS=()
+TMP_DIR_IDENTITIES=()
+readonly TMP_OWNER_SUBSHELL=$BASH_SUBSHELL
+TMP_CREATION_IN_PROGRESS=false
+TMP_PENDING_SIGNAL=0
+SOURCE_GO_VERSION=""
+
+# Set when a release asset was selected but could not be downloaded, so a
+# failed source-build fallback exits with EXIT_DOWNLOAD_FAILED.
+BINARY_DOWNLOAD_FAILED=false
 
 # ==============================================================================
 # Argument Parsing
@@ -93,14 +109,13 @@ Usage:
 Options:
   --version=VERSION   Install specific version (e.g., v1.2.3)
   --channel=CHANNEL   Release channel: stable (default) or beta
-  --verify            Run self-test after install
+  --verify            Run self-test after install (release signatures always required)
   --force             Force reinstall even if same version exists
   --dry-run           Show what would be done without installing
   --help              Show this help message
 
 Environment Variables:
   INSTALL_DIR         Override install directory
-  CAAM_SKIP_VERIFY    Skip signature/checksum verification
   CAAM_NO_CACHE_BUST  Disable cache-busting query params
   NO_COLOR            Disable colored output
   CI                  Enable non-interactive mode
@@ -175,7 +190,7 @@ success() {
 warn() {
     local msg="$1"
     if [ "$HAS_GUM" = true ]; then
-        gum style --foreground 214 "==> WARNING: $msg"
+        gum style --foreground 214 "==> WARNING: $msg" >&2
     elif [ "$USE_COLOR" = true ]; then
         printf "\033[1;33m==>\033[0m WARNING: %s\n" "$msg" >&2
     else
@@ -186,7 +201,7 @@ warn() {
 error() {
     local msg="$1"
     if [ "$HAS_GUM" = true ]; then
-        gum style --foreground 196 "==> ERROR: $msg"
+        gum style --foreground 196 "==> ERROR: $msg" >&2
     elif [ "$USE_COLOR" = true ]; then
         printf "\033[1;31m==>\033[0m ERROR: %s\n" "$msg" >&2
     else
@@ -199,11 +214,12 @@ die() {
     exit "${2:-$EXIT_ERROR}"
 }
 
-# Spinner for long operations
+# Spinner for long operations. gum spin launches an external executable, so
+# shell functions and builtins run directly in this shell instead.
 spin() {
     local msg="$1"
     shift
-    if [ "$HAS_GUM" = true ] && [ "$IS_TTY" = true ]; then
+    if [ "$HAS_GUM" = true ] && [ "$IS_TTY" = true ] && [ "$(type -t "$1" 2>/dev/null || true)" = "file" ]; then
         gum spin --spinner dot --title "$msg" -- "$@"
     else
         info "$msg"
@@ -234,20 +250,94 @@ confirm() {
 }
 
 cleanup_tmp_dirs() {
-    local dir
+    # Never let a child shell clean up its parent's active downloads/builds.
+    [ "$BASH_SUBSHELL" -eq "$TMP_OWNER_SUBSHELL" ] || return 0
+    local dir identity index=0 failed=0
     for dir in ${TMP_DIRS[@]+"${TMP_DIRS[@]}"}; do
-        [ -n "$dir" ] && rm -rf "$dir"
+        if [ -e "$dir" ] || [ -L "$dir" ]; then
+            identity=$(tmp_dir_identity "$dir") || identity=""
+            if [ -n "$identity" ] && [ "$identity" = "${TMP_DIR_IDENTITIES[$index]}" ] && [ ! -L "$dir" ]; then
+                if ! rm -rf -- "$dir"; then
+                    error "Could not remove installer temporary directory: $dir"
+                    failed=1
+                fi
+            else
+                warn "Preserving replaced temporary path: $dir"
+                failed=1
+            fi
+        fi
+        index=$((index + 1))
     done
+    # Retire the authority even after a failed removal. A later pathname or
+    # inode reuse must never authorize deleting another invocation's files.
+    TMP_DIRS=()
+    TMP_DIR_IDENTITIES=()
+    return "$failed"
+}
+
+tmp_dir_identity() {
+    [ -d "$1" ] && [ ! -L "$1" ] || return 1
+    # GNU/BusyBox stat on Linux; BSD stat on macOS.
+    stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1" 2>/dev/null
 }
 
 make_tmp_dir() {
-    local dir
-    dir=$(mktemp -d)
-    TMP_DIRS+=("$dir")
-    printf '%s\n' "$dir"
+    # Assign into the caller's variable, not stdout: command substitution
+    # loses the cleanup registration in a subshell (issue #136).
+    [ "$BASH_SUBSHELL" -eq "$TMP_OWNER_SUBSHELL" ] || {
+        error "Temporary directories must be created in the installer shell."
+        return 1
+    }
+    local created_tmp_dir tmp_parent identity
+    tmp_parent=$(cd -- "${TMPDIR:-/tmp}" && pwd -P) || return 1
+    if ! tmp_dir_identity "$tmp_parent" >/dev/null; then
+        error "stat is required to identify installer temporary directories."
+        return 1
+    fi
+    TMP_CREATION_IN_PROGRESS=true
+    if created_tmp_dir=$(mktemp -d "$tmp_parent/caam-install.XXXXXXXXXX"); then
+        TMP_DIRS+=("$created_tmp_dir")
+        identity=$(tmp_dir_identity "$created_tmp_dir") || identity=""
+        TMP_DIR_IDENTITIES+=("$identity")
+    else
+        TMP_CREATION_IN_PROGRESS=false
+        [ "$TMP_PENDING_SIGNAL" -eq 0 ] || exit "$TMP_PENDING_SIGNAL"
+        error "Could not create installer temporary directory."
+        return 1
+    fi
+    TMP_CREATION_IN_PROGRESS=false
+    [ "$TMP_PENDING_SIGNAL" -eq 0 ] || exit "$TMP_PENDING_SIGNAL"
+    if [ -z "$identity" ]; then
+        error "Could not identify installer temporary directory: $created_tmp_dir"
+        return 1
+    fi
+    printf -v "$1" '%s' "$created_tmp_dir"
 }
 
-trap cleanup_tmp_dirs EXIT
+handle_install_signal() {
+    # A trap may run between mktemp's return and registration. Finish that
+    # critical section first so the EXIT handler owns the resulting path.
+    if [ "$TMP_CREATION_IN_PROGRESS" = true ]; then
+        TMP_PENDING_SIGNAL=$1
+    else
+        exit "$1"
+    fi
+}
+
+finish_install() {
+    local status=$1
+    trap - EXIT
+    trap '' HUP INT TERM
+    if ! cleanup_tmp_dirs && [ "$status" -eq 0 ]; then
+        status=$EXIT_ERROR
+    fi
+    exit "$status"
+}
+
+trap 'finish_install $?' EXIT
+trap 'handle_install_signal 129' HUP
+trap 'handle_install_signal 130' INT
+trap 'handle_install_signal 143' TERM
 
 # Returns 0 if the given directory is a version-manager shim/managed dir that
 # tools like pyenv/asdf/rbenv/nvm rehash and wipe. Installing into these would
@@ -331,6 +421,16 @@ cache_bust_url() {
         echo "${url}&_cb=${ts}"
     else
         echo "${url}?_cb=${ts}"
+    fi
+}
+
+# A requested source build must come from exactly the requested tag. Only an
+# unversioned source install is allowed to follow main.
+source_tarball_ref() {
+    if [ -n "${INSTALL_VERSION:-}" ]; then
+        printf 'refs/tags/%s\n' "$INSTALL_VERSION"
+    else
+        printf 'refs/heads/main\n'
     fi
 }
 
@@ -485,14 +585,7 @@ get_release() {
 
     # For beta channel, extract first release from array
     if [ "$INSTALL_CHANNEL" = "beta" ] && [ -z "$version" ]; then
-        echo "$response" | ensure_python && "$PYTHON_CMD" -c "
-import json, sys
-data = json.load(sys.stdin)
-if isinstance(data, list) and len(data) > 0:
-    print(json.dumps(data[0]))
-else:
-    sys.exit(1)
-"
+        printf '%s' "$response" | first_release_json
     else
         echo "$response"
     fi
@@ -540,29 +633,62 @@ ensure_install_dir() {
 }
 
 PYTHON_CMD=""
+JSON_TOOL=""
 
-ensure_python() {
-    if [ -n "$PYTHON_CMD" ]; then
+# ensure_json_tool picks the parser for GitHub/go.dev release metadata:
+# python3 (or a python that is Python 3) first, jq otherwise. Either one is
+# enough; the jq paths below mirror the Python ones exactly.
+ensure_json_tool() {
+    if [ -n "$JSON_TOOL" ]; then
         return 0
     fi
 
-    if command -v python3 >/dev/null 2>&1; then
-        PYTHON_CMD="$(command -v python3)"
+    local candidate
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 \
+            && "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
+            PYTHON_CMD="$(command -v "$candidate")"
+            JSON_TOOL="python"
+            return 0
+        fi
+    done
+
+    if command -v jq >/dev/null 2>&1; then
+        JSON_TOOL="jq"
         return 0
     fi
 
-    if command -v python >/dev/null 2>&1; then
-        PYTHON_CMD="$(command -v python)"
-        return 0
-    fi
-
-    print_error "Python 3 is required to parse GitHub release metadata."
-    print_error "Please install python3 (e.g., 'xcode-select --install' on macOS) or install jq."
+    print_error "python3 or jq is required to parse GitHub release metadata."
+    print_error "Install either one (e.g. 'brew install jq', 'sudo apt install jq', or 'xcode-select --install' for python3) and re-run."
     return 1
 }
 
+# first_release_json reads a GitHub releases array on stdin and prints its
+# first element as JSON. Fails when the input is not a non-empty array.
+first_release_json() {
+    ensure_json_tool || return 1
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        jq -ce 'if type == "array" and length > 0 then .[0] else empty end'
+        return
+    fi
+
+    "$PYTHON_CMD" -c "
+import json, sys
+data = json.load(sys.stdin)
+if isinstance(data, list) and len(data) > 0:
+    print(json.dumps(data[0]))
+else:
+    sys.exit(1)
+"
+}
+
+# fetch_latest_go_pkg prints three lines for the latest stable Go release's
+# macOS .pkg for this machine's architecture: version, download URL, SHA-256.
+# go.dev's ?mode=json file entries carry no URL field (only filename, os, arch,
+# version, sha256, size, kind); files are served from https://go.dev/dl/<filename>.
 fetch_latest_go_pkg() {
-    ensure_python || return 1
+    ensure_json_tool || return 1
 
     local arch
     arch="$(uname -m)"
@@ -572,19 +698,36 @@ fetch_latest_go_pkg() {
         *) print_error "Unsupported macOS architecture for Go install: $arch"; return 1 ;;
     esac
 
-    "$PYTHON_CMD" - "$arch" <<'PY'
+    local releases
+    releases=$(curl -fsSL "https://go.dev/dl/?mode=json") || {
+        print_error "Failed to fetch Go releases from go.dev"
+        return 1
+    }
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        printf '%s' "$releases" | jq -re --arg arch "$arch" '
+            (map(select(.stable == true)) | .[0]) as $rel
+            | if $rel == null then empty else
+                ([($rel.files // [])[]
+                  | select(.os == "darwin" and .arch == $arch and ((.filename // "") | endswith(".pkg")))][0]) as $pkg
+                | if $pkg == null or ($pkg.sha256 // "") == "" then empty
+                  else ($rel.version // ""), ("https://go.dev/dl/" + $pkg.filename), $pkg.sha256 end
+              end'
+        return
+    fi
+
+    GO_RELEASES_JSON="$releases" "$PYTHON_CMD" - "$arch" <<'PY'
 import json
+import os
 import sys
-import urllib.request
 
 
 def main() -> int:
     arch = sys.argv[1]
     try:
-        with urllib.request.urlopen("https://go.dev/dl/?mode=json") as resp:
-            data = json.load(resp)
+        data = json.loads(os.environ.get("GO_RELEASES_JSON", ""))
     except Exception as exc:
-        sys.stderr.write(f"Failed to fetch Go releases: {exc}\n")
+        sys.stderr.write(f"Failed to parse Go releases: {exc}\n")
         return 1
 
     release = next((r for r in data if r.get("stable")), None)
@@ -594,16 +737,16 @@ def main() -> int:
     version = release.get("version") or ""
     files = release.get("files") or []
     pkg = next(
-        (f for f in files if f.get("os") == "darwin" and f.get("arch") == arch and f.get("filename", "").endswith(".pkg")),
+        (f for f in files if f.get("os") == "darwin" and f.get("arch") == arch and (f.get("filename") or "").endswith(".pkg")),
         None,
     )
 
-    if not pkg:
+    if not pkg or not pkg.get("sha256"):
         return 1
 
-    url = pkg.get("url") or ""
     print(version)
-    print(url)
+    print("https://go.dev/dl/" + pkg["filename"])
+    print(pkg["sha256"])
     return 0
 
 
@@ -613,39 +756,49 @@ PY
 }
 
 install_go_from_pkg() {
-    local version url tmpdir pkg_path
+    local version="" url="" expected_sha="" actual_sha="" tmpdir pkg_path
 
-    read -r version url < <(fetch_latest_go_pkg) || return 1
+    # fetch_latest_go_pkg prints version, URL and SHA-256 on separate lines.
+    { read -r version; read -r url; read -r expected_sha; } < <(fetch_latest_go_pkg) || true
 
-    if [ -z "$version" ] || [ -z "$url" ]; then
+    if [ -z "$version" ] || [ -z "$url" ] || [ -z "$expected_sha" ]; then
         return 1
     fi
 
     print_info "Downloading Go $version (.pkg)..."
-    tmpdir=$(mktemp -d)
+    make_tmp_dir tmpdir || return 1
     pkg_path="$tmpdir/go.pkg"
 
     if ! curl -fsSL "$url" -o "$pkg_path"; then
         print_error "Failed to download Go installer from $url"
-        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # The .pkg is installed with sudo: refuse it unless it matches go.dev's SHA-256.
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_sha=$(sha256sum "$pkg_path" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual_sha=$(shasum -a 256 "$pkg_path" | awk '{print $1}')
+    fi
+    if [ -z "$actual_sha" ] || [ "$actual_sha" != "$expected_sha" ]; then
+        print_error "Go installer checksum mismatch (expected $expected_sha, got ${actual_sha:-none}); not installing"
         return 1
     fi
 
     print_info "Installing Go $version (requires sudo)..."
     if sudo installer -pkg "$pkg_path" -target / >/dev/null; then
         print_success "Installed Go $version"
-        rm -rf "$tmpdir"
         return 0
     fi
 
     print_error "Go installer failed"
-    rm -rf "$tmpdir"
     return 1
 }
 
 version_ge() {
-    local IFS=.
-    local i ver1=($1) ver2=($2)
+    local i ver1 ver2
+    IFS=. read -r -a ver1 <<< "$1"
+    IFS=. read -r -a ver2 <<< "$2"
     for ((i=0; i<${#ver1[@]} || i<${#ver2[@]}; i++)); do
         local v1=${ver1[i]:-0}
         local v2=${ver2[i]:-0}
@@ -655,12 +808,60 @@ version_ge() {
     return 0
 }
 
+# The signing policy depends on the release version, never on which signature
+# assets happen to be present. Do not feed release metadata into version_ge:
+# its arithmetic is meant for the bounded numeric Go toolchain versions above.
+release_signature_kind() {
+    local version="$1"
+    local pattern='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+    if ! [[ "$version" =~ $pattern ]]; then
+        print_error "Release tag must contain a valid major.minor.patch version for signature verification."
+        return 1
+    fi
+
+    local major="${BASH_REMATCH[1]}"
+    local minor="${BASH_REMATCH[2]}"
+    local patch="${BASH_REMATCH[3]}"
+    # String-only checks also handle very large numeric components safely.
+    # Prereleases of 0.1.18 already require the maintainer signing key.
+    if [[ "$major" == 0 && ( "$minor" == 0 || ( "$minor" == 1 && "$patch" =~ ^([0-9]|1[0-7])$ ) ) ]]; then
+        printf 'cosign\n'
+    else
+        printf 'minisign\n'
+    fi
+}
+
+# select_release_asset reads one release object on stdin and prints three
+# lines: tag name, download URL, asset name. Fails when no asset matches.
 select_release_asset() {
     local platform="$1"
-    ensure_python || return 1
+    ensure_json_tool || return 1
 
     local release_json
     release_json=$(cat) || return 1
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        local ext=".tar.gz" parsed
+        case "$platform" in
+            windows_*) ext=".zip" ;;
+        esac
+        parsed=$(printf '%s' "$release_json" | jq -r --arg platform "$platform" --arg ext "$ext" '
+            [(.assets // [])[]
+             | {name: (.name // ""), url: (.browser_download_url // "")}
+             | select(.url != "" and (.name | endswith($ext)))] as $candidates
+            | ([$candidates[] | select(.name | contains($platform))][0]
+               // [$candidates[] | select(.name | gsub("_"; "") | contains($platform | gsub("_"; "")))][0]
+               // {name: "", url: ""}) as $pick
+            | (.tag_name // ""), $pick.url, $pick.name') || {
+            print_error "Failed to parse release JSON"
+            return 1
+        }
+        local tag="" url="" name=""
+        { read -r tag; read -r url; read -r name; } <<< "$parsed" || true
+        printf '%s\n%s\n%s\n' "$tag" "$url" "$name"
+        [ -n "$url" ]
+        return
+    fi
 
     CAAM_RELEASE_JSON="$release_json" "$PYTHON_CMD" - "$platform" "$BIN_NAME" <<'PY'
 import json
@@ -720,12 +921,29 @@ if __name__ == "__main__":
 PY
 }
 
+# select_named_asset reads one release object on stdin and prints the
+# download URL of the asset named exactly $1. Fails when there is none.
 select_named_asset() {
     local asset_name="$1"
-    ensure_python || return 1
+    ensure_json_tool || return 1
 
     local release_json
     release_json=$(cat) || return 1
+
+    if [ "$JSON_TOOL" = "jq" ]; then
+        local url
+        url=$(printf '%s' "$release_json" | jq -r --arg target "$asset_name" '
+            [(.assets // [])[]
+             | select((.name // "") == $target)
+             | (.browser_download_url // "")
+             | select(. != "")][0] // ""') || {
+            print_error "Failed to parse release JSON"
+            return 1
+        }
+        printf '%s\n' "$url"
+        [ -n "$url" ]
+        return
+    fi
 
     CAAM_RELEASE_JSON="$release_json" "$PYTHON_CMD" - "$asset_name" <<'PY'
 import json
@@ -764,6 +982,105 @@ if __name__ == "__main__":
 PY
 }
 
+# Prefer a verifier already trusted by the host. Otherwise use a temporary,
+# authenticated upstream binary on Linux; this also works on Ubuntu 22.04,
+# which has no minisign package. Do not install packages, require sudo, change
+# PATH, or trust a checksum downloaded from the same place as the executable.
+# The caller owns tmp_dir and invokes this function in the parent shell.
+ensure_minisign() {
+    local tmp_dir="$1"
+    MINISIGN_BIN=""
+    if command -v minisign >/dev/null 2>&1; then
+        MINISIGN_BIN="minisign"
+        return 0
+    fi
+
+    local os arch
+    os=$(uname -s) || return 1
+    arch=$(uname -m) || return 1
+    if [ "$os" != Linux ]; then
+        print_error "Automatic Minisign acquisition is only supported on Linux x86_64 and aarch64."
+        return 1
+    fi
+    case "$arch" in
+        x86_64|amd64) arch=x86_64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        *)
+            print_error "Automatic Minisign acquisition is only supported on Linux x86_64 and aarch64."
+            return 1
+            ;;
+    esac
+
+    # Check the authenticator before downloading anything. A failed hash
+    # command is an authentication failure even if it printed a matching hash.
+    local hash_tool
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash_tool=sha256sum
+    elif command -v shasum >/dev/null 2>&1; then
+        hash_tool=shasum
+    else
+        print_error "sha256sum or shasum is required to authenticate the Minisign download."
+        return 1
+    fi
+
+    local bootstrap_dir="$tmp_dir/minisign-bootstrap"
+    if ! mkdir -m 700 "$bootstrap_dir"; then
+        print_error "Could not prepare the temporary Minisign directory."
+        return 1
+    fi
+    local archive_path="$bootstrap_dir/minisign.tar.gz"
+    local url="https://github.com/jedisct1/minisign/releases/download/${MINISIGN_BOOTSTRAP_VERSION}/minisign-${MINISIGN_BOOTSTRAP_VERSION}-linux.tar.gz"
+    print_info "Acquiring authenticated temporary Minisign $MINISIGN_BOOTSTRAP_VERSION for Linux $arch..."
+    if ! download_file "$url" "$archive_path" false; then
+        print_error "Failed to download Minisign."
+        return 1
+    fi
+
+    local actual
+    if [ "$hash_tool" = sha256sum ]; then
+        actual=$(sha256sum "$archive_path" | awk '{print $1}') || {
+            print_error "Could not authenticate the Minisign download."
+            return 1
+        }
+    else
+        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}') || {
+            print_error "Could not authenticate the Minisign download."
+            return 1
+        }
+    fi
+    if [ "$actual" != "$MINISIGN_BOOTSTRAP_SHA256" ]; then
+        print_error "Minisign archive checksum verification failed."
+        return 1
+    fi
+
+    # Stream only the authenticated architecture-specific executable into a
+    # file we own. Do not restore upstream archive ownership or other members.
+    local candidate="$bootstrap_dir/minisign"
+    if ! tar -xzOf "$archive_path" "minisign-linux/$arch/minisign" > "$candidate"; then
+        print_error "Failed to extract Minisign."
+        return 1
+    fi
+    if [ ! -f "$candidate" ] || [ -L "$candidate" ] || [ ! -s "$candidate" ]; then
+        print_error "Minisign archive does not contain the expected executable."
+        return 1
+    fi
+    if ! chmod 700 "$candidate"; then
+        print_error "Could not make the authenticated Minisign executable."
+        return 1
+    fi
+    MINISIGN_BIN="$candidate"
+}
+
+minisign_install_help() {
+    error "minisign is required to verify release signatures, including in CI/non-interactive mode."
+    error "Linux x86_64/aarch64: resolve the acquisition error above and re-run for an authenticated temporary verifier."
+    error "Ubuntu 22.04 has no minisign apt package; the temporary upstream verifier supports it."
+    error "To install Minisign separately from an authenticated package repository:"
+    error "  Ubuntu 24.04+ (universe) / Debian 12+: sudo apt install minisign"
+    error "  macOS: brew install minisign"
+    error "Manual authentication instructions: https://github.com/${REPO_OWNER}/${REPO_NAME}#verify-release-artifacts"
+}
+
 verify_release_assets() {
     local release_json="$1"
     local version="$2"
@@ -771,9 +1088,20 @@ verify_release_assets() {
     local archive_path="$4"
     local tmp_dir="$5"
 
+    local signature_kind
+    signature_kind=$(release_signature_kind "$version") || return 1
+    if [ -n "$INSTALL_VERSION" ] && ! versions_equal "$INSTALL_VERSION" "$version"; then
+        print_error "Release metadata does not match the requested version."
+        return 1
+    fi
+    if [[ "$asset_name" != "${BIN_NAME}_${version#v}_"* ]]; then
+        print_error "Release archive name does not match its release version."
+        return 1
+    fi
+
     if [ -n "${CAAM_SKIP_VERIFY:-}" ]; then
-        print_warn "Skipping release verification (CAAM_SKIP_VERIFY set)."
-        return 0
+        print_error "Release verification cannot be disabled. Unset CAAM_SKIP_VERIFY and re-run."
+        return 1
     fi
 
     local checksums_url signature_url minisig_url
@@ -783,6 +1111,10 @@ verify_release_assets() {
 
     if [ -z "$checksums_url" ]; then
         print_error "Release is missing the SHA256SUMS asset."
+        return 1
+    fi
+    if [ "$signature_kind" = "minisign" ] && [ -z "$minisig_url" ]; then
+        print_error "Release is missing SHA256SUMS.minisig (required for releases >= v0.1.18)."
         return 1
     fi
     if [ -z "$minisig_url" ] && [ -z "$signature_url" ]; then
@@ -808,23 +1140,9 @@ verify_release_assets() {
             print_error "Failed to download SHA256SUMS.minisig."
             return 1
         fi
-        if ! command -v minisign >/dev/null 2>&1; then
-            if [ "${CI:-}" = "true" ] || [ "${NONINTERACTIVE:-}" = "1" ]; then
-                print_warn "minisign not found — skipping signature verification (CI/non-interactive mode)."
-                print_warn "Install minisign for signature verification in production."
-                # Fall through to checksum-only verification below
-            else
-                error "minisign is required to verify release signatures."
-                error ""
-                error "Install minisign:"
-                error "  macOS:         brew install minisign"
-                error "  Ubuntu/Debian: sudo apt install minisign"
-                error "  Other:         https://jedisct1.github.io/minisign/"
-                error ""
-                error "Or bypass verification (not recommended for security):"
-                error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
-                return 1
-            fi
+        if ! ensure_minisign "$tmp_dir"; then
+            minisign_install_help
+            return 1
         else
             local minisign_pub="$tmp_dir/caam-release-minisign.pub"
             cat > "$minisign_pub" <<'CAAM_MINISIGN_PUB'
@@ -832,7 +1150,7 @@ untrusted comment: caam release signing key (minisign key 1BBD79B28BF718D0)
 RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70
 CAAM_MINISIGN_PUB
             local minisign_out=""
-            if ! minisign_out=$(minisign -V -p "$minisign_pub" -m "$checksums_path" -x "$minisig_path" 2>&1); then
+            if ! minisign_out=$("$MINISIGN_BIN" -V -p "$minisign_pub" -m "$checksums_path" -x "$minisig_path" 2>&1); then
                 print_error "Signature verification failed."
                 if [ -n "$minisign_out" ]; then
                     printf '%s\n' "$minisign_out" | while IFS= read -r line; do
@@ -843,22 +1161,13 @@ CAAM_MINISIGN_PUB
             fi
         fi
     elif ! command -v cosign >/dev/null 2>&1; then
-        if [ "${CI:-}" = "true" ] || [ "${NONINTERACTIVE:-}" = "1" ]; then
-            print_warn "cosign not found — skipping signature verification (CI/non-interactive mode)."
-            print_warn "Install cosign for signature verification in production."
-            # Fall through to checksum-only verification below
-        else
-            error "cosign is required to verify release signatures."
-            error ""
-            error "Install cosign:"
-            error "  macOS:        brew install cosign"
-            error "  Ubuntu/Debian: sudo apt install cosign"
-            error "  Go:           go install github.com/sigstore/cosign/v2/cmd/cosign@latest"
-            error ""
-            error "Or bypass verification (not recommended for security):"
-            error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
-            return 1
-        fi
+        error "cosign is required to verify legacy release signatures, including in CI/non-interactive mode."
+        error ""
+        error "Install cosign:"
+        error "  macOS:        brew install cosign"
+        error "  Ubuntu/Debian: sudo apt install cosign"
+        error "  Go:           go install github.com/sigstore/cosign/v2/cmd/cosign@latest"
+        return 1
     else
         if ! download_file "$signature_url" "$signature_path"; then
             print_error "Failed to download SHA256SUMS.sig."
@@ -935,21 +1244,36 @@ CAAM_COSIGN_PUB
         fi
     fi
 
-    if [ -z "$asset_name" ]; then
-        asset_name=$(basename "$archive_path")
-    fi
-
     local expected actual
-    expected=$(grep -F " $asset_name" "$checksums_path" | awk '{print $1}' | head -1)
-    if [ -z "$expected" ]; then
-        print_error "Checksum entry not found for $asset_name."
+    expected=$(awk -v name="$asset_name" '
+        {
+            filename = $2
+            sub(/^\*/, "", filename)
+            if (filename == name) {
+                matches++
+                if (NF != 2 || length($1) != 64 || $1 ~ /[^[:xdigit:]]/) invalid = 1
+                hash = tolower($1)
+            }
+        }
+        END {
+            if (matches != 1 || invalid) exit 1
+            print hash
+        }
+    ' "$checksums_path") || {
+        print_error "Signed checksums must contain exactly one valid entry for the selected archive."
         return 1
-    fi
+    }
 
     if command -v sha256sum >/dev/null 2>&1; then
-        actual=$(sha256sum "$archive_path" | awk '{print $1}')
+        actual=$(sha256sum "$archive_path" | awk '{print $1}') || {
+            print_error "Could not compute the release archive checksum."
+            return 1
+        }
     elif command -v shasum >/dev/null 2>&1; then
-        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}')
+        actual=$(shasum -a 256 "$archive_path" | awk '{print $1}') || {
+            print_error "Could not compute the release archive checksum."
+            return 1
+        }
     else
         print_error "sha256sum or shasum is required for checksum verification."
         return 1
@@ -969,13 +1293,14 @@ is_tty() {
 }
 
 ensure_go() {
-    local min_version="1.21"
+    # Keep source builds aligned with go.mod's pinned release toolchain.
+    local min_version="1.26.11"
     local go_version=""
 
     if command -v go >/dev/null 2>&1; then
         go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
         if version_ge "$go_version" "$min_version"; then
-            printf '%s' "$go_version"
+            SOURCE_GO_VERSION="$go_version"
             return 0
         fi
         print_warn "Go $min_version or later is required. Found: go$go_version"
@@ -999,7 +1324,7 @@ ensure_go() {
             go_version=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
             if version_ge "$go_version" "$min_version"; then
                 print_success "Installed Go $go_version via Homebrew"
-                printf '%s' "$go_version"
+                SOURCE_GO_VERSION="$go_version"
                 return 0
             fi
         else
@@ -1028,7 +1353,7 @@ ensure_go() {
                     go_version=$("$candidate" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
                     if [ -n "$go_version" ] && version_ge "$go_version" "$min_version"; then
                         print_success "Detected Go $go_version after pkg install"
-                        printf '%s' "$go_version"
+                        SOURCE_GO_VERSION="$go_version"
                         return 0
                     fi
                 fi
@@ -1045,6 +1370,13 @@ try_binary_install() {
 
     info "Checking for pre-built binary..."
 
+    # Release metadata is parsed with python3 or jq; without either we cannot
+    # pick (or verify) a release asset.
+    if ! ensure_json_tool; then
+        warn "Skipping the pre-built binary: neither python3 nor jq is installed."
+        return 1
+    fi
+
     local release_json
     if [ -n "$INSTALL_VERSION" ]; then
         release_json=$(get_release "$INSTALL_VERSION") || {
@@ -1056,7 +1388,6 @@ try_binary_install() {
         release_json=$(get_release) || {
             error "Failed to fetch release information from GitHub"
             error "Check your internet connection or try again later"
-            error "You can also try: CAAM_SKIP_VERIFY=1 to skip verification"
             return 1
         }
     fi
@@ -1076,6 +1407,10 @@ try_binary_install() {
 
     if [ -z "$version" ]; then
         version="unknown"
+    fi
+
+    if [ -n "$INSTALL_VERSION" ] && ! versions_equal "$INSTALL_VERSION" "$version"; then
+        die "Release metadata does not match the requested version." $EXIT_VERIFY_FAILED
     fi
 
     # Check for idempotency (skip if same version already installed)
@@ -1098,7 +1433,7 @@ try_binary_install() {
 
     info "Downloading from GitHub..."
 
-    tmp_dir=$(make_tmp_dir)
+    make_tmp_dir tmp_dir || die "Could not prepare binary download directory." $EXIT_ERROR
 
     local ext=".tar.gz"
     if [[ "$download_url" == *.zip ]]; then
@@ -1107,19 +1442,13 @@ try_binary_install() {
 
     local archive_path="$tmp_dir/archive${ext}"
 
-    # Use spin for download if gum available
-    if [ "$HAS_GUM" = true ]; then
-        if ! spin "Downloading $asset_name" download_file "$download_url" "$archive_path" "false"; then
-            error "Download failed from: $download_url"
-            error "Try again or check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
-            return 1
-        fi
-    else
-        if ! download_file "$download_url" "$archive_path" "false"; then
-            error "Download failed from: $download_url"
-            error "Try again or check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
-            return 1
-        fi
+    # download_file is a Bash function; invoke it directly rather than passing
+    # it to gum spin (which can only exec external binaries, issue #137).
+    if ! download_file "$download_url" "$archive_path" "false"; then
+        error "Download failed from: $download_url"
+        BINARY_DOWNLOAD_FAILED=true
+        error "Try again or check https://github.com/${REPO_OWNER}/${REPO_NAME}/releases"
+        return 1
     fi
 
     if ! verify_release_assets "$release_json" "$version" "$asset_name" "$archive_path" "$tmp_dir"; then
@@ -1130,8 +1459,7 @@ try_binary_install() {
         error "A verification failure must never silently downgrade into installing"
         error "unsigned code (supply-chain safety). See issue #59."
         error ""
-        error "If you understand and accept the risk, re-run with:"
-        error "  CAAM_SKIP_VERIFY=1 curl -fsSL ... | bash"
+        error "Resolve the verification error above and re-run. Release authentication is mandatory."
         # Fail CLOSED: exit the whole installer rather than returning non-zero,
         # which the caller would treat as "no prebuilt binary" and fall through
         # to try_go_install (an unsigned build of main HEAD).
@@ -1192,9 +1520,8 @@ try_binary_install() {
 try_go_install() {
     info "Attempting to build from source with go build..."
 
-    local go_version
-    if ! go_version=$(ensure_go); then
-        error "Go 1.21 or later is required for building from source."
+    if ! ensure_go; then
+        error "Go 1.26.11 or later is required for building from source."
         error ""
         error "Install Go:"
         error "  macOS:         brew install go"
@@ -1203,10 +1530,10 @@ try_go_install() {
         return 1
     fi
 
-    info "Using Go $go_version"
+    info "Using Go $SOURCE_GO_VERSION"
 
     local tmp_dir src_dir repo_url tarball_url tarball_path build_output fetched=0
-    tmp_dir=$(make_tmp_dir)
+    make_tmp_dir tmp_dir || return 1
     src_dir="$tmp_dir/src"
     repo_url="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 
@@ -1221,7 +1548,9 @@ try_go_install() {
     fi
 
     if [ "$fetched" -ne 1 ]; then
-        tarball_url=$(cache_bust_url "https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/main")
+        local tarball_ref
+        tarball_ref=$(source_tarball_ref)
+        tarball_url=$(cache_bust_url "https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/${tarball_ref}")
         tarball_path="$tmp_dir/source.tar.gz"
         if ! download_file "$tarball_url" "$tarball_path" "false"; then
             error "Failed to download source tarball from GitHub."
@@ -1247,7 +1576,8 @@ try_go_install() {
            git -C "$src_dir" checkout -q "tags/${INSTALL_VERSION}" >/dev/null 2>&1; then
             info "Building source at tag ${INSTALL_VERSION}"
         else
-            warn "Could not check out tag ${INSTALL_VERSION}; building default branch."
+            error "Could not check out requested tag ${INSTALL_VERSION}; refusing to build a different source version."
+            return 1
         fi
     fi
 
@@ -1272,7 +1602,7 @@ try_go_install() {
             error "Go build failed."
             error ""
             error "Troubleshooting:"
-            error "  1. Ensure Go 1.21+ is installed: go version"
+            error "  1. Ensure Go 1.26.11+ is installed: go version"
             error "  2. Check for network issues (module downloads)"
             error "  3. Try manually: git clone $repo_url && cd ${REPO_NAME} && go build ./cmd/$BIN_NAME"
             return 1
@@ -1282,7 +1612,7 @@ try_go_install() {
             error "Go build failed."
             error ""
             error "Troubleshooting:"
-            error "  1. Ensure Go 1.21+ is installed: go version"
+            error "  1. Ensure Go 1.26.11+ is installed: go version"
             error "  2. Check for network issues (module downloads)"
             error "  3. Try manually: git clone $repo_url && cd ${REPO_NAME} && go build ./cmd/$BIN_NAME"
             return 1
@@ -1386,9 +1716,6 @@ main() {
 
     # First, try to download pre-built binary
     if try_binary_install "$platform"; then
-        # Cleanup backup on success
-        cleanup_backup
-
         # Run verification if requested
         if [ "$VERIFY_AFTER_INSTALL" = true ]; then
             if ! verify_installation; then
@@ -1397,6 +1724,8 @@ main() {
             fi
         fi
 
+        # Keep the previous binary until the optional executable check passes.
+        cleanup_backup
         show_quick_start
         exit $EXIT_SUCCESS
     fi
@@ -1406,11 +1735,11 @@ main() {
 
     if ! try_go_install; then
         rollback_on_failure
+        if [ "$BINARY_DOWNLOAD_FAILED" = true ]; then
+            die "Failed to install $BIN_NAME: the release download failed and the source build fallback did not succeed" $EXIT_DOWNLOAD_FAILED
+        fi
         die "Failed to install $BIN_NAME" $EXIT_BUILD_FAILED
     fi
-
-    # Cleanup backup on success
-    cleanup_backup
 
     # Run verification if requested
     if [ "$VERIFY_AFTER_INSTALL" = true ]; then
@@ -1420,6 +1749,7 @@ main() {
         fi
     fi
 
+    cleanup_backup
     show_quick_start
     exit $EXIT_SUCCESS
 }

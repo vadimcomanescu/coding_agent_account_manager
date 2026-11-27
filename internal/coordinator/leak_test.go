@@ -13,6 +13,7 @@ func TestAuthRequestLeakOnTimeout(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.AuthTimeout = 10 * time.Millisecond
 	cfg.StateTimeout = 10 * time.Millisecond
+	cfg.MaxLoginRetries = 0 // exercise the give-up path that resets to IDLE
 	cfg.PaneClient = &fakePaneClient{
 		panes: []Pane{{PaneID: 1}},
 	}
@@ -29,7 +30,8 @@ func TestAuthRequestLeakOnTimeout(t *testing.T) {
 	tracker.mu.Unlock()
 
 	coord.trackers[1] = tracker
-	coord.requests[reqID] = &AuthRequest{ID: reqID, Status: "pending"}
+	// Claimed by an agent that then never answered.
+	coord.requests[reqID] = &AuthRequest{ID: reqID, Status: "pending", ClaimedAt: time.Now().Add(-1 * time.Second)}
 
 	ctx := context.Background()
 

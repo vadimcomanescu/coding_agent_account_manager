@@ -2,15 +2,21 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -76,6 +82,404 @@ type AccountUsage struct {
 	LastUsed   time.Time `json:"last_used"`
 	UseCount   int       `json:"use_count"`
 	LastResult string    `json:"last_result"` // success, failed
+	// LimitedUntil is when the account's usage limit lifts; until then it
+	// is not signed in again (signing a pane in with it would only hit the
+	// limit again).
+	LimitedUntil time.Time `json:"limited_until,omitzero"`
+}
+
+// defaultLimitHold is how long an account at its usage limit is passed over
+// when the limit's reset cannot be read: Claude's five-hour session window.
+const defaultLimitHold = 5 * time.Hour
+
+// maxLimitHold caps a hold; the longest limit, the weekly one, lifts within
+// a week.
+const maxLimitHold = 8 * 24 * time.Hour
+
+var (
+	resetZoneRe  = regexp.MustCompile(`\(([A-Za-z]+(?:/[A-Za-z0-9_+-]+)+|UTC|GMT)\)`)
+	resetClockRe = regexp.MustCompile(`(?i)\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\b`)
+	resetDateRe  = regexp.MustCompile(`(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b`)
+	resetInRe    = regexp.MustCompile(`(?i)^in\s+(?:(\d+)\s*d\w*\s*)?(?:(\d+)\s*h\w*\s*)?(?:(\d+)\s*m\w*)?\s*$`)
+)
+
+// limitResetTime returns when a usage limit lifts, from the reset Claude Code
+// printed in its banner: "3pm (America/New_York)", "Oct 9, 3:30pm
+// (Europe/Paris)", "Oct 9", "in 2h 13m". A time without a zone is read in
+// the agent's local zone. Text it cannot read gives now+defaultLimitHold. The
+// result is never before now nor more than maxLimitHold after it.
+func limitResetTime(reset string, now time.Time) time.Time {
+	reset = strings.TrimSpace(reset)
+	t, ok := parseLimitReset(reset, now)
+	switch {
+	case !ok:
+		return now.Add(defaultLimitHold)
+	case t.Before(now):
+		return now
+	case t.After(now.Add(maxLimitHold)):
+		return now.Add(maxLimitHold)
+	}
+	return t
+}
+
+func parseLimitReset(reset string, now time.Time) (time.Time, bool) {
+	if m := resetInRe.FindStringSubmatch(reset); m != nil && (m[1] != "" || m[2] != "" || m[3] != "") {
+		d := time.Duration(atoiOr0(m[1]))*24*time.Hour + time.Duration(atoiOr0(m[2]))*time.Hour + time.Duration(atoiOr0(m[3]))*time.Minute
+		return now.Add(d), true
+	}
+
+	loc := time.Local
+	if m := resetZoneRe.FindStringSubmatch(reset); m != nil {
+		if l, err := time.LoadLocation(m[1]); err == nil {
+			loc = l
+		}
+	}
+	local := now.In(loc)
+
+	clock := resetClockRe.FindStringSubmatch(reset)
+	hour, minute := 0, 0
+	if clock != nil {
+		hour = atoiOr0(clock[1]) % 12
+		minute = atoiOr0(clock[2])
+		if strings.EqualFold(clock[3], "p") {
+			hour += 12
+		}
+		if minute > 59 {
+			return time.Time{}, false
+		}
+	}
+
+	if date := resetDateRe.FindStringSubmatch(reset); date != nil {
+		month, err := time.Parse("Jan", strings.ToUpper(date[1][:1])+strings.ToLower(date[1][1:3]))
+		day := atoiOr0(date[2])
+		if err != nil || day < 1 || day > 31 {
+			return time.Time{}, false
+		}
+		t := time.Date(local.Year(), month.Month(), day, hour, minute, 0, 0, loc)
+		// "Jan 2" read in late December is next year's.
+		if t.Before(local.Add(-48 * time.Hour)) {
+			t = t.AddDate(1, 0, 0)
+		}
+		return t, true
+	}
+
+	if clock == nil {
+		return time.Time{}, false
+	}
+	t := time.Date(local.Year(), local.Month(), local.Day(), hour, minute, 0, 0, loc)
+	if !t.After(local) {
+		t = t.AddDate(0, 0, 1)
+	}
+	return t, true
+}
+
+func atoiOr0(s string) int {
+	n, _ := strconv.Atoi(s)
+	return n
+}
+
+// UsagePath is where the agent keeps account usage and holds.
+func UsagePath() string {
+	configDir, _ := os.UserConfigDir()
+	return filepath.Join(configDir, "caam", "account_usage.json")
+}
+
+// HeldAccounts returns the accounts the agent holds at their usage limit at
+// now, with when each hold lifts, from the usage file at path.
+func HeldAccounts(path string, now time.Time) (map[string]time.Time, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var usages []*AccountUsage
+	if err := json.Unmarshal(data, &usages); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	held := map[string]time.Time{}
+	for _, u := range usages {
+		if u != nil && u.LimitedUntil.After(now) {
+			held[u.Email] = u.LimitedUntil
+		}
+	}
+	return held, nil
+}
+
+// unheldAccounts returns, in order, the accounts not held at their usage
+// limit at now.
+func unheldAccounts(accounts []string, usage map[string]*AccountUsage, now time.Time) []string {
+	var out []string
+	for _, acc := range accounts {
+		if u, ok := usage[acc]; ok && u.LimitedUntil.After(now) {
+			continue
+		}
+		out = append(out, acc)
+	}
+	return out
+}
+
+// holdAccount records that email is at its usage limit until until, keeping
+// a later hold already recorded. A configured account matching email in any
+// case is the one held.
+func holdAccount(usage map[string]*AccountUsage, configured []string, email string, until time.Time) string {
+	for _, acc := range configured {
+		if strings.EqualFold(acc, email) {
+			email = acc
+			break
+		}
+	}
+	u, ok := usage[email]
+	if !ok {
+		u = &AccountUsage{Email: email}
+		usage[email] = u
+	}
+	if until.After(u.LimitedUntil) {
+		u.LimitedUntil = until
+	}
+	return email
+}
+
+// accountsLimitedError is the agent declining a sign-in: every configured
+// account is at its usage limit, the first until Until.
+type accountsLimitedError struct {
+	Accounts int
+	Until    time.Time
+}
+
+func (e *accountsLimitedError) Error() string {
+	return fmt.Sprintf("all %d configured accounts are at their usage limit (the first lifts at %s); not signing in",
+		e.Accounts, e.Until.Local().Format("Jan 2 15:04 MST"))
+}
+
+// allLimitedError reports that every configured account is held, and when
+// the first hold lifts.
+func allLimitedError(accounts []string, usage map[string]*AccountUsage) error {
+	var first time.Time
+	for _, acc := range accounts {
+		if u, ok := usage[acc]; ok && (first.IsZero() || u.LimitedUntil.Before(first)) {
+			first = u.LimitedUntil
+		}
+	}
+	return &accountsLimitedError{Accounts: len(accounts), Until: first}
+}
+
+// failureCompletion reports err for a request; a decline because every
+// account is at its limit says when to ask again.
+func failureCompletion(requestID string, err error) completion {
+	c := completion{RequestID: requestID, Error: err.Error()}
+	var limited *accountsLimitedError
+	if errors.As(err, &limited) {
+		c.RetryAfter = limited.Until
+	}
+	return c
+}
+
+// oauthCompleter completes an OAuth flow and returns the challenge code and
+// the account that was used. *Browser is the production implementation.
+type oauthCompleter interface {
+	// CompleteOAuth signs in with one of accounts (most preferred first,
+	// any account when empty) and returns the code and the account used.
+	CompleteOAuth(ctx context.Context, oauthURL string, accounts []string) (string, string, error)
+}
+
+// accountOrder lists the accounts a flow may use: the selected one first,
+// then the rest in configured order as fallbacks. With no selection (no
+// accounts configured) it is empty, meaning any account.
+func accountOrder(selected string, configured []string) []string {
+	if selected == "" {
+		return nil
+	}
+	order := []string{selected}
+	for _, account := range configured {
+		if !strings.EqualFold(account, selected) {
+			order = append(order, account)
+		}
+	}
+	return order
+}
+
+// deliveryPolicy bounds acknowledged delivery of auth results.
+type deliveryPolicy struct {
+	// Timeout is the total time spent retrying one delivery.
+	Timeout time.Duration
+	// InitialDelay is the first retry delay; it doubles up to MaxDelay.
+	InitialDelay time.Duration
+	MaxDelay     time.Duration
+}
+
+// defaultDeliveryPolicy outlasts a dropped SSH tunnel reconnect while staying
+// within the coordinator's default auth timeout plus its replay window.
+var defaultDeliveryPolicy = deliveryPolicy{
+	Timeout:      90 * time.Second,
+	InitialDelay: 500 * time.Millisecond,
+	MaxDelay:     8 * time.Second,
+}
+
+// completion is the auth result body posted to a coordinator's /auth/complete.
+// Exactly one of Code or Error is set. Retries resend identical bytes, which
+// the coordinator acknowledges as a duplicate of the response it accepted.
+type completion struct {
+	RequestID string `json:"request_id"`
+	Code      string `json:"code,omitempty"`
+	Account   string `json:"account,omitempty"`
+	Error     string `json:"error,omitempty"`
+	// RetryAfter, with Error, is when an account frees up again.
+	RetryAfter time.Time `json:"retry_after,omitzero"`
+}
+
+// DeliveryRejectedError is a final coordinator rejection of an auth result,
+// such as an unknown, closed, or conflicting request. It is not retried.
+type DeliveryRejectedError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *DeliveryRejectedError) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("coordinator rejected auth result (HTTP %d)", e.StatusCode)
+	}
+	return fmt.Sprintf("coordinator rejected auth result (HTTP %d): %s", e.StatusCode, e.Message)
+}
+
+// retryableDeliveryStatus reports whether a coordinator status may succeed on
+// redelivery. Everything else other than 2xx is final.
+func retryableDeliveryStatus(code int) bool {
+	return code >= 500 || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests
+}
+
+// deliverCompletion posts an auth result until the coordinator acknowledges
+// it with a 2xx status or rejects it with a final status. Transport errors,
+// 5xx, 408, and 429 are retried with exponential backoff, so a response lost
+// on the way back is redelivered rather than reported as success or dropped.
+func deliverCompletion(ctx context.Context, client *http.Client, baseURL, token string, body completion, policy deliveryPolicy, logger *slog.Logger) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("encode auth result: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, policy.Timeout)
+	defer cancel()
+
+	delay := policy.InitialDelay
+	for attempt := 1; ; attempt++ {
+		status, msg, err := postCompletion(ctx, client, baseURL, token, payload)
+		if err == nil && status >= 200 && status < 300 {
+			logger.Info("auth result acknowledged",
+				"request_id", body.RequestID,
+				"attempt", attempt)
+			return nil
+		}
+		if err == nil && !retryableDeliveryStatus(status) {
+			return &DeliveryRejectedError{StatusCode: status, Message: msg}
+		}
+		if err == nil {
+			err = fmt.Errorf("HTTP %d: %s", status, msg)
+		}
+
+		logger.Warn("auth result delivery failed",
+			"request_id", body.RequestID,
+			"attempt", attempt,
+			"retry_in", delay,
+			"error", err)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("auth result for request %s not acknowledged after %d attempts: %w", body.RequestID, attempt, err)
+		case <-timer.C:
+		}
+		delay = min(delay*2, policy.MaxDelay)
+	}
+}
+
+func postCompletion(ctx context.Context, client *http.Client, baseURL, token string, payload []byte) (int, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/auth/complete", bytes.NewReader(payload))
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// The acknowledgement was cut off; redelivery is safe.
+		return 0, "", fmt.Errorf("read acknowledgement: %w", err)
+	}
+	return resp.StatusCode, coordinatorErrorMessage(data), nil
+}
+
+// coordinatorErrorMessage extracts the "error" field of a coordinator JSON
+// error body, falling back to the raw text.
+func coordinatorErrorMessage(data []byte) string {
+	var body struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(data, &body) == nil && body.Error != "" {
+		return body.Error
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// pendingRequest is one entry of a coordinator's /auth/pending list.
+type pendingRequest struct {
+	ID        string    `json:"id"`
+	PaneID    int       `json:"pane_id"`
+	URL       string    `json:"url"`
+	CreatedAt time.Time `json:"created_at"`
+	// LimitedAccount hit its usage limit in the pane, which LimitReset
+	// lifts ("3pm (America/New_York)"); both are empty when unknown.
+	LimitedAccount        string `json:"limited_account,omitempty"`
+	LimitReset            string `json:"limit_reset,omitempty"`
+	LimitedAccountID      string `json:"limited_account_id,omitempty"`
+	LimitedOrganizationID string `json:"limited_organization_id,omitempty"`
+}
+
+// Browser account configuration contains emails, not Claude organization
+// identities. Decline an organization-specific handoff instead of treating
+// every organization of that email as one account or selecting one by chance.
+func organizationSelectionError(p pendingRequest) error {
+	if p.LimitedAccountID != "" || p.LimitedOrganizationID != "" {
+		return fmt.Errorf("automatic browser login cannot select a verified Claude organization; activate a verified account-and-organization profile")
+	}
+	return nil
+}
+
+// fetchPending lists a coordinator's pending auth requests.
+func fetchPending(ctx context.Context, client *http.Client, baseURL, token string) ([]pendingRequest, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/auth/pending", nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, coordinatorErrorMessage(data))
+	}
+
+	var pending []pendingRequest
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&pending); err != nil {
+		return nil, fmt.Errorf("decode pending requests: %w", err)
+	}
+	return pending, nil
 }
 
 // Agent handles OAuth completion for the coordinator.
@@ -84,9 +488,14 @@ type Agent struct {
 	logger       *slog.Logger
 	server       *http.Server
 	browser      *Browser
+	oauth        oauthCompleter
+	oauthMu      sync.Mutex // serializes browser flows (see runOAuth)
+	client       *http.Client
+	delivery     deliveryPolicy
 	accountUsage map[string]*AccountUsage
 	usagePath    string
 	mu           sync.RWMutex
+	cancel       context.CancelFunc
 	stopCh       chan struct{}
 	doneCh       chan struct{}
 	running      bool
@@ -103,13 +512,13 @@ func New(config Config) *Agent {
 		config.Logger = slog.Default()
 	}
 
-	// Determine usage storage path
-	configDir, _ := os.UserConfigDir()
-	usagePath := filepath.Join(configDir, "caam", "account_usage.json")
+	usagePath := UsagePath()
 
 	agent := &Agent{
 		config:       config,
 		logger:       config.Logger,
+		client:       &http.Client{Timeout: 15 * time.Second},
+		delivery:     defaultDeliveryPolicy,
 		accountUsage: make(map[string]*AccountUsage),
 		usagePath:    usagePath,
 		stopCh:       make(chan struct{}),
@@ -153,6 +562,13 @@ func (a *Agent) Start(ctx context.Context) error {
 		Headless:    a.config.Headless,
 		Logger:      a.logger,
 	})
+	a.logger.Info("using Chrome profile", "dir", a.browser.UserDataDir())
+	if a.oauth == nil {
+		a.oauth = a.browser
+	}
+
+	// Stop cancels in-flight OAuth flows and deliveries.
+	ctx, a.cancel = context.WithCancel(ctx)
 
 	// Set up HTTP server
 	mux := http.NewServeMux()
@@ -163,6 +579,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", a.config.Port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
+		a.cancel()
 		a.mu.Lock()
 		a.running = false
 		close(a.doneCh)
@@ -172,7 +589,7 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	a.server = &http.Server{
 		Addr:         addr,
-		Handler:      a.withLogging(mux),
+		Handler:      a.withLogging(loopbackOnly(mux)),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 120 * time.Second, // Long timeout for OAuth
 	}
@@ -212,6 +629,9 @@ func (a *Agent) Stop(ctx context.Context) error {
 		// Already closed
 	default:
 		close(a.stopCh)
+	}
+	if a.cancel != nil {
+		a.cancel()
 	}
 
 	if a.server != nil {
@@ -254,132 +674,154 @@ func (a *Agent) pollLoop(ctx context.Context) {
 
 // checkPendingRequests fetches and processes pending auth requests.
 func (a *Agent) checkPendingRequests(ctx context.Context) {
-	url := a.config.CoordinatorURL + "/auth/pending"
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	pending, err := fetchPending(ctx, a.client, a.config.CoordinatorURL, a.config.CoordinatorToken)
 	if err != nil {
-		return
-	}
-	if a.config.CoordinatorToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.config.CoordinatorToken)
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		a.logger.Debug("failed to reach coordinator", "error", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		a.logger.Debug("coordinator returned non-200", "status", resp.StatusCode)
-		return
-	}
-
-	var pending []struct {
-		ID        string    `json:"id"`
-		PaneID    int       `json:"pane_id"`
-		URL       string    `json:"url"`
-		CreatedAt time.Time `json:"created_at"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&pending); err != nil {
-		a.logger.Debug("failed to decode pending requests", "error", err)
+		a.logger.Debug("failed to fetch pending requests", "error", err)
 		return
 	}
 
 	for _, p := range pending {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := organizationSelectionError(p); err != nil {
+			if deliveryErr := deliverCompletion(ctx, a.client, a.config.CoordinatorURL, a.config.CoordinatorToken,
+				failureCompletion(p.ID, err), a.delivery, a.logger); deliveryErr != nil {
+				a.logger.Warn("could not deliver organization selection refusal", "request_id", p.ID, "error", deliveryErr)
+			}
+			continue
+		}
+		a.noteLimit(p)
 		a.processAuthRequest(ctx, p.ID, p.URL)
 	}
 }
 
-// processAuthRequest handles a single auth request.
-func (a *Agent) processAuthRequest(ctx context.Context, requestID, authURL string) {
-	a.logger.Info("processing auth request",
-		"request_id", requestID,
-		"url_prefix", truncate(authURL, 50))
-
-	// Select account
-	account := a.selectAccount()
-	if a.OnAuthStart != nil {
-		a.OnAuthStart(authURL, account)
+// noteLimit holds the account a request reports at its usage limit.
+func (a *Agent) noteLimit(p pendingRequest) {
+	if p.LimitedAccount == "" || organizationSelectionError(p) != nil {
+		return
 	}
+	until := limitResetTime(p.LimitReset, time.Now())
+	a.mu.Lock()
+	held := holdAccount(a.accountUsage, a.config.Accounts, p.LimitedAccount, until)
+	a.mu.Unlock()
+	a.logger.Info("account at its usage limit; passing over it",
+		"request_id", p.ID,
+		"account", held,
+		"until", until.Format(time.RFC3339))
+	go a.saveUsage()
+}
 
-	// Complete OAuth
-	code, usedAccount, err := a.browser.CompleteOAuth(ctx, authURL, account)
+// processAuthRequest completes one auth request and delivers the result.
+// Success callbacks and usage records happen only after the coordinator
+// acknowledges the code.
+func (a *Agent) processAuthRequest(ctx context.Context, requestID, authURL string) {
+	a.logger.Info("processing auth request", "request_id", requestID)
+
+	account, code, usedAccount, err := a.runOAuth(ctx, authURL, "", func(account string) {
+		if a.OnAuthStart != nil {
+			a.OnAuthStart(authURL, account)
+		}
+	})
 	if err != nil {
 		a.logger.Error("OAuth failed",
 			"request_id", requestID,
 			"error", err)
 		a.recordUsage(account, "failed")
 
+		// Report the failure so the pane stops waiting for a code.
+		if derr := deliverCompletion(ctx, a.client, a.config.CoordinatorURL, a.config.CoordinatorToken,
+			failureCompletion(requestID, err), a.delivery, a.logger); derr != nil {
+			a.logger.Warn("failed to report OAuth failure", "request_id", requestID, "error", derr)
+		}
+
 		if a.OnAuthFailed != nil {
 			a.OnAuthFailed(account, err)
 		}
-
-		// Send error to coordinator
-		a.sendAuthComplete(ctx, requestID, "", "", err.Error())
 		return
 	}
 
 	a.logger.Info("OAuth completed",
 		"request_id", requestID,
 		"account", usedAccount)
-	a.recordUsage(usedAccount, "success")
 
+	if err := deliverCompletion(ctx, a.client, a.config.CoordinatorURL, a.config.CoordinatorToken,
+		completion{RequestID: requestID, Code: code, Account: usedAccount}, a.delivery, a.logger); err != nil {
+		a.logger.Error("auth code not delivered",
+			"request_id", requestID,
+			"account", usedAccount,
+			"error", err)
+		a.recordUsage(usedAccount, "undelivered")
+		if a.OnAuthFailed != nil {
+			a.OnAuthFailed(usedAccount, fmt.Errorf("deliver code for request %s: %w", requestID, err))
+		}
+		return
+	}
+
+	a.recordUsage(usedAccount, "success")
 	if a.OnAuthComplete != nil {
 		a.OnAuthComplete(usedAccount, code)
 	}
-
-	// Send success to coordinator
-	a.sendAuthComplete(ctx, requestID, code, usedAccount, "")
 }
 
-// sendAuthComplete sends the auth result to the coordinator.
-func (a *Agent) sendAuthComplete(ctx context.Context, requestID, code, account, errMsg string) {
-	url := a.config.CoordinatorURL + "/auth/complete"
+// runOAuth selects an account (unless one is requested) and completes one
+// OAuth flow. Flows are serialized because they share one Chrome profile
+// directory, and each selection must see the account the previous flow used.
+func (a *Agent) runOAuth(ctx context.Context, authURL, requested string, onStart func(account string)) (account, code, usedAccount string, err error) {
+	a.oauthMu.Lock()
+	defer a.oauthMu.Unlock()
 
-	body := map[string]string{
-		"request_id": requestID,
-		"code":       code,
-		"account":    account,
+	account = requested
+	accounts := []string{requested}
+	if account == "" {
+		// Accounts at their usage limit are neither chosen nor fallen back
+		// to; with all of them there, signing in would only hit a limit.
+		a.mu.RLock()
+		available := unheldAccounts(a.config.Accounts, a.accountUsage, time.Now())
+		if len(a.config.Accounts) > 0 && len(available) == 0 {
+			err = allLimitedError(a.config.Accounts, a.accountUsage)
+		}
+		a.mu.RUnlock()
+		if err != nil {
+			return "", "", "", err
+		}
+		account = a.selectAccount()
+		accounts = accountOrder(account, available)
 	}
-	if errMsg != "" {
-		body["error"] = errMsg
+	if onStart != nil {
+		onStart(account)
 	}
-
-	bodyJSON, _ := json.Marshal(body)
-
-	req, err := http.NewRequestWithContext(ctx, "POST", url,
-		jsonReader(bodyJSON))
-	if err != nil {
-		a.logger.Error("failed to create request", "error", err)
-		return
+	code, usedAccount, err = a.oauth.CompleteOAuth(ctx, authURL, accounts)
+	if usedAccount != "" {
+		a.touchAccount(usedAccount)
+	} else {
+		a.touchAccount(account)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if a.config.CoordinatorToken != "" {
-		req.Header.Set("Authorization", "Bearer "+a.config.CoordinatorToken)
-	}
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		a.logger.Error("failed to send auth complete", "error", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		a.logger.Warn("coordinator returned error", "status", resp.StatusCode)
-	}
+	return account, code, usedAccount, err
 }
 
-// selectAccount chooses which account to use based on strategy.
+// touchAccount marks an account as just used without recording an outcome.
+func (a *Agent) touchAccount(email string) {
+	if email == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	usage, ok := a.accountUsage[email]
+	if !ok {
+		usage = &AccountUsage{Email: email}
+		a.accountUsage[email] = usage
+	}
+	usage.LastUsed = time.Now()
+}
+
+// selectAccount chooses which account to use based on strategy, among the
+// accounts not at their usage limit.
 func (a *Agent) selectAccount() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	accounts := a.config.Accounts
+	accounts := unheldAccounts(a.config.Accounts, a.accountUsage, time.Now())
 	if len(accounts) == 0 {
 		return "" // Will use whatever account is currently logged in
 	}
@@ -389,6 +831,8 @@ func (a *Agent) selectAccount() string {
 		return a.selectLRU(accounts)
 	case StrategyRoundRobin:
 		return a.selectRoundRobin(accounts)
+	case StrategyRandom:
+		return accounts[rand.IntN(len(accounts))]
 	default:
 		return accounts[0]
 	}
@@ -482,7 +926,8 @@ func (a *Agent) saveUsage() {
 	a.mu.RLock()
 	usages := make([]*AccountUsage, 0, len(a.accountUsage))
 	for _, u := range a.accountUsage {
-		usages = append(usages, u)
+		copied := *u
+		usages = append(usages, &copied)
 	}
 	a.mu.RUnlock()
 
@@ -541,10 +986,11 @@ func (a *Agent) withLogging(next http.Handler) http.Handler {
 func (a *Agent) handleStatus(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	accountCount := len(a.accountUsage)
+	running := a.running
 	a.mu.RUnlock()
 
 	status := map[string]interface{}{
-		"running":       a.running,
+		"running":       running,
 		"coordinator":   a.config.CoordinatorURL,
 		"account_count": accountCount,
 		"strategy":      a.config.AccountStrategy,
@@ -558,7 +1004,8 @@ func (a *Agent) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()
 	usages := make([]*AccountUsage, 0, len(a.accountUsage))
 	for _, u := range a.accountUsage {
-		usages = append(usages, u)
+		copied := *u
+		usages = append(usages, &copied)
 	}
 	a.mu.RUnlock()
 
@@ -590,13 +1037,12 @@ func (a *Agent) handleAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "url required", http.StatusBadRequest)
 		return
 	}
-
-	account := req.Account
-	if account == "" {
-		account = a.selectAccount()
+	if err := validateAuthorizeURL(req.URL); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	code, usedAccount, err := a.browser.CompleteOAuth(r.Context(), req.URL, account)
+	account, code, usedAccount, err := a.runOAuth(r.Context(), req.URL, req.Account, nil)
 	if err != nil {
 		a.recordUsage(account, "failed")
 		w.Header().Set("Content-Type", "application/json")
@@ -612,6 +1058,34 @@ func (a *Agent) handleAuth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// loopbackOnly rejects requests whose Host header names anything but a
+// loopback address. The agent listens on 127.0.0.1, but a web page can still
+// reach it through DNS rebinding, and then sends its own host name.
+func loopbackOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackHost(r.Host) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackHost reports whether a Host header value (host or host:port)
+// names localhost or a loopback IP such as 127.0.0.1 or [::1].
+func isLoopbackHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // Helpers
 
 func truncate(s string, n int) string {
@@ -619,22 +1093,4 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
-}
-
-type jsonReaderWrapper struct {
-	data []byte
-	pos  int
-}
-
-func jsonReader(data []byte) *jsonReaderWrapper {
-	return &jsonReaderWrapper{data: data}
-}
-
-func (r *jsonReaderWrapper) Read(p []byte) (n int, err error) {
-	if r.pos >= len(r.data) {
-		return 0, io.EOF
-	}
-	n = copy(p, r.data[r.pos:])
-	r.pos += n
-	return n, nil
 }

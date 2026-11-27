@@ -15,6 +15,7 @@ import (
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/handoff"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/pty"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/rotation"
@@ -26,25 +27,27 @@ var ExecCommand = exec.CommandContext
 
 // SmartRunner orchestrates the auto-handoff flow for seamless profile switching.
 // When a rate limit is detected in the CLI output, SmartRunner:
-// 1. Selects the best backup profile using the rotation algorithm
-// 2. Swaps auth files atomically
-// 3. Injects the login command via PTY
-// 4. Waits for login completion
+// 1. Records the limit and selects an untried backup within the retry budget
+// 2. Waits for configured backoff and any explicit Retry-After deadline
+// 3. Swaps auth files atomically
+// 4. Injects the login command via PTY and waits for login completion
 // 5. Notifies the user and continues execution
 //
 // On any failure, it rolls back to the original profile and shows manual instructions.
 type SmartRunner struct {
 	*Runner
 
-	detector      *ratelimit.Detector
-	rotation      *rotation.Selector
-	vault         *authfile.Vault
-	db            *caamdb.DB
-	authPool      *authpool.AuthPool
-	ptyController pty.Controller
-	loginHandler  handoff.LoginHandler
-	handoffConfig *config.HandoffConfig
-	notifier      notify.Notifier
+	detector        *ratelimit.Detector
+	rotation        *rotation.Selector
+	vault           *authfile.Vault
+	db              *caamdb.DB
+	authPool        *authpool.AuthPool
+	ptyController   pty.Controller
+	loginHandler    handoff.LoginHandler
+	handoffConfig   *config.HandoffConfig
+	retryConfig     config.WrapConfig
+	notifier        notify.Notifier
+	beforeSelection func(context.Context, []string) error
 
 	// Cooldown duration to apply when rate limit is detected
 	cooldownDuration time.Duration
@@ -54,6 +57,9 @@ type SmartRunner struct {
 	currentProfile  string
 	previousProfile string // For rollback
 	handoffCount    int
+	handoffAttempts int
+	rateLimitHit    bool
+	triedProfiles   map[string]bool
 	state           HandoffState
 
 	// WaitGroup to track background goroutines (handleRateLimit)
@@ -71,21 +77,41 @@ type loginResult struct {
 
 // SmartRunnerOptions configures the SmartRunner.
 type SmartRunnerOptions struct {
-	HandoffConfig    *config.HandoffConfig
+	HandoffConfig *config.HandoffConfig
+
+	// RetryConfig is the effective provider retry policy. Nil uses defaults;
+	// an explicit MaxRetries of zero disables automatic handoffs.
+	RetryConfig      *config.WrapConfig
 	Notifier         notify.Notifier
 	Vault            *authfile.Vault
 	DB               *caamdb.DB
 	AuthPool         *authpool.AuthPool
 	Rotation         *rotation.Selector
 	CooldownDuration time.Duration
+	// BeforeSelection refreshes selection evidence for the candidates before
+	// recovery and again after backoff. Errors stop before swapping live auth
+	// or consuming a handoff attempt. Nil keeps ordinary no-fetch behavior.
+	BeforeSelection func(context.Context, []string) error
 }
 
 // NewSmartRunner creates a new SmartRunner.
 func NewSmartRunner(runner *Runner, opts SmartRunnerOptions) *SmartRunner {
-	// Use default notifier if none provided
+	// Without a notifier, alerts are dropped. (A zero TerminalNotifier has no
+	// writer and would panic on the first handoff.)
 	notifier := opts.Notifier
 	if notifier == nil {
-		notifier = &notify.TerminalNotifier{}
+		notifier = notify.Nop()
+	}
+	if opts.Vault != nil && opts.Rotation != nil {
+		opts.Rotation.SetVaultPath(opts.Vault.BasePath())
+	}
+	retryConfig := config.DefaultWrapConfig()
+	if opts.RetryConfig != nil {
+		retryConfig = *opts.RetryConfig
+	}
+	cooldownDuration := retryConfig.CooldownDuration.Duration()
+	if opts.CooldownDuration > 0 {
+		cooldownDuration = opts.CooldownDuration
 	}
 
 	return &SmartRunner{
@@ -95,8 +121,11 @@ func NewSmartRunner(runner *Runner, opts SmartRunnerOptions) *SmartRunner {
 		authPool:         opts.AuthPool,
 		rotation:         opts.Rotation,
 		handoffConfig:    opts.HandoffConfig,
+		retryConfig:      retryConfig,
 		notifier:         notifier,
-		cooldownDuration: opts.CooldownDuration,
+		cooldownDuration: cooldownDuration,
+		beforeSelection:  opts.BeforeSelection,
+		triedProfiles:    make(map[string]bool),
 		state:            Running,
 		loginDone:        make(chan loginResult, 1),
 	}
@@ -158,7 +187,15 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 		return r.Runner.Run(ctx, opts)
 	}
 
+	r.mu.Lock()
 	r.currentProfile = opts.Profile.Name
+	r.previousProfile = ""
+	r.handoffCount = 0
+	r.handoffAttempts = 0
+	r.rateLimitHit = false
+	r.triedProfiles = make(map[string]bool)
+	r.state = Running
+	r.mu.Unlock()
 
 	// Log activation event
 	if r.db != nil {
@@ -194,7 +231,7 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 				EndedAt:         time.Now(),
 				DurationSeconds: int(duration.Seconds()),
 				ExitCode:        finalCode,
-				RateLimitHit:    r.handoffCount > 0,
+				RateLimitHit:    r.rateLimitHit,
 			}
 			if r.handoffCount > 0 {
 				session.Notes = fmt.Sprintf("handoffs: %d", r.handoffCount)
@@ -215,9 +252,14 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	// vault-based runs (`caam run`) swap auth files inside the REAL home, so
 	// injecting the provider's isolated-profile env (HOME, CODEX_HOME, ...)
 	// would point the tool at a profile directory that is not logged in.
-	var providerEnv map[string]string
+	environment := provider.CredentialEnvironment(opts.Provider.ID(), provider.AuthModeOAuth, nil)
 	if !opts.UseGlobalEnv {
-		providerEnv, err = opts.Provider.Env(ctx, opts.Profile)
+		if preparer, ok := opts.Provider.(provider.ProfileRunPreparer); ok {
+			if err := preparer.PrepareRun(ctx, opts.Profile); err != nil {
+				return fmt.Errorf("prepare %s launch: %w", opts.Provider.ID(), err)
+			}
+		}
+		environment, err = provider.ProfileEnvironment(ctx, opts.Provider, opts.Profile)
 		if err != nil {
 			return fmt.Errorf("get provider env: %w", err)
 		}
@@ -227,24 +269,7 @@ func (r *SmartRunner) Run(ctx context.Context, opts RunOptions) (err error) {
 	bin := opts.Provider.DefaultBin()
 	cmd := ExecCommand(ctx, bin, opts.Args...)
 
-	// Apply env (same as Runner.Run)
-	envMap := make(map[string]string)
-	for _, e := range os.Environ() {
-		parts := splitEnv(e)
-		if len(parts) == 2 {
-			envMap[parts[0]] = parts[1]
-		}
-	}
-	for k, v := range providerEnv {
-		envMap[k] = v
-	}
-	for k, v := range opts.Env {
-		envMap[k] = v
-	}
-	cmd.Env = make([]string, 0, len(envMap))
-	for k, v := range envMap {
-		cmd.Env = append(cmd.Env, k+"="+v)
-	}
+	cmd.Env = provider.MergeEnvironment(os.Environ(), environment, opts.Env)
 	if opts.WorkDir != "" {
 		cmd.Dir = opts.WorkDir
 	}
@@ -355,10 +380,50 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 		return // Already handling or failed
 	}
 	r.state = RateLimited
+	currentProfile := r.currentProfile
+	r.rateLimitHit = true
+	r.triedProfiles[currentProfile] = true
+	attempt := r.handoffAttempts
 	r.mu.Unlock()
 
+	if r.db != nil {
+		_ = r.db.Log(caamdb.Event{
+			Type:        caamdb.EventError,
+			Provider:    r.loginHandler.Provider(),
+			ProfileName: currentProfile,
+			Timestamp:   time.Now(),
+			Details:     map[string]any{"operation": "session", "reason": "rate_limit"},
+		})
+	}
+
+	// A known-limited account stays unavailable even if there is no backup,
+	// retries are disabled, or a later handoff fails. The in-session tried set
+	// also protects callers that do not have a database or persistent cooldown.
+	if r.cooldownDuration > 0 {
+		if r.authPool != nil {
+			r.authPool.SetCooldown(r.loginHandler.Provider(), currentProfile, r.cooldownDuration)
+		}
+		if r.db != nil {
+			if _, err := r.db.SetCooldown(r.loginHandler.Provider(), currentProfile, time.Now(), r.cooldownDuration, "auto-detected via SmartRunner"); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to record rate limit cooldown: %v\n", err)
+			}
+		}
+	}
+	if !r.retryConfig.ShouldRetry(attempt) {
+		r.failWithManual("retry budget exhausted after %d handoff attempts", attempt)
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		r.failWithManual("context cancelled before handoff: %v", err)
+		return
+	}
+	if r.vault == nil || r.rotation == nil {
+		r.failWithManual("no backup selection is configured")
+		return
+	}
+
 	// Notify detection
-	r.notifyHandoff(r.currentProfile, "selecting backup...")
+	r.notifyHandoff(currentProfile, "selecting backup...")
 
 	// Get file set
 	fileSet, ok := authfile.GetAuthFileSet(r.loginHandler.Provider())
@@ -367,20 +432,18 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 		return
 	}
 
-	// 1. Save current state for rollback
-	r.previousProfile = r.currentProfile
-	if err := r.vault.Backup(fileSet, r.currentProfile); err != nil {
-		r.failWithManual("failed to backup current profile: %v", err)
+	spmConfig, err := config.LoadSPMConfig()
+	if err != nil {
+		r.failWithManual("load activation safety settings: %v", err)
 		return
 	}
+	switchOptions := authfile.SwitchOptions{
+		BackupMode:     spmConfig.Safety.AutoBackupBeforeSwitch,
+		MaxAutoBackups: spmConfig.Safety.MaxAutoBackups,
+	}
+	r.previousProfile = ""
 
-	defer func() {
-		if r.getState() == HandoffFailed {
-			r.rollback(fileSet)
-		}
-	}()
-
-	// 2. Select best backup profile
+	// Select and validate a target before preserving or changing live auth.
 	r.setState(SelectingBackup)
 
 	// Get all profiles
@@ -389,50 +452,91 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 		r.failWithManual("failed to list profiles: %v", err)
 		return
 	}
+	r.mu.Lock()
+	available := make([]string, 0, len(profiles))
+	for _, name := range profiles {
+		if !r.triedProfiles[name] {
+			available = append(available, name)
+		}
+	}
+	r.mu.Unlock()
 
 	// Select best
-	selection, err := r.rotation.Select(r.loginHandler.Provider(), profiles, r.currentProfile)
+	if r.beforeSelection != nil {
+		if err := r.beforeSelection(ctx, available); err != nil {
+			r.failWithManual("refresh backup profile eligibility: %v", err)
+			return
+		}
+	}
+	selection, err := r.rotation.Select(r.loginHandler.Provider(), available, currentProfile)
 	if err != nil {
 		r.failWithManual("no backup available: %v", err)
 		return
 	}
 	nextProfile := selection.Selected
 
-	if nextProfile == r.currentProfile {
+	if nextProfile == currentProfile {
 		r.failWithManual("no other profiles available")
 		return
 	}
 
-	r.notifyHandoff(r.currentProfile, nextProfile)
-
-	// 3. Mark current profile as in cooldown (if authPool is available)
-	cooldownDuration := r.cooldownDuration
-	if cooldownDuration == 0 {
-		cooldownDuration = 60 * time.Minute
+	backoff := r.retryConfig.NextDelay(attempt)
+	delay := ratelimit.RetryDelay(backoff, r.retryAfter(), time.Now())
+	r.notifyHandoff(currentProfile, nextProfile,
+		fmt.Sprintf("Rate limit on %s; retrying with %s after %s.", currentProfile, nextProfile, delay.Round(time.Millisecond)))
+	if err := r.waitBeforeHandoff(ctx, backoff); err != nil {
+		r.failWithManual("context cancelled before handoff: %v", err)
+		return
 	}
-	if r.authPool != nil {
-		r.authPool.SetCooldown(r.loginHandler.Provider(), r.currentProfile, cooldownDuration)
-	}
-	if r.db != nil {
-		r.db.SetCooldown(r.loginHandler.Provider(), r.currentProfile, time.Now(), cooldownDuration, "auto-detected via SmartRunner")
-	}
-
-	// 4. Swap auth files
-	r.setState(SwappingAuth)
-	// Re-snapshot the outgoing profile's (possibly rotated) tokens before we
-	// clobber the live auth file. Codex/ChatGPT rotate refresh tokens in place
-	// while a profile is active; skipping this leaves the vault copy stale and a
-	// later restore would replay a consumed refresh_token, bricking the account.
-	// Non-fatal.
-	if r.currentProfile != "" && r.currentProfile != nextProfile {
-		if err := r.vault.ResnapshotOutgoing(fileSet, r.currentProfile, nextProfile); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not re-snapshot outgoing profile %s: %v\n", r.currentProfile, err)
+	// Expiry, quota, provider verdicts, and cooldowns can change during the wait.
+	// Recheck the chosen target before consuming a retry or changing live auth.
+	if r.beforeSelection != nil {
+		if err := r.beforeSelection(ctx, []string{nextProfile}); err != nil {
+			r.failWithManual("refresh selected profile eligibility: %v", err)
+			return
 		}
 	}
-	if err := r.vault.Restore(fileSet, nextProfile); err != nil {
+	if _, err := r.rotation.Select(r.loginHandler.Provider(), []string{nextProfile}, ""); err != nil {
+		r.failWithManual("selected profile is no longer launchable: %v", err)
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		r.failWithManual("context cancelled before handoff: %v", err)
+		return
+	}
+	// Charge attempts before changing auth, including failed swaps and logins.
+	// Never select a failed handoff target again after rollback in this session.
+	r.mu.Lock()
+	r.handoffAttempts++
+	r.triedProfiles[nextProfile] = true
+	r.mu.Unlock()
+
+	// 4. Preserve the verified live owner and swap auth files. The profile
+	// label recorded at process startup may no longer own the live login.
+	r.setState(SwappingAuth)
+	switchResult, err := r.vault.Switch(fileSet, nextProfile, switchOptions)
+	if switchResult != nil {
+		r.previousProfile = switchResult.AutoBackup
+		if r.previousProfile == "" {
+			r.previousProfile = switchResult.ResnapshottedProfile
+		}
+		if r.previousProfile == "" {
+			r.previousProfile = switchResult.PreviousProfile
+		}
+		for _, warning := range switchResult.Warnings {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
+		}
+	}
+	defer func() {
+		if r.getState() == HandoffFailed && switchResult != nil && switchResult.RestoreStarted {
+			r.rollback(fileSet, switchOptions)
+		}
+	}()
+	if err != nil {
 		r.failWithManual("auth swap failed: %v", err)
 		return
 	}
+	r.currentProfile = nextProfile
 
 	// 5. Inject login command
 	r.drainLoginDone()
@@ -470,6 +574,16 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	r.currentProfile = nextProfile
 	r.handoffCount++
 
+	if r.db != nil {
+		_ = r.db.Log(caamdb.Event{
+			Type:        caamdb.EventSwitch,
+			Provider:    r.loginHandler.Provider(),
+			ProfileName: nextProfile,
+			Timestamp:   time.Now(),
+			Details:     map[string]any{"from": currentProfile, "reason": "rate_limit"},
+		})
+	}
+
 	r.notifier.Notify(&notify.Alert{
 		Level:   notify.Info,
 		Title:   "Profile switched",
@@ -481,10 +595,49 @@ func (r *SmartRunner) handleRateLimit(ctx context.Context) {
 	r.setState(Running)
 }
 
-func (r *SmartRunner) rollback(fileSet authfile.AuthFileSet) {
+func (r *SmartRunner) retryAfter() time.Time {
+	if r.detector == nil {
+		return time.Time{}
+	}
+	return r.detector.RetryAfter()
+}
+
+// Keep backoff interruptible while the child continues to own its terminal.
+// A Retry-After header received during the wait may extend its deadline.
+func (r *SmartRunner) waitBeforeHandoff(ctx context.Context, backoff time.Duration) error {
+	backoffUntil := time.Now().Add(backoff)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		now := time.Now()
+		delay := ratelimit.RetryDelay(backoffUntil.Sub(now), r.retryAfter(), now)
+		if delay <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (r *SmartRunner) rollback(fileSet authfile.AuthFileSet, opts authfile.SwitchOptions) {
+	if r.previousProfile == "" {
+		r.failWithManual("no preserved outgoing login is available for rollback")
+		return
+	}
 	fmt.Fprintf(os.Stderr, "Rolling back to %s...\n", r.previousProfile)
-	if err := r.vault.Restore(fileSet, r.previousProfile); err != nil {
-		fmt.Fprintf(os.Stderr, "Rollback failed: %v\n", err)
+	result, err := r.vault.Switch(fileSet, r.previousProfile, opts)
+	if err != nil {
+		r.failWithManual("rollback failed: %v", err)
+		return
+	}
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 	}
 	r.currentProfile = r.previousProfile
 	r.detector.Reset()
@@ -546,12 +699,9 @@ func (r *SmartRunner) monitorOutput(ctx context.Context, ctrl pty.Controller, do
 	// Use a local flag to prevent repeated dispatching within this loop context
 	dispatched := false
 
-	writer := ratelimit.NewObservingWriter(r.detector, func(line string) {
-		if observer != nil {
-			observer(line)
-		}
-		// This callback is triggered when a complete line is processed
-		if !dispatched && r.detector.Detected() {
+	writer := ratelimit.NewObservingWriter(r.detector, observer)
+	dispatch := func() {
+		if !dispatched && r.getState() == Running && r.detector.Detected() {
 			dispatched = true
 			r.wg.Add(1)
 			go func() {
@@ -559,8 +709,11 @@ func (r *SmartRunner) monitorOutput(ctx context.Context, ctrl pty.Controller, do
 				r.handleRateLimit(ctx)
 			}()
 		}
-	})
-	defer writer.Flush()
+	}
+	defer func() {
+		writer.Flush()
+		dispatch()
+	}()
 
 	// draining indicates context was cancelled and we're draining remaining PTY output
 	draining := false
@@ -586,11 +739,14 @@ func (r *SmartRunner) monitorOutput(ctx context.Context, ctrl pty.Controller, do
 					dispatched = false
 				}
 
-				// Only write to observer if we haven't dispatched yet
-				// This avoids processing output during the handoff transition
-				if !dispatched {
-					writer.Write([]byte(output))
-				}
+				// Process the whole packet before dispatch so headers following
+				// the error line are visible to the retry wait.
+				writer.Write([]byte(output))
+				dispatch()
+			} else if state == RateLimited || state == SelectingBackup {
+				// The process still owns its terminal during backoff. Keep
+				// collecting headers that may extend the server's deadline.
+				writer.Write([]byte(output))
 			} else if state == LoggingIn {
 				// Check for login completion and signal handleRateLimit
 				if r.loginHandler.IsLoginComplete(output) {
@@ -627,13 +783,4 @@ func (r *SmartRunner) monitorOutput(ctx context.Context, ctrl pty.Controller, do
 		}
 		// In drain mode, continue looping without delay until ReadOutput returns EOF
 	}
-}
-
-func splitEnv(s string) []string {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '=' {
-			return []string{s[:i], s[i+1:]}
-		}
-	}
-	return []string{s}
 }

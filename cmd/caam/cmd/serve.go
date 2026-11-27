@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -27,7 +29,8 @@ ENDPOINTS:
   GET  /api/v1/profiles?tool=X  List profiles for a specific tool
   GET  /api/v1/profiles/X/Y     Get profile details
   DELETE /api/v1/profiles/X/Y   Delete a profile
-  GET  /api/v1/usage            Usage statistics
+  GET  /api/v1/usage            Recorded CAAM activity (default: last 24 hours)
+  GET  /api/v1/activity         Recent activity (?limit=N) and active cooldowns
   GET  /api/v1/coordinators     Coordinator status
   POST /api/v1/actions/activate Activate a profile
   POST /api/v1/actions/backup   Backup current auth to a profile
@@ -40,6 +43,15 @@ AUTHENTICATION:
 
   Include the header: Authorization: Bearer <token>
 
+ACTIVITY AND BACKUPS:
+  /api/v1/usage accepts period=1h, 24h, 7d, or 30d and an optional tool filter.
+  It reports logged activations, errors, and completed-session duration, not
+  provider API calls or quota. Sessions count in full when they complete.
+  available=false means the activity database is unavailable.
+
+  Backup actions require a new profile name by default. Replacing an existing
+  snapshot requires an explicit "overwrite": true in the JSON request.
+
 SECURITY:
   - Server binds to 127.0.0.1 only (localhost)
   - CORS allows only localhost origins
@@ -47,30 +59,51 @@ SECURITY:
   - Token file has 0600 permissions
 
 Examples:
-  caam serve                        # Start on default port 7891
+  caam serve                        # Start on default port 7892
   caam serve --port 8080            # Use custom port
   caam serve --verbose              # Debug logging
   caam serve --show-token           # Print the API token
+  caam serve --dashboard-url http://localhost:3000   # Link that connects the web dashboard
 
 Querying the API:
   TOKEN=$(cat ~/.config/caam/.api_token)
-  curl -H "Authorization: Bearer $TOKEN" http://localhost:7891/api/v1/status`,
+  curl -H "Authorization: Bearer $TOKEN" http://localhost:7892/api/v1/status
+
+The default port avoids 7891, which the local auth-agent uses; both can run
+on the same machine. /api/v1/coordinators reports the agent's coordinators.`,
 	RunE: runServe,
 }
 
 var (
-	servePort      int
-	serveVerbose   bool
-	serveShowToken bool
-	serveJSONLogs  bool
+	servePort         int
+	serveVerbose      bool
+	serveShowToken    bool
+	serveJSONLogs     bool
+	serveDashboardURL string
 )
+
+// dashboardConnectURL is a dashboard link that hands it the API address and
+// token in the URL fragment, which the browser never sends to a server.
+func dashboardConnectURL(dashboard, apiBase, token string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(dashboard))
+	if err != nil || u.User != nil || (u.Scheme != "http" && u.Scheme != "https") ||
+		(u.Hostname() != "localhost" && u.Hostname() != "127.0.0.1" && u.Hostname() != "::1") ||
+		(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return "", fmt.Errorf("dashboard URL must be a loopback HTTP(S) origin without a path, credentials, query, or fragment")
+	}
+	values := url.Values{}
+	values.Set("token", token)
+	values.Set("api", apiBase)
+	return u.Scheme + "://" + u.Host + "/#" + values.Encode(), nil
+}
 
 func init() {
 	rootCmd.AddCommand(serveCmd)
 
-	serveCmd.Flags().IntVar(&servePort, "port", 7891, "API server port")
+	serveCmd.Flags().IntVar(&servePort, "port", api.DefaultConfig().Port, "API server port")
 	serveCmd.Flags().BoolVar(&serveVerbose, "verbose", false, "Enable debug logging")
 	serveCmd.Flags().BoolVar(&serveShowToken, "show-token", false, "Print API token and exit")
+	serveCmd.Flags().StringVar(&serveDashboardURL, "dashboard-url", "", "Print a link that connects the web dashboard at this address (e.g. http://localhost:3000) and exit")
 	serveCmd.Flags().BoolVar(&serveJSONLogs, "json", false, "Output logs in JSON format")
 }
 
@@ -114,6 +147,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 		fmt.Println(server.Token())
 		return nil
 	}
+	if serveDashboardURL != "" {
+		link, err := dashboardConnectURL(serveDashboardURL, fmt.Sprintf("http://127.0.0.1:%d", server.Port()), server.Token())
+		if err != nil {
+			return err
+		}
+		fmt.Println(link)
+		return nil
+	}
 
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(cmd.Context())
@@ -137,7 +178,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Println("  GET  /health              - Health check")
 	fmt.Println("  GET  /api/v1/status       - Overall status")
 	fmt.Println("  GET  /api/v1/profiles     - List profiles")
-	fmt.Println("  GET  /api/v1/usage        - Usage statistics")
+	fmt.Println("  GET  /api/v1/usage        - Recorded CAAM activity")
+	fmt.Println("  GET  /api/v1/activity     - Recent activity and cooldowns")
 	fmt.Println("  GET  /api/v1/events       - SSE live updates")
 	fmt.Println("  POST /api/v1/actions/*    - Actions (activate, backup)")
 	fmt.Println()

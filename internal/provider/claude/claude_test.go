@@ -1,16 +1,25 @@
 package claude
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 )
 
 // =============================================================================
@@ -376,7 +385,7 @@ func TestPrepareProfileWithAPIKey(t *testing.T) {
 		p := New()
 		p.PrepareProfile(context.Background(), prof)
 
-		settingsPath := filepath.Join(prof.HomePath(), ".claude", "settings.json")
+		settingsPath := filepath.Join(claudeConfigDirForProfile(prof), "settings.json")
 		data, err := os.ReadFile(settingsPath)
 		if err != nil {
 			t.Fatalf("settings.json not created: %v", err)
@@ -532,7 +541,7 @@ func TestLogout(t *testing.T) {
 		}
 	})
 
-	t.Run("removes .claude.json", func(t *testing.T) {
+	t.Run("scrubs account state from .claude.json", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		prof := &profile.Profile{
 			Name:     "test",
@@ -545,7 +554,7 @@ func TestLogout(t *testing.T) {
 
 		// Create .claude.json
 		claudeJsonPath := filepath.Join(prof.HomePath(), ".claude.json")
-		if err := os.WriteFile(claudeJsonPath, []byte(`{"session":"test"}`), 0600); err != nil {
+		if err := os.WriteFile(claudeJsonPath, []byte(`{"sessionKey":"test","mcpServers":{"kept":{}}}`), 0600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -554,9 +563,9 @@ func TestLogout(t *testing.T) {
 			t.Fatalf("Logout() error = %v", err)
 		}
 
-		// Verify removed
-		if _, err := os.Stat(claudeJsonPath); !os.IsNotExist(err) {
-			t.Error(".claude.json should be removed after Logout")
+		data, err := os.ReadFile(claudeJsonPath)
+		if err != nil || strings.Contains(string(data), "sessionKey") || !strings.Contains(string(data), "mcpServers") {
+			t.Errorf("logout did not preserve policy and scrub account state: %s, %v", data, err)
 		}
 	})
 
@@ -633,7 +642,7 @@ func TestStatus(t *testing.T) {
 		authDir := filepath.Join(prof.XDGConfigPath(), "claude-code")
 		os.MkdirAll(authDir, 0700)
 		authPath := filepath.Join(authDir, "auth.json")
-		if err := os.WriteFile(authPath, []byte(`{}`), 0600); err != nil {
+		if err := os.WriteFile(authPath, []byte(`{"accessToken":"test-auth"}`), 0600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -646,7 +655,7 @@ func TestStatus(t *testing.T) {
 		}
 	})
 
-	t.Run("logged in when .claude.json exists", func(t *testing.T) {
+	t.Run("logged in when .claude.json contains a credential", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		prof := &profile.Profile{
 			Name:     "test",
@@ -659,7 +668,7 @@ func TestStatus(t *testing.T) {
 
 		// Create .claude.json
 		claudeJsonPath := filepath.Join(prof.HomePath(), ".claude.json")
-		if err := os.WriteFile(claudeJsonPath, []byte(`{}`), 0600); err != nil {
+		if err := os.WriteFile(claudeJsonPath, []byte(`{"oauthToken":"test-oauth"}`), 0600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -923,7 +932,7 @@ func TestFullProfileLifecycle(t *testing.T) {
 
 	// Simulate login by creating .claude.json
 	claudeJsonPath := filepath.Join(prof.HomePath(), ".claude.json")
-	os.WriteFile(claudeJsonPath, []byte(`{"session":"test"}`), 0600)
+	os.WriteFile(claudeJsonPath, []byte(`{"sessionKey":"test"}`), 0600)
 
 	// Status (now logged in)
 	status, _ = p.Status(context.Background(), prof)
@@ -986,7 +995,7 @@ func TestAPIKeyModeLifecycle(t *testing.T) {
 	}
 
 	// Verify settings.json exists
-	settingsPath := filepath.Join(prof.HomePath(), ".claude", "settings.json")
+	settingsPath := filepath.Join(claudeConfigDirForProfile(prof), "settings.json")
 	settingsData, err := os.ReadFile(settingsPath)
 	if err != nil {
 		t.Fatalf("settings.json not found: %v", err)
@@ -1227,6 +1236,181 @@ func TestDetectExistingAuth(t *testing.T) {
 	})
 }
 
+func TestDetectExistingAuthReadOnlyNativeAuthority(t *testing.T) {
+	const keychainA = `{"claudeAiOauth":{"accessToken":"keychain-access-A","refreshToken":"keychain-refresh-A","expiresAt":4102444800000,"accountId":"account-A"}}`
+	const configuredB = `{"claudeAiOauth":{"accessToken":"configured-access-B","expiresAt":4102444800000,"accountId":"account-B"}}`
+	for _, tc := range []struct {
+		name           string
+		configured     bool
+		defaultDir     bool
+		mirror         string
+		item           string
+		locked         bool
+		unavailable    bool
+		legacy         bool
+		wantFound      bool
+		wantErr        bool
+		wantCredential string
+	}{
+		{name: "explicit_directory_keeps_B", configured: true, mirror: configuredB, item: keychainA, wantFound: true, wantCredential: configuredB},
+		{name: "explicit_directory_does_not_inherit_A", configured: true, item: keychainA},
+		{name: "explicit_default_directory_still_isolated", configured: true, defaultDir: true, item: keychainA},
+		{name: "default_keychain_only", item: keychainA, wantFound: true, wantCredential: keychainA},
+		{name: "keychain_supersedes_stale_mirror", mirror: configuredB, item: keychainA, wantFound: true, wantCredential: keychainA},
+		{name: "keychain_supersedes_malformed_mirror", mirror: "{invalid", item: keychainA, wantFound: true, wantCredential: keychainA},
+		{name: "keychain_supersedes_newer_legacy_account", item: keychainA, legacy: true, wantFound: true, wantCredential: keychainA},
+		{name: "missing_item_uses_file", mirror: configuredB, wantFound: true, wantCredential: configuredB},
+		{name: "missing_item_no_file"},
+		{name: "unavailable_keychain_uses_file", unavailable: true, mirror: configuredB, wantFound: true, wantCredential: configuredB},
+		{name: "unavailable_keychain_no_file", unavailable: true},
+		{name: "denied_keychain_cannot_use_stale_mirror", locked: true, item: keychainA, mirror: configuredB, wantErr: true},
+		{name: "malformed_keychain_cannot_use_stale_mirror", item: "{invalid", mirror: configuredB, wantErr: true},
+		{name: "empty_keychain_grant_cannot_use_stale_mirror", item: `{"claudeAiOauth":null}`, mirror: configuredB},
+		{name: "malformed_file_cannot_use_legacy_account", mirror: "{invalid", legacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "")
+			items := testutil.FakeKeychain(t)
+			if tc.item != "" {
+				testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), tc.item)
+			}
+			if tc.locked {
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+			}
+			if tc.unavailable {
+				bin := filepath.Join(t.TempDir(), "security")
+				const script = "#!/bin/sh\necho 'security: A default keychain could not be found.' >&2\nexit 44\n"
+				if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("CAAM_KEYCHAIN_BIN", bin)
+			}
+			dir := filepath.Join(home, ".claude")
+			if tc.configured {
+				if !tc.defaultDir {
+					dir = filepath.Join(home, "configured-B")
+				}
+				t.Setenv("CLAUDE_CONFIG_DIR", dir)
+			}
+			path := filepath.Join(dir, ".credentials.json")
+			stamp := time.Unix(1700000000, 0)
+			if tc.mirror != "" {
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(tc.mirror), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(path, stamp, stamp); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.legacy {
+				writeJSON(t, filepath.Join(home, ".claude.json"), map[string]string{"oauthToken": "legacy-account-B"})
+			}
+			for i := 0; i < 2; i++ {
+				detection, err := New().DetectExistingAuth()
+				if (err != nil) != tc.wantErr {
+					t.Fatalf("DetectExistingAuth error = %v, want error %v", err, tc.wantErr)
+				}
+				if tc.locked && !errors.Is(err, keychain.ErrDenied) {
+					t.Fatalf("denied keychain error = %v", err)
+				}
+				if detection == nil || detection.Found != tc.wantFound {
+					t.Fatalf("detection = %+v, want Found %v", detection, tc.wantFound)
+				}
+				if tc.wantFound {
+					loc := detection.Primary
+					if loc == nil || loc.Path != path || !loc.Exists || !loc.IsValid || loc.FileSize != int64(len(tc.wantCredential)) {
+						t.Fatalf("detection did not select the captured native credential: %+v", loc)
+					}
+				} else if detection.Primary != nil {
+					t.Fatal("unavailable authentication selected a stale primary")
+				}
+				data, err := os.ReadFile(path)
+				if tc.mirror == "" {
+					if !os.IsNotExist(err) {
+						t.Fatalf("discovery materialized a native mirror: %v", err)
+					}
+				} else {
+					if err != nil || string(data) != tc.mirror {
+						t.Fatalf("discovery changed the native credential: %v", err)
+					}
+					info, err := os.Stat(path)
+					if err != nil || !info.ModTime().Equal(stamp) || info.Mode().Perm() != 0600 {
+						t.Fatalf("discovery changed native credential metadata: %v", err)
+					}
+				}
+				if item, exists := testutil.FakeKeychainRead(t, items, keychain.ClaudeService); item != tc.item || exists != (tc.item != "") {
+					t.Fatal("discovery changed the authoritative keychain item")
+				}
+			}
+		})
+	}
+}
+
+func TestImportAuthRecapturesNativeAuthority(t *testing.T) {
+	const initial = `{"claudeAiOauth":{"accessToken":"initial-grant","expiresAt":4102444800000,"accountId":"account-A"}}`
+	const current = `{"claudeAiOauth":{"accessToken":"current-grant","expiresAt":4102444800000,"accountId":"account-B"}}`
+	for _, mode := range []string{"rotated_keychain", "denied_keychain", "malformed_keychain", "explicit_file"} {
+		t.Run(mode, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "")
+			items := testutil.FakeKeychain(t)
+			testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), initial)
+			p := New()
+			detection, err := p.DetectExistingAuth()
+			if err != nil || detection == nil || !detection.Found || detection.Primary == nil {
+				t.Fatalf("detect keychain-only login: %v, %+v", err, detection)
+			}
+			source := detection.Primary.Path
+			wantErr := false
+			switch mode {
+			case "rotated_keychain":
+				testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), current)
+			case "denied_keychain":
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+				wantErr = true
+			case "malformed_keychain":
+				testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), `{"claudeAiOauth":{"accessToken":null}}`)
+				wantErr = true
+			case "explicit_file":
+				source = filepath.Join(t.TempDir(), ".credentials.json")
+				if err := os.WriteFile(source, []byte(current), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prof := &profile.Profile{Name: "imported", Provider: "claude", BasePath: t.TempDir()}
+			if err := p.PrepareProfile(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			files, err := p.ImportAuth(context.Background(), source, prof)
+			if (err != nil) != wantErr {
+				t.Fatalf("ImportAuth error = %v, want error %v", err, wantErr)
+			}
+			target := filepath.Join(claudeConfigDirForProfile(prof), ".credentials.json")
+			data, readErr := os.ReadFile(target)
+			if wantErr {
+				if len(files) != 0 || !os.IsNotExist(readErr) {
+					t.Fatal("failed native capture published a profile credential")
+				}
+			} else if readErr != nil || string(data) != current || len(files) != 1 || files[0] != target {
+				t.Fatalf("import did not capture the selected current credential: %v", readErr)
+			}
+			if _, err := os.Stat(detection.Primary.Path); !os.IsNotExist(err) {
+				t.Fatalf("detection or import materialized a native mirror: %v", err)
+			}
+		})
+	}
+}
+
 // =============================================================================
 // ImportAuth Tests
 // =============================================================================
@@ -1245,7 +1429,7 @@ func TestImportAuth(t *testing.T) {
 		// Create source file
 		srcDir := t.TempDir()
 		srcPath := filepath.Join(srcDir, ".credentials.json")
-		writeJSON(t, srcPath, map[string]string{"key": "value"})
+		writeJSON(t, srcPath, map[string]interface{}{"claudeAiOauth": map[string]string{"accessToken": "selected-token"}})
 
 		copied, err := p.ImportAuth(context.Background(), srcPath, prof)
 		if err != nil {
@@ -1256,7 +1440,7 @@ func TestImportAuth(t *testing.T) {
 			t.Fatalf("Expected 1 copied file, got %d", len(copied))
 		}
 
-		expectedPath := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
+		expectedPath := filepath.Join(claudeConfigDirForProfile(prof), ".credentials.json")
 		if copied[0] != expectedPath {
 			t.Errorf("Copied path = %q, want %q", copied[0], expectedPath)
 		}
@@ -1278,7 +1462,7 @@ func TestImportAuth(t *testing.T) {
 
 		srcDir := t.TempDir()
 		srcPath := filepath.Join(srcDir, "auth.json")
-		writeJSON(t, srcPath, map[string]string{"key": "value"})
+		writeJSON(t, srcPath, map[string]string{"accessToken": "selected-token"})
 
 		copied, err := p.ImportAuth(context.Background(), srcPath, prof)
 		if err != nil {
@@ -1312,6 +1496,407 @@ func TestImportAuth(t *testing.T) {
 			t.Error("Should fail if source is directory")
 		}
 	})
+}
+
+func claudeImportTestCredential(t *testing.T, org string, expires time.Time) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]interface{}{"claudeAiOauth": map[string]interface{}{
+		"accessToken": "synthetic-access-" + org, "refreshToken": "synthetic-refresh-" + org,
+		"expiresAt": expires.UnixMilli(), "subscriptionType": org,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func writeClaudeImportTestBinding(t *testing.T, path string, credentials []byte, org string) []byte {
+	t.Helper()
+	fingerprint, err := identity.ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := &identity.ClaudeIdentityBinding{
+		Identity: identity.Identity{Provider: "claude", AccountID: "shared-account", OrganizationID: org,
+			Organization: org, Email: "same@example.com", Verified: true},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Unix(1700000000, 0),
+	}
+	metadata, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeClaudeLifecycleJSON(t, path, string(metadata))
+	return metadata
+}
+
+func TestImportAuthCarriesVerifiedOrganizationOffline(t *testing.T) {
+	for _, metadataName := range []string{"meta.json", identity.ClaudeIdentityCacheFile} {
+		t.Run(metadataName, func(t *testing.T) {
+			realHome, prof := claudeLifecycleFixture(t)
+			host := filepath.Join(realHome, ".claude", "settings.json")
+			writeClaudeLifecycleJSON(t, host, `{"model":"host-policy","apiKeyHelper":"host-account"}`)
+			p := New()
+			if err := p.PrepareProfile(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			expiry := time.Now().Add(-time.Hour).Truncate(time.Second)
+			credentials := claudeImportTestCredential(t, "team-org", expiry)
+			writeClaudeLifecycleJSON(t, source, string(credentials))
+			metadataPath := filepath.Join(filepath.Dir(source), metadataName)
+			metadata := writeClaudeImportTestBinding(t, metadataPath, credentials, "team-org")
+			staleState := `{"oauthAccount":{"accountUuid":"shared-account","organizationUuid":"personal-org","emailAddress":"same@example.com"},"mcpServers":{"source-only":{}}}`
+			writeClaudeLifecycleJSON(t, filepath.Join(filepath.Dir(source), ".claude.json"), staleState)
+			state := filepath.Join(claudeConfigDirForProfile(prof), ".claude.json")
+			writeClaudeLifecycleJSON(t, state, `{"oauthAccount":{"organizationUuid":"old-org"},"mcpServers":{"kept":{}},"history":["kept-session"]}`)
+
+			files, err := p.ImportAuth(context.Background(), source, prof)
+			if err != nil || len(files) != 3 {
+				t.Fatalf("import credential, proof and corrected state: %v, %v", files, err)
+			}
+			env, err := p.Env(context.Background(), prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(env["CLAUDE_CONFIG_DIR"], ".credentials.json")
+			if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, credentials) {
+				t.Fatalf("import changed the captured expired credentials: %v", err)
+			}
+			prof.LoadIdentity()
+			if id := prof.Identity; id == nil || !id.Verified || id.OrganizationID != "team-org" || id.AccountID != "shared-account" ||
+				id.Email != "same@example.com" || !id.ExpiresAt.Equal(expiry) {
+				t.Fatalf("expired token lost matching verified ownership: %+v", id)
+			}
+			validation, err := p.ValidateToken(context.Background(), prof, true)
+			if err != nil || !validation.Valid || !validation.ExpiresAt.Equal(expiry) {
+				t.Fatalf("offline renewable import validation: %+v, %v", validation, err)
+			}
+			got := readClaudeLifecycleJSON(t, state)
+			if got["oauthAccount"].(map[string]interface{})["organizationUuid"] != "team-org" ||
+				got["mcpServers"].(map[string]interface{})["kept"] == nil || got["history"] == nil {
+				t.Fatalf("import did not preserve independent state while correcting the organization: %#v", got)
+			}
+			for _, path := range files {
+				info, err := os.Stat(path)
+				if err != nil || info.Mode().Perm() != 0600 {
+					t.Fatalf("imported credential artifacts are not private: %v", err)
+				}
+			}
+			for path, want := range map[string][]byte{source: credentials, metadataPath: metadata,
+				filepath.Join(filepath.Dir(source), ".claude.json"): []byte(staleState), host: []byte(`{"model":"host-policy","apiKeyHelper":"host-account"}`)} {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("import mutated a source or host file: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestImportAuthRejectsBrokenSavedProofAndDiscardsStaleNativeProof(t *testing.T) {
+	for _, scenario := range []string{"no proof", "stale native proof", "changed access only", "saved proof mismatch", "invalid saved proof", "invalid native proof", "saved conflicting secondary proof", "saved malformed secondary proof"} {
+		t.Run(scenario, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			personal := claudeImportTestCredential(t, "personal-org", time.Now().Add(time.Hour))
+			team := claudeImportTestCredential(t, "team-org", time.Now().Add(time.Hour))
+			if scenario == "changed access only" {
+				team = bytes.Replace(personal, []byte("synthetic-access-personal-org"), []byte("synthetic-access-team-org"), 1)
+			}
+			writeClaudeLifecycleJSON(t, source, string(team))
+			sourceCache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			meta := filepath.Join(filepath.Dir(source), "meta.json")
+			switch scenario {
+			case "stale native proof", "changed access only":
+				writeClaudeImportTestBinding(t, sourceCache, personal, "personal-org")
+			case "saved proof mismatch":
+				writeClaudeImportTestBinding(t, meta, personal, "personal-org")
+				// A matching copied sidecar must not bypass the saved owner.
+				writeClaudeImportTestBinding(t, sourceCache, team, "team-org")
+			case "invalid saved proof":
+				writeClaudeLifecycleJSON(t, meta, `{"claude_identity":`)
+			case "invalid native proof":
+				writeClaudeLifecycleJSON(t, sourceCache, `{"claude_identity":`)
+			case "saved conflicting secondary proof":
+				writeClaudeImportTestBinding(t, meta, team, "team-org")
+				writeClaudeImportTestBinding(t, sourceCache, team, "personal-org")
+			case "saved malformed secondary proof":
+				writeClaudeImportTestBinding(t, meta, team, "team-org")
+				writeClaudeLifecycleJSON(t, sourceCache, `{"claude_identity":`)
+			}
+			target := claudeXDGCredentialsPathForProfile(prof)
+			writeClaudeLifecycleJSON(t, target, string(personal))
+			cache := filepath.Join(filepath.Dir(target), identity.ClaudeIdentityCacheFile)
+			beforeCache := writeClaudeImportTestBinding(t, cache, personal, "personal-org")
+			state := filepath.Join(filepath.Dir(target), ".claude.json")
+			beforeState := `{"oauthAccount":{"accountUuid":"shared-account","organizationUuid":"personal-org","emailAddress":"same@example.com"},"history":["preserved"]}`
+			writeClaudeLifecycleJSON(t, state, beforeState)
+			_, err := New().ImportAuth(context.Background(), source, prof)
+			wantError := strings.Contains(scenario, "saved") || scenario == "invalid native proof"
+			if (err != nil) != wantError {
+				t.Fatalf("import error = %v, want error %v", err, wantError)
+			}
+			if wantError {
+				for path, before := range map[string][]byte{target: personal, cache: beforeCache, state: []byte(beforeState)} {
+					if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
+						t.Fatalf("rejected proof changed the previous profile: %v", err)
+					}
+				}
+				return
+			}
+			prof.LoadIdentity()
+			if id := prof.Identity; id == nil || id.Verified || id.AccountID != "" || id.OrganizationID != "" || id.Email != "" {
+				t.Fatalf("unproven import acquired an old account label: %+v", id)
+			}
+			got := readClaudeLifecycleJSON(t, state)
+			if got["oauthAccount"] != nil || got["history"] == nil {
+				t.Fatalf("unproven import kept an account label or lost independent state: %#v", got)
+			}
+			if got, err := os.ReadFile(target); err != nil || !bytes.Equal(got, team) {
+				t.Fatalf("unproven import changed credential bytes: %v", err)
+			}
+		})
+	}
+}
+
+func TestCapturedClaudeImportRejectsSourceReplacementBeforeWrites(t *testing.T) {
+	for _, changed := range []string{"credentials", "binding", "identical replacement", "previously absent metadata", "secondary binding with verified primary"} {
+		t.Run(changed, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			credentials := claudeImportTestCredential(t, "team-org", time.Now().Add(time.Hour))
+			writeClaudeLifecycleJSON(t, source, string(credentials))
+			cache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			writeClaudeImportTestBinding(t, cache, credentials, "team-org")
+			if changed == "secondary binding with verified primary" {
+				writeClaudeImportTestBinding(t, filepath.Join(filepath.Dir(source), "meta.json"), credentials, "team-org")
+			}
+			captured, err := captureClaudeImportSource(source, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch changed {
+			case "credentials":
+				writeClaudeLifecycleJSON(t, source, string(claudeImportTestCredential(t, "personal-org", time.Now().Add(time.Hour))))
+			case "binding", "secondary binding with verified primary":
+				writeClaudeImportTestBinding(t, cache, credentials, "personal-org")
+			case "identical replacement":
+				replacement := source + ".replacement"
+				writeClaudeLifecycleJSON(t, replacement, string(credentials))
+				if err := os.Rename(replacement, source); err != nil {
+					t.Fatal(err)
+				}
+			case "previously absent metadata":
+				writeClaudeImportTestBinding(t, filepath.Join(filepath.Dir(source), "meta.json"), credentials, "personal-org")
+			}
+			if _, err := captured.publish(context.Background(), claudeConfigDirForProfile(prof), prof); err == nil {
+				t.Fatal("published credentials after the source generation changed")
+			}
+			for _, name := range []string{".credentials.json", identity.ClaudeIdentityCacheFile, ".claude.json"} {
+				if _, err := os.Stat(filepath.Join(claudeConfigDirForProfile(prof), name)); !os.IsNotExist(err) {
+					t.Fatalf("source rejection left a partial profile artifact %s: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeImportRechecksSourceAfterStagedValidation(t *testing.T) {
+	for _, changed := range []string{"credentials", "binding", "unchanged"} {
+		t.Run(changed, func(t *testing.T) {
+			claudeLifecycleFixture(t)
+			store := profile.NewStore(t.TempDir())
+			previous, err := store.Create("claude", "work", "oauth")
+			if err != nil {
+				t.Fatal(err)
+			}
+			previous.Description = "keep this working profile on failed import"
+			if err := previous.Save(); err != nil {
+				t.Fatal(err)
+			}
+			beforeProfile, err := os.ReadFile(previous.MetaPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldCredential := claudeImportTestCredential(t, "personal-org", time.Now().Add(time.Hour))
+			oldPath := claudeXDGCredentialsPathForProfile(previous)
+			writeClaudeLifecycleJSON(t, oldPath, string(oldCredential))
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			credentials := claudeImportTestCredential(t, "team-org", time.Now().Add(-time.Hour))
+			writeClaudeLifecycleJSON(t, source, string(credentials))
+			cache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			writeClaudeImportTestBinding(t, cache, credentials, "team-org")
+			result, err := store.Import(context.Background(), "claude", "work", "oauth", true, func(staged *profile.Profile) error {
+				if _, err := New().ImportAuth(context.Background(), source, staged); err != nil {
+					return err
+				}
+				validation, err := New().ValidateToken(context.Background(), staged, true)
+				if err != nil || !validation.Valid {
+					t.Fatalf("staged profile failed passive validation: %+v, %v", validation, err)
+				}
+				// Another Claude session changes the source after preparation
+				// but before Store.Import can publish the isolated directory.
+				switch changed {
+				case "credentials":
+					writeClaudeLifecycleJSON(t, source, string(oldCredential))
+				case "binding":
+					writeClaudeImportTestBinding(t, cache, credentials, "personal-org")
+				}
+				return nil
+			})
+			if changed == "unchanged" {
+				if err != nil || result == nil || result.BackupPath == "" {
+					t.Fatalf("publish verified staged import: %+v, %v", result, err)
+				}
+				loaded, err := store.Load("claude", "work")
+				if err != nil || loaded.Identity == nil || !loaded.Identity.Verified || loaded.Identity.OrganizationID != "team-org" {
+					t.Fatalf("restarted import lost verified Team ownership: %+v, %v", loaded, err)
+				}
+				return
+			}
+			if err == nil || result != nil {
+				t.Fatal("published a stale prepared import")
+			}
+			for path, before := range map[string][]byte{previous.MetaPath(): beforeProfile, oldPath: oldCredential} {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
+					t.Fatalf("source conflict replaced the existing isolated profile: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeImportUsesKeychainTokenIdentityWithoutChangingMirror(t *testing.T) {
+	for _, scenario := range []string{"matching keychain proof", "stale mirror proof", "changed keychain"} {
+		t.Run(scenario, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			items := testutil.FakeKeychain(t)
+			personal := claudeImportTestCredential(t, "personal-org", time.Now().Add(time.Hour))
+			team := claudeImportTestCredential(t, "team-org", time.Now().Add(-time.Hour))
+			testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), string(team))
+			files := authfile.ClaudeAuthFiles()
+			source := files.Files[0].Path
+			writeClaudeLifecycleJSON(t, source, string(personal))
+			cache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			proof, org := team, "team-org"
+			if scenario == "stale mirror proof" {
+				proof, org = personal, "personal-org"
+			}
+			metadata := writeClaudeImportTestBinding(t, cache, proof, org)
+			captured, err := captureClaudeImportSource(source, &files)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "changed keychain" {
+				testutil.FakeKeychainStore(t, items, keychain.ClaudeService, keychain.LoginAccount(), string(personal))
+			}
+			_, err = captured.publish(context.Background(), claudeConfigDirForProfile(prof), prof)
+			if (err != nil) != (scenario == "changed keychain") {
+				t.Fatalf("native import outcome = %v", err)
+			}
+			if scenario == "changed keychain" {
+				if _, err := os.Stat(claudeXDGCredentialsPathForProfile(prof)); !os.IsNotExist(err) {
+					t.Fatal("changed native authority published captured credentials")
+				}
+			} else {
+				if got, err := os.ReadFile(claudeXDGCredentialsPathForProfile(prof)); err != nil || !bytes.Equal(got, team) {
+					t.Fatalf("import selected the stale file mirror: %v", err)
+				}
+				prof.LoadIdentity()
+				if prof.Identity == nil || prof.Identity.Verified != (scenario == "matching keychain proof") {
+					t.Fatalf("native import proof mismatch: %+v", prof.Identity)
+				}
+				if scenario == "matching keychain proof" && prof.Identity.OrganizationID != "team-org" ||
+					scenario == "stale mirror proof" && prof.Identity.OrganizationID != "" {
+					t.Fatalf("native import inferred ownership from a stale mirror: %+v", prof.Identity)
+				}
+			}
+			for path, before := range map[string][]byte{source: personal, cache: metadata} {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
+					t.Fatalf("native import changed a host file: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestClaudeImportRejectsSharedDestinationAliases(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink isolation fixture")
+	}
+	for _, alias := range []string{"directory", "credential", "cache"} {
+		t.Run(alias, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			source := filepath.Join(t.TempDir(), ".credentials.json")
+			credentials := claudeImportTestCredential(t, "team-org", time.Now().Add(time.Hour))
+			writeClaudeLifecycleJSON(t, source, string(credentials))
+			cache := filepath.Join(filepath.Dir(source), identity.ClaudeIdentityCacheFile)
+			metadata := writeClaudeImportTestBinding(t, cache, credentials, "team-org")
+			configDir := claudeConfigDirForProfile(prof)
+			if err := os.MkdirAll(filepath.Dir(configDir), 0700); err != nil {
+				t.Fatal(err)
+			}
+			target, referent := configDir, filepath.Dir(source)
+			if alias != "directory" {
+				if err := os.MkdirAll(configDir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				target, referent = filepath.Join(configDir, ".credentials.json"), source
+				if alias == "cache" {
+					target, referent = filepath.Join(configDir, identity.ClaudeIdentityCacheFile), cache
+				}
+			}
+			if err := os.Symlink(referent, target); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := New().ImportAuth(context.Background(), source, prof); err == nil {
+				t.Fatal("import accepted a shared authentication destination")
+			}
+			for path, before := range map[string][]byte{source: credentials, cache: metadata} {
+				if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
+					t.Fatalf("rejected alias changed a host source: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestImportSettingsSelectsCredentialMode(t *testing.T) {
+	for _, tc := range []struct {
+		name, settings, mode string
+	}{
+		{"helper", `{"apiKeyHelper":"selected-helper"}`, "api-key"},
+		{"key", `{"apiKey":"synthetic-selected-key"}`, "api-key"},
+		{"environment key", `{"env":{"ANTHROPIC_API_KEY":"synthetic-selected-key"}}`, "api-key"},
+		{"OAuth token", `{"env":{"CLAUDE_CODE_OAUTH_TOKEN":"synthetic-selected-token"}}`, "oauth"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			p := New()
+			if err := p.PrepareProfile(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			source := filepath.Join(t.TempDir(), "settings.json")
+			writeClaudeLifecycleJSON(t, source, tc.settings)
+			if _, err := p.ImportAuth(context.Background(), source, prof); err != nil {
+				t.Fatal(err)
+			}
+			if prof.AuthMode != tc.mode {
+				t.Fatalf("imported mode = %q, want %q", prof.AuthMode, tc.mode)
+			}
+			changes, err := provider.ProfileEnvironment(context.Background(), p, prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			merged := provider.MergeEnvironment([]string{"ANTHROPIC_API_KEY=synthetic-helper-input"}, changes, nil)
+			found := false
+			for _, value := range merged {
+				found = found || value == "ANTHROPIC_API_KEY=synthetic-helper-input"
+			}
+			if found != (tc.mode == "api-key") {
+				t.Fatalf("imported mode does not control the helper's ambient key input: %v", merged)
+			}
+		})
+	}
 }
 
 // Helper for writing JSON
@@ -1354,8 +1939,8 @@ func writeCredentialsFileAt(t *testing.T, path string, expiresAtMillis int64) {
 
 // TestValidateTokenPassive_CredentialPrecedence is a regression test for
 // issue #72: a stale (expired or corrupt) legacy home/.claude/ credentials
-// file must not shadow fresh XDG-side credentials, and when both are valid
-// the fresher expiry wins.
+// file must not shadow XDG-side credentials. Validation must describe the
+// selected native store even when ignored legacy credentials are fresher.
 func TestValidateTokenPassive_CredentialPrecedence(t *testing.T) {
 	newProf := func(t *testing.T) *profile.Profile {
 		return &profile.Profile{
@@ -1429,7 +2014,7 @@ func TestValidateTokenPassive_CredentialPrecedence(t *testing.T) {
 		}
 	})
 
-	t.Run("both valid: fresher legacy expiry wins", func(t *testing.T) {
+	t.Run("both valid: XDG remains authoritative despite fresher legacy", func(t *testing.T) {
 		prof := newProf(t)
 		writeCredentialsFileAt(t, legacyPath(prof), fresher)
 		writeCredentialsFileAt(t, xdgPath(prof), future)
@@ -1441,8 +2026,8 @@ func TestValidateTokenPassive_CredentialPrecedence(t *testing.T) {
 		if !result.Valid {
 			t.Fatalf("expected valid; got error: %s", result.Error)
 		}
-		if got := result.ExpiresAt.UnixMilli(); got != fresher {
-			t.Errorf("ExpiresAt = %d, want fresher legacy expiry %d", got, fresher)
+		if got := result.ExpiresAt.UnixMilli(); got != future {
+			t.Errorf("ExpiresAt = %d, want native XDG expiry %d", got, future)
 		}
 	})
 
@@ -1487,4 +2072,490 @@ func TestValidateTokenPassive_CredentialPrecedence(t *testing.T) {
 			t.Errorf("Error = %q, want invalid .credentials.json parse error", result.Error)
 		}
 	})
+}
+
+func TestValidateTokenPassive_ClaudeRenewalUsesSelectedGrant(t *testing.T) {
+	past := time.Now().Add(-2 * time.Hour).UnixMilli()
+	future := time.Now().Add(4 * time.Hour).UnixMilli()
+	for _, tc := range []struct {
+		name       string
+		oauth      any
+		valid      bool
+		expiresAt  int64
+		legacyOnly bool
+	}{
+		{"expired complete grant", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": past}, true, past, false},
+		{"legacy expired complete grant", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": past}, true, past, true},
+		{"unexpired access without refresh", map[string]any{"accessToken": "synthetic-access", "expiresAt": future}, true, future, false},
+		{"complete grant without expiry", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh"}, true, 0, false},
+		{"expired without refresh", map[string]any{"accessToken": "synthetic-access", "expiresAt": past}, false, past, false},
+		{"null refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": nil, "expiresAt": past}, false, 0, false},
+		{"empty refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "", "expiresAt": past}, false, 0, false},
+		{"whitespace refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": " \t", "expiresAt": past}, false, 0, false},
+		{"wrong type refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": true, "expiresAt": past}, false, 0, false},
+		{"unexpired access does not rescue null refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": nil, "expiresAt": future}, false, 0, false},
+		{"refresh without access", map[string]any{"refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"null access with refresh", map[string]any{"accessToken": nil, "refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"empty access with refresh", map[string]any{"accessToken": "", "refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"whitespace access with refresh", map[string]any{"accessToken": " \t", "refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"wrong type access with refresh", map[string]any{"accessToken": 42, "refreshToken": "synthetic-refresh", "expiresAt": past}, false, 0, false},
+		{"null OAuth", nil, false, 0, false},
+		{"nonobject OAuth", []any{}, false, 0, false},
+		{"null expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": nil}, false, 0, false},
+		{"zero expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": 0}, false, 0, false},
+		{"negative expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": -1}, false, 0, false},
+		{"wrong type expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": "not-a-timestamp"}, false, 0, false},
+		{"fractional expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": float64(past) + 0.5}, false, 0, false},
+		{"overflowing expiry with refresh", map[string]any{"accessToken": "synthetic-access", "refreshToken": "synthetic-refresh", "expiresAt": 1e30}, false, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			legacy := filepath.Join(claudeLegacyDirForProfile(prof), ".credentials.json")
+			selected := claudeXDGCredentialsPathForProfile(prof)
+			if tc.legacyOnly {
+				selected = legacy
+			} else {
+				// A healthy ignored account must never supply the selected
+				// account's missing or malformed refresh capability.
+				writeClaudeLifecycleJSON(t, legacy, `{"claudeAiOauth":{"accessToken":"ignored-access","refreshToken":"ignored-refresh"}}`)
+			}
+			data, err := json.Marshal(map[string]any{"claudeAiOauth": tc.oauth})
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeClaudeLifecycleJSON(t, selected, string(data))
+			p := New()
+			result, err := p.ValidateToken(context.Background(), prof, true)
+			if err != nil || result == nil || result.Valid != tc.valid {
+				t.Fatalf("selected grant validation = %+v, %v; want valid=%v", result, err, tc.valid)
+			}
+			if tc.expiresAt == 0 {
+				if !result.ExpiresAt.IsZero() {
+					t.Fatalf("unexpected expiry from another grant: %v", result.ExpiresAt)
+				}
+			} else if result.ExpiresAt.UnixMilli() != tc.expiresAt {
+				t.Fatalf("expiry = %v, want selected grant timestamp %d", result.ExpiresAt, tc.expiresAt)
+			}
+			if (result.Error == "") != tc.valid || result.Method != "passive" {
+				t.Fatalf("validation did not report its result accurately: %+v", result)
+			}
+			if unchanged, err := os.ReadFile(selected); err != nil || !bytes.Equal(unchanged, data) {
+				t.Fatalf("passive validation modified the native credential: %v", err)
+			}
+		})
+	}
+}
+
+func claudeLifecycleFixture(t *testing.T) (string, *profile.Profile) {
+	t.Helper()
+	realHome := t.TempDir()
+	t.Setenv("HOME", realHome)
+	t.Setenv("USERPROFILE", realHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(realHome, ".config"))
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CAAM_KEYCHAIN", "0")
+	return realHome, &profile.Profile{Name: "isolated", Provider: "claude", AuthMode: "oauth", BasePath: t.TempDir()}
+}
+
+func TestOAuthLoginUsesSelectedClaudeConfigWithoutAmbientCredential(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture; Windows environment merging is tested in provider")
+	}
+	realHome, prof := claudeLifecycleFixture(t)
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+test "$HOME" = "$CAAM_TEST_SELECTED_HOME" || exit 11
+test "$CLAUDE_CONFIG_DIR" = "$CAAM_TEST_SELECTED_CONFIG" || exit 12
+test -z "$ANTHROPIC_API_KEY$ANTHROPIC_AUTH_TOKEN$CLAUDE_CODE_OAUTH_TOKEN$CLAUDE_CODE_USE_BEDROCK$ANTHROPIC_PROFILE" || exit 13
+test "$OPENAI_API_KEY" = unrelated || exit 14
+printf success > "$CAAM_TEST_LOGIN_MARKER"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(realHome, "host-config"))
+	for _, key := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_PROFILE"} {
+		t.Setenv(key, "synthetic-ambient")
+	}
+	t.Setenv("OPENAI_API_KEY", "unrelated")
+	t.Setenv("CAAM_TEST_SELECTED_HOME", prof.HomePath())
+	t.Setenv("CAAM_TEST_SELECTED_CONFIG", claudeConfigDirForProfile(prof))
+	marker := filepath.Join(realHome, "login-ran")
+	t.Setenv("CAAM_TEST_LOGIN_MARKER", marker)
+	if err := New().Login(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	if content, err := os.ReadFile(marker); err != nil || string(content) != "success" {
+		t.Fatalf("native login did not use selected environment: %q, %v", content, err)
+	}
+}
+
+func writeClaudeLifecycleJSON(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readClaudeLifecycleJSON(t *testing.T, path string) map[string]interface{} {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]interface{}
+	if err := json.Unmarshal(data, &obj); err != nil {
+		t.Fatal(err)
+	}
+	return obj
+}
+
+func TestIsolatedClaudeSharedSettingsLifecycle(t *testing.T) {
+	realHome, prof := claudeLifecycleFixture(t)
+	shared := filepath.Join(realHome, ".claude", "settings.json")
+	writeClaudeLifecycleJSON(t, shared, `{"permissions":{"allow":["Read"]},"model":"initial","hooks":{"Stop":[]},"apiKeyHelper":"host-secret","env":{"ANTHROPIC_API_KEY":"host-key"}}`)
+	writeClaudeLifecycleJSON(t, filepath.Join(realHome, ".claude.json"), `{"oauthAccount":{"accountUuid":"host"},"mcpServers":{"current":{}}}`)
+	p := New()
+	if err := p.PrepareProfile(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range claudeSettingsPathsForProfile(prof) {
+		got := readClaudeLifecycleJSON(t, path)
+		if got["model"] != "initial" || got["permissions"] == nil || got["apiKeyHelper"] != nil || got["env"] != nil {
+			t.Fatalf("new profile lost policy or copied host auth: %#v", got)
+		}
+	}
+	statePath := filepath.Join(claudeConfigDirForProfile(prof), ".claude.json")
+	if got := readClaudeLifecycleJSON(t, statePath); got["oauthAccount"] != nil || got["mcpServers"] == nil {
+		t.Fatalf("new native state copied the host account or lost MCP policy: %#v", got)
+	}
+	settingsPath := filepath.Join(claudeConfigDirForProfile(prof), "settings.json")
+	writeClaudeLifecycleJSON(t, settingsPath, `{"apiKeyHelper":"profile-helper","env":{"ANTHROPIC_API_KEY":"profile-key"},"model":"old","hooks":{"Stop":[]}}`)
+	writeClaudeLifecycleJSON(t, shared, `{"permissions":{"allow":[]},"model":"current","apiKeyHelper":"other-host-secret"}`)
+	beforeHost, _ := os.ReadFile(shared)
+	if err := p.PrepareRun(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range claudeSettingsPathsForProfile(prof) {
+		got := readClaudeLifecycleJSON(t, path)
+		if got["model"] != "current" || got["hooks"] != nil || got["permissions"] == nil {
+			t.Fatalf("launch retained stale policy or revived a deleted hook: %#v", got)
+		}
+	}
+	got := readClaudeLifecycleJSON(t, settingsPath)
+	if got["apiKeyHelper"] != "profile-helper" || got["env"].(map[string]interface{})["ANTHROPIC_API_KEY"] != "profile-key" {
+		t.Fatalf("refresh changed the selected account: %#v", got)
+	}
+	afterHost, _ := os.ReadFile(shared)
+	if !bytes.Equal(beforeHost, afterHost) {
+		t.Fatal("profile refresh changed canonical host settings")
+	}
+}
+
+func TestIsolatedClaudeExplicitSharedConfigDirectory(t *testing.T) {
+	for _, canonicalExists := range []bool{false, true} {
+		t.Run(map[bool]string{false: "missing canonical source", true: "canonical source present"}[canonicalExists], func(t *testing.T) {
+			realHome, prof := claudeLifecycleFixture(t)
+			writeClaudeLifecycleJSON(t, filepath.Join(realHome, ".claude", "settings.json"), `{"model":"ignored-legacy","apiKeyHelper":"ignored-secret"}`)
+			explicit := t.TempDir()
+			t.Setenv("CLAUDE_CONFIG_DIR", explicit)
+			want := "profile-policy"
+			if canonicalExists {
+				writeClaudeLifecycleJSON(t, filepath.Join(explicit, "settings.json"), `{"model":"canonical","apiKeyHelper":"host-secret"}`)
+				want = "canonical"
+			}
+			path := filepath.Join(claudeConfigDirForProfile(prof), "settings.json")
+			writeClaudeLifecycleJSON(t, path, `{"model":"profile-policy","apiKeyHelper":"profile-helper"}`)
+			if err := New().PrepareRun(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			got := readClaudeLifecycleJSON(t, path)
+			if got["model"] != want || got["apiKeyHelper"] != "profile-helper" {
+				t.Fatalf("explicit canonical directory was ignored: %#v", got)
+			}
+		})
+	}
+}
+
+func TestIsolatedClaudePreparationFailsBeforeChangingSettings(t *testing.T) {
+	realHome, prof := claudeLifecycleFixture(t)
+	shared := filepath.Join(realHome, ".claude", "settings.json")
+	writeClaudeLifecycleJSON(t, shared, `{"model":"new"}`)
+	legacy := filepath.Join(claudeLegacyDirForProfile(prof), "settings.json")
+	writeClaudeLifecycleJSON(t, legacy, `{"model":"old"}`)
+	xdg := filepath.Join(claudeConfigDirForProfile(prof), "settings.json")
+	writeClaudeLifecycleJSON(t, xdg, `{broken`)
+	before, _ := os.ReadFile(legacy)
+	if err := New().PrepareRun(context.Background(), prof); err == nil {
+		t.Fatal("malformed destination settings allowed launch preparation")
+	}
+	after, _ := os.ReadFile(legacy)
+	if !bytes.Equal(before, after) {
+		t.Fatal("preflight failure partially changed the other settings destination")
+	}
+}
+
+func TestIsolatedClaudeAPIHelperMergesPolicy(t *testing.T) {
+	_, prof := claudeLifecycleFixture(t)
+	path := filepath.Join(claudeConfigDirForProfile(prof), "settings.json")
+	writeClaudeLifecycleJSON(t, path, `{"permissions":{"allow":["Read"]},"model":"kept","hooks":{"Stop":[]},"env":{"EDITOR":"vim"},"apiKeyHelper":"old"}`)
+	if err := New().setupAPIKeyHelper(prof); err != nil {
+		t.Fatal(err)
+	}
+	got := readClaudeLifecycleJSON(t, path)
+	if got["apiKeyHelper"] != filepath.Join(prof.BasePath, "api_key_helper.sh") || got["model"] != "kept" || got["permissions"] == nil || got["hooks"] == nil || got["env"] == nil {
+		t.Fatalf("API enrollment truncated workflow policy: %#v", got)
+	}
+}
+
+func TestIsolatedClaudeImportUsesSelectedNativeStoreAndLivePolicy(t *testing.T) {
+	realHome, prof := claudeLifecycleFixture(t)
+	writeClaudeLifecycleJSON(t, filepath.Join(realHome, ".claude", "settings.json"), `{"model":"current","permissions":{"allow":["Read"]},"apiKeyHelper":"host"}`)
+	p := New()
+	if err := p.PrepareProfile(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "settings.json")
+	writeClaudeLifecycleJSON(t, source, `{"model":"stale","apiKeyHelper":"selected-account","env":{"ANTHROPIC_API_KEY":"selected-key"}}`)
+	paths, err := p.ImportAuth(context.Background(), source, prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := p.Env(context.Background(), prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.Join(env["CLAUDE_CONFIG_DIR"], "settings.json")
+	if len(paths) != 1 || paths[0] != wantPath {
+		t.Fatalf("import destinations %v do not match native config %s", paths, wantPath)
+	}
+	got := readClaudeLifecycleJSON(t, wantPath)
+	if got["model"] != "current" || got["permissions"] == nil || got["apiKeyHelper"] != "selected-account" {
+		t.Fatalf("import reverted policy or selected another account: %#v", got)
+	}
+	ignored := readClaudeLifecycleJSON(t, filepath.Join(claudeLegacyDirForProfile(prof), "settings.json"))
+	if ignored["apiKeyHelper"] != nil || ignored["env"] != nil {
+		t.Fatalf("import duplicated authentication into the ignored store: %#v", ignored)
+	}
+}
+
+func TestIsolatedClaudeLogoutRetainsPolicyWithoutLogin(t *testing.T) {
+	_, prof := claudeLifecycleFixture(t)
+	prof.AuthMode = "api-key"
+	for _, path := range claudeSettingsPathsForProfile(prof) {
+		writeClaudeLifecycleJSON(t, path, `{"apiKeyHelper":"account","env":{"ANTHROPIC_API_KEY":"key"},"model":"kept","permissions":{"allow":["Read"]}}`)
+	}
+	statePath := filepath.Join(claudeConfigDirForProfile(prof), ".claude.json")
+	writeClaudeLifecycleJSON(t, statePath, `{"oauthAccount":{"accountUuid":"account"},"oauthToken":"token","mcpServers":{"kept":{}}}`)
+	writeCredentialsFileAt(t, claudeXDGCredentialsPathForProfile(prof), time.Now().Add(time.Hour).UnixMilli())
+	p := New()
+	if err := p.Logout(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range claudeSettingsPathsForProfile(prof) {
+		got := readClaudeLifecycleJSON(t, path)
+		if got["model"] != "kept" || got["permissions"] == nil || got["apiKeyHelper"] != nil || got["env"] != nil {
+			t.Fatalf("logout lost policy or retained account settings: %#v", got)
+		}
+	}
+	if got := readClaudeLifecycleJSON(t, statePath); got["mcpServers"] == nil || got["oauthToken"] != nil || got["oauthAccount"] != nil {
+		t.Fatalf("logout mishandled native state: %#v", got)
+	}
+	status, err := p.Status(context.Background(), prof)
+	if err != nil || status.LoggedIn {
+		t.Fatalf("policy was reported as a login: %+v, %v", status, err)
+	}
+	validation, err := p.ValidateToken(context.Background(), prof, true)
+	if err != nil || validation.Valid {
+		t.Fatalf("policy validated as credentials: %+v, %v", validation, err)
+	}
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeConfigDirForProfile(prof))
+	detection, err := p.DetectExistingAuth()
+	if err != nil || detection.Found {
+		t.Fatalf("retained native settings were discovered as auth: %+v, %v", detection, err)
+	}
+}
+
+func TestIsolatedClaudePerProfilePolicyAndPureEnv(t *testing.T) {
+	realHome, prof := claudeLifecycleFixture(t)
+	writeClaudeLifecycleJSON(t, claudesettings.CAAMConfigPath(), `{"claude_settings":{"mode":"per-profile"}}`)
+	writeClaudeLifecycleJSON(t, filepath.Join(realHome, ".claude", "settings.json"), `{"model":"host"}`)
+	if _, err := New().Env(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(prof.HomePath()); !os.IsNotExist(err) {
+		t.Fatalf("Env mutated the profile: %v", err)
+	}
+	for _, path := range claudeSettingsPathsForProfile(prof) {
+		writeClaudeLifecycleJSON(t, path, `{"model":"own","apiKeyHelper":"own-helper"}`)
+	}
+	if err := New().PrepareRun(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range claudeSettingsPathsForProfile(prof) {
+		if got := readClaudeLifecycleJSON(t, path); got["model"] != "own" || got["apiKeyHelper"] != "own-helper" {
+			t.Fatalf("per-profile policy was overwritten: %#v", got)
+		}
+	}
+}
+
+func TestIsolatedClaudeNativeReaderAgreesWithValidation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("synthetic native reader uses a POSIX shell")
+	}
+	for _, scenario := range []string{"legacy-only", "XDG authoritative", "expired XDG", "malformed XDG"} {
+		t.Run(scenario, func(t *testing.T) {
+			_, prof := claudeLifecycleFixture(t)
+			legacy := filepath.Join(claudeLegacyDirForProfile(prof), ".credentials.json")
+			xdg := claudeXDGCredentialsPathForProfile(prof)
+			writeCredentialsFileAt(t, legacy, time.Now().Add(8*time.Hour).UnixMilli())
+			selected := legacy
+			if scenario != "legacy-only" {
+				selected = xdg
+				expiry := time.Now().Add(time.Hour)
+				if scenario == "expired XDG" {
+					expiry = time.Now().Add(-time.Hour)
+				}
+				writeCredentialsFileAt(t, xdg, expiry.UnixMilli())
+				if scenario == "malformed XDG" {
+					writeClaudeLifecycleJSON(t, xdg, `{broken`)
+				}
+			}
+			p := New()
+			if err := p.PrepareRun(context.Background(), prof); err != nil {
+				t.Fatal(err)
+			}
+			env, err := p.Env(context.Background(), prof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if env["CLAUDE_CONFIG_DIR"] != filepath.Dir(selected) {
+				t.Fatalf("native config = %q, selected path = %q", env["CLAUDE_CONFIG_DIR"], selected)
+			}
+			command := exec.Command("sh", "-c", `cat "$CLAUDE_CONFIG_DIR/.credentials.json"`)
+			command.Env = os.Environ()
+			for key, value := range env {
+				command.Env = append(command.Env, key+"="+value)
+			}
+			read, err := command.Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, _ := os.ReadFile(selected)
+			if !bytes.Equal(read, want) {
+				t.Fatal("synthetic native CLI read another credential source")
+			}
+			validation, err := p.ValidateToken(context.Background(), prof, true)
+			wantValid := scenario == "legacy-only" || scenario == "XDG authoritative"
+			if err != nil || validation.Valid != wantValid {
+				t.Fatalf("native-source validation mismatch: %+v, %v", validation, err)
+			}
+			if scenario == "XDG authoritative" {
+				var token struct {
+					OAuth struct {
+						Expiry int64 `json:"expiresAt"`
+					} `json:"claudeAiOauth"`
+				}
+				if err := json.Unmarshal(read, &token); err != nil {
+					t.Fatal(err)
+				}
+				if validation.ExpiresAt.UnixMilli() != token.OAuth.Expiry {
+					t.Fatal("validation borrowed the ignored legacy token's later expiry")
+				}
+				ignoredBefore, _ := os.ReadFile(legacy)
+				source := filepath.Join(t.TempDir(), ".credentials.json")
+				writeCredentialsFileAt(t, source, time.Now().Add(2*time.Hour).UnixMilli())
+				imported, err := p.ImportAuth(context.Background(), source, prof)
+				if err != nil || len(imported) != 1 || imported[0] != selected {
+					t.Fatalf("credential import did not target only the native store: %v, %v", imported, err)
+				}
+				ignoredAfter, _ := os.ReadFile(legacy)
+				if !bytes.Equal(ignoredBefore, ignoredAfter) {
+					t.Fatal("credential import duplicated a generation into the ignored store")
+				}
+				reader := exec.Command("sh", "-c", `cat "$CLAUDE_CONFIG_DIR/.credentials.json"`)
+				reader.Env = command.Env
+				read, err = reader.Output()
+				want, _ = os.ReadFile(source)
+				if err != nil || !bytes.Equal(read, want) {
+					t.Fatalf("native reader did not see imported credentials: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestIsolatedClaudeRejectsKnownConflictingAccounts(t *testing.T) {
+	_, prof := claudeLifecycleFixture(t)
+	writeClaudeLifecycleJSON(t, filepath.Join(claudeLegacyDirForProfile(prof), ".credentials.json"), `{"claudeAiOauth":{"accessToken":"legacy","accountId":"alice"}}`)
+	writeClaudeLifecycleJSON(t, claudeXDGCredentialsPathForProfile(prof), `{"claudeAiOauth":{"accessToken":"xdg","accountId":"bob"}}`)
+	p := New()
+	if _, err := p.Env(context.Background(), prof); err == nil {
+		t.Fatal("conflicting accounts were assigned a launch environment")
+	}
+	if err := p.PrepareRun(context.Background(), prof); err == nil {
+		t.Fatal("conflicting accounts passed launch preparation")
+	}
+	if _, err := p.Status(context.Background(), prof); err == nil {
+		t.Fatal("conflicting accounts were reported as one profile")
+	}
+	validation, err := p.ValidateToken(context.Background(), prof, true)
+	if err != nil || validation.Valid || !strings.Contains(validation.Error, "conflicting accounts") {
+		t.Fatalf("conflict was not retained in validation: %+v, %v", validation, err)
+	}
+}
+
+func TestIsolatedClaudeLegacyStateMovesToSelectedNativeLocation(t *testing.T) {
+	realHome, prof := claudeLifecycleFixture(t)
+	writeClaudeLifecycleJSON(t, filepath.Join(realHome, ".claude.json"), `{"oauthAccount":{"accountUuid":"host"},"mcpServers":{"current":{}}}`)
+	oldState := filepath.Join(prof.HomePath(), ".claude.json")
+	writeClaudeLifecycleJSON(t, oldState, `{"oauthToken":"profile-token","oauthAccount":{"accountUuid":"profile"},"mcpServers":{"old":{}}}`)
+	p := New()
+	if err := p.PrepareRun(context.Background(), prof); err != nil {
+		t.Fatal(err)
+	}
+	env, err := p.Env(context.Background(), prof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env["CLAUDE_CONFIG_DIR"] != claudeLegacyDirForProfile(prof) {
+		t.Fatal("legacy-only profile unexpectedly selected XDG")
+	}
+	state := readClaudeLifecycleJSON(t, filepath.Join(env["CLAUDE_CONFIG_DIR"], ".claude.json"))
+	if state["oauthToken"] != "profile-token" || state["oauthAccount"].(map[string]interface{})["accountUuid"] != "profile" || state["mcpServers"].(map[string]interface{})["current"] == nil {
+		t.Fatalf("native state lost its account or current shared policy: %#v", state)
+	}
+}
+
+func TestIsolatedClaudeImportRejectsPolicyOnlyAndNewAccountConflict(t *testing.T) {
+	_, prof := claudeLifecycleFixture(t)
+	sourceDir := t.TempDir()
+	settingsSource := filepath.Join(sourceDir, "settings.json")
+	writeClaudeLifecycleJSON(t, settingsSource, `{"model":"policy-only"}`)
+	p := New()
+	if _, err := p.ImportAuth(context.Background(), settingsSource, prof); err == nil {
+		t.Fatal("policy-only settings imported as a login")
+	}
+	legacy := filepath.Join(claudeLegacyDirForProfile(prof), ".credentials.json")
+	xdg := claudeXDGCredentialsPathForProfile(prof)
+	for _, path := range []string{legacy, xdg} {
+		writeClaudeLifecycleJSON(t, path, `{"claudeAiOauth":{"accessToken":"current","accountId":"alice"}}`)
+	}
+	source := filepath.Join(sourceDir, ".credentials.json")
+	writeClaudeLifecycleJSON(t, source, `{"claudeAiOauth":{"accessToken":"other","accountId":"bob"}}`)
+	before, _ := os.ReadFile(xdg)
+	if _, err := p.ImportAuth(context.Background(), source, prof); err == nil {
+		t.Fatal("import introduced known conflicting account stores")
+	}
+	after, _ := os.ReadFile(xdg)
+	if !bytes.Equal(before, after) {
+		t.Fatal("rejected import changed the selected native credential")
+	}
 }

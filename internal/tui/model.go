@@ -114,6 +114,7 @@ type Profile struct {
 
 type vaultProfileMeta struct {
 	Description string
+	Tags        []string
 	Account     string
 }
 
@@ -159,6 +160,7 @@ type Model struct {
 
 	// Runtime configuration
 	runtime config.RuntimeConfig
+	safety  config.SafetyConfig
 
 	// Project context
 	cwd            string
@@ -243,12 +245,16 @@ func NewWithProvidersAndConfig(providers []string, cfg *config.SPMConfig) Model 
 		profilesPanel.SetProvider(providers[0])
 	}
 
-	// Use runtime config from SPM config if provided
+	// Keep execution settings from the same configuration as the TUI.
 	var runtime config.RuntimeConfig
+	var safety config.SafetyConfig
 	if cfg != nil {
 		runtime = cfg.Runtime
+		safety = cfg.Safety
 	} else {
-		runtime = config.DefaultSPMConfig().Runtime
+		defaults := config.DefaultSPMConfig()
+		runtime = defaults.Runtime
+		safety = defaults.Safety
 	}
 
 	return Model{
@@ -267,6 +273,7 @@ func NewWithProvidersAndConfig(providers []string, cfg *config.SPMConfig) Model 
 		vaultPath:       authfile.DefaultVaultPath(),
 		badges:          make(map[string]profileBadge),
 		runtime:         runtime,
+		safety:          safety,
 		cwd:             cwd,
 		profileStore:    profile.NewStore(profile.DefaultStorePath()),
 		profileMeta:     make(map[string]map[string]*profile.Profile),
@@ -522,6 +529,7 @@ type activateResultMsg struct {
 	provider string
 	profile  string
 	err      error
+	warnings []string
 }
 
 // toastTickMsg is sent to check for expired toasts.
@@ -851,6 +859,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.showActivateSuccess(msg.provider, msg.profile)
+		if len(msg.warnings) > 0 {
+			m.statusMsg += "; " + strings.Join(msg.warnings, "; ")
+		}
 		// Refresh profiles to update active state
 		ctx := refreshContext{
 			provider:        msg.provider,
@@ -859,11 +870,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refreshProfiles(ctx)
 
 	case refreshResultMsg:
-		if msg.err != nil {
+		if msg.err != nil && !refresh.IsDeliveryIncomplete(msg.err) {
+			if refresh.IsSkipped(msg.err) {
+				m.statusMsg = fmt.Sprintf("Refresh skipped: %v", msg.err)
+				return m, nil
+			}
 			m.showError(msg.err, "Refresh")
 			return m, nil
 		}
 		m.showRefreshSuccess(msg.profile, time.Time{}) // TODO: pass actual expiry time
+		if msg.err != nil {
+			m.statusMsg += "; " + msg.err.Error()
+		}
 		// Refresh profiles to update any changed state
 		ctx := refreshContext{
 			provider:        msg.provider,
@@ -1481,8 +1499,16 @@ func (m Model) handleLoginProfile() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	provider := m.currentProvider()
+	if provider == "cursor" {
+		if info.TokenRenewable {
+			m.statusMsg = "Cursor renews access tokens from the saved API key automatically."
+		} else {
+			m.statusMsg = health.CursorReloginInstructions(info.Name)
+		}
+		return m, nil
+	}
 
-	m.statusMsg = fmt.Sprintf("Refreshing %s token...", info.Name)
+	m.statusMsg = fmt.Sprintf("Checking refresh eligibility for %s...", info.Name)
 
 	// Return a command that performs the async refresh
 	return m, m.doRefreshProfile(provider, info.Name)
@@ -1521,7 +1547,11 @@ func (m Model) doActivateProfile(provider, profile string) tea.Cmd {
 		}
 
 		vault := authfile.NewVault(m.vaultPath)
-		if err := vault.Restore(fileSet, profile); err != nil {
+		result, err := vault.Switch(fileSet, profile, authfile.SwitchOptions{
+			BackupMode:     m.safety.AutoBackupBeforeSwitch,
+			MaxAutoBackups: m.safety.MaxAutoBackups,
+		})
+		if err != nil {
 			return activateResultMsg{
 				provider: provider,
 				profile:  profile,
@@ -1532,7 +1562,7 @@ func (m Model) doActivateProfile(provider, profile string) tea.Cmd {
 		return activateResultMsg{
 			provider: provider,
 			profile:  profile,
-			err:      nil,
+			warnings: result.Warnings,
 		}
 	}
 }
@@ -2025,10 +2055,12 @@ func loadVaultProfileMeta(vault *authfile.Vault, provider, name string) vaultPro
 	metaPath := filepath.Join(profileDir, "meta.json")
 	if raw, err := os.ReadFile(metaPath); err == nil {
 		var stored struct {
-			Description string `json:"description"`
+			Description string   `json:"description"`
+			Tags        []string `json:"tags"`
 		}
 		if err := json.Unmarshal(raw, &stored); err == nil {
 			meta.Description = strings.TrimSpace(stored.Description)
+			meta.Tags = stored.Tags
 		}
 	}
 
@@ -2092,7 +2124,28 @@ func profileMatchesQuery(info ProfileInfo, query string) bool {
 	if info.Description != "" && strings.Contains(strings.ToLower(info.Description), query) {
 		return true
 	}
+	for _, tag := range info.Tags {
+		if strings.Contains(strings.ToLower(tag), query) {
+			return true
+		}
+	}
 	return false
+}
+
+// mergeTags combines tag lists, keeping the first occurrence of each tag.
+func mergeTags(lists ...[]string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, list := range lists {
+		for _, tag := range list {
+			tag = strings.ToLower(strings.TrimSpace(tag))
+			if tag != "" && !seen[tag] {
+				seen[tag] = true
+				out = append(out, tag)
+			}
+		}
+	}
+	return out
 }
 
 func (m Model) buildProfileInfo(provider string, p Profile, projectDefault string) ProfileInfo {
@@ -2101,6 +2154,7 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 	description := ""
 	lastUsed := time.Time{}
 	locked := false
+	var tags []string
 
 	meta := m.profileMetaFor(provider, p.Name)
 	if meta != nil {
@@ -2111,6 +2165,7 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 		description = meta.Description
 		lastUsed = meta.LastUsedAt
 		locked = meta.IsLocked()
+		tags = meta.Tags
 	}
 
 	vmeta := m.vaultMetaFor(provider, p.Name)
@@ -2120,36 +2175,48 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 	if description == "" {
 		description = vmeta.Description
 	}
+	tags = mergeTags(vmeta.Tags, tags)
 
 	healthStatus := health.StatusUnknown
 	errorCount := 0
 	penalty := float64(0)
 	var tokenExpiry time.Time
+	var tokenRenewable, loginRequired bool
+	var reloginWarningLead time.Duration
 
 	if m.healthStorage != nil {
+		m.healthStorage.SetVaultPath(m.vaultPath)
 		if h, err := m.healthStorage.GetProfile(provider, p.Name); err == nil && h != nil {
 			healthStatus = health.CalculateStatus(h)
 			errorCount = h.ErrorCount1h
 			penalty = h.Penalty
 			tokenExpiry = h.TokenExpiresAt
+			tokenRenewable = h.CredentialRenewable()
+			reloginWarningLead = h.ReloginWarningLead
+			signals := health.CredentialSignals(h, health.DefaultHealthConfig())
+			loginRequired = signals.LoginRequired != nil && *signals.LoginRequired
 		}
 	}
 
 	return ProfileInfo{
-		Name:           p.Name,
-		Badge:          m.badgeFor(provider, p.Name),
-		ProjectDefault: projectDefault != "" && p.Name == projectDefault,
-		AuthMode:       authMode,
-		LoggedIn:       true,
-		Locked:         locked,
-		LastUsed:       lastUsed,
-		Account:        account,
-		Description:    description,
-		IsActive:       p.IsActive,
-		HealthStatus:   healthStatus,
-		TokenExpiry:    tokenExpiry,
-		ErrorCount:     errorCount,
-		Penalty:        penalty,
+		Name:               p.Name,
+		Badge:              m.badgeFor(provider, p.Name),
+		ProjectDefault:     projectDefault != "" && p.Name == projectDefault,
+		AuthMode:           authMode,
+		LoggedIn:           !loginRequired,
+		Locked:             locked,
+		LastUsed:           lastUsed,
+		Account:            account,
+		Description:        description,
+		Tags:               tags,
+		IsActive:           p.IsActive,
+		HealthStatus:       healthStatus,
+		TokenExpiry:        tokenExpiry,
+		TokenRenewable:     tokenRenewable,
+		LoginRequired:      loginRequired,
+		ReloginWarningLead: reloginWarningLead,
+		ErrorCount:         errorCount,
+		Penalty:            penalty,
 	}
 }
 
@@ -2236,14 +2303,21 @@ func (m Model) syncDetailPanel() {
 	errorCount := 0
 	penalty := float64(0)
 	var tokenExpiry time.Time
+	var tokenRenewable, loginRequired bool
+	var reloginWarningLead time.Duration
 
 	// Fetch real health data if available
 	if m.healthStorage != nil {
+		m.healthStorage.SetVaultPath(m.vaultPath)
 		if h, err := m.healthStorage.GetProfile(provider, profileName); err == nil && h != nil {
 			healthStatus = health.CalculateStatus(h)
 			errorCount = h.ErrorCount1h
 			penalty = h.Penalty
 			tokenExpiry = h.TokenExpiresAt
+			tokenRenewable = h.CredentialRenewable()
+			reloginWarningLead = h.ReloginWarningLead
+			signals := health.CredentialSignals(h, health.DefaultHealthConfig())
+			loginRequired = signals.LoginRequired != nil && *signals.LoginRequired
 		}
 	}
 
@@ -2256,6 +2330,7 @@ func (m Model) syncDetailPanel() {
 	browserCmd := ""
 	browserProf := ""
 	locked := false
+	var tags []string
 
 	meta := m.profileMetaFor(provider, profileName)
 	if meta != nil {
@@ -2264,6 +2339,7 @@ func (m Model) syncDetailPanel() {
 		}
 		account = profileAccountLabel(meta)
 		description = meta.Description
+		tags = meta.Tags
 		createdAt = meta.CreatedAt
 		lastUsedAt = meta.LastUsedAt
 		browserCmd = meta.BrowserCommand
@@ -2283,6 +2359,7 @@ func (m Model) syncDetailPanel() {
 	if description == "" {
 		description = vmeta.Description
 	}
+	tags = mergeTags(vmeta.Tags, tags)
 
 	if path == "" {
 		vault := authfile.NewVault(m.vaultPath)
@@ -2290,22 +2367,26 @@ func (m Model) syncDetailPanel() {
 	}
 
 	detail := &DetailInfo{
-		Name:         profileName,
-		Provider:     provider,
-		AuthMode:     authMode,
-		LoggedIn:     true,
-		Locked:       locked,
-		Path:         path,
-		CreatedAt:    createdAt,
-		LastUsedAt:   lastUsedAt,
-		Account:      account,
-		Description:  description,
-		BrowserCmd:   browserCmd,
-		BrowserProf:  browserProf,
-		HealthStatus: healthStatus,
-		TokenExpiry:  tokenExpiry,
-		ErrorCount:   errorCount,
-		Penalty:      penalty,
+		Name:               profileName,
+		Provider:           provider,
+		AuthMode:           authMode,
+		LoggedIn:           !loginRequired,
+		Locked:             locked,
+		Path:               path,
+		CreatedAt:          createdAt,
+		LastUsedAt:         lastUsedAt,
+		Account:            account,
+		Description:        description,
+		Tags:               tags,
+		BrowserCmd:         browserCmd,
+		BrowserProf:        browserProf,
+		HealthStatus:       healthStatus,
+		TokenExpiry:        tokenExpiry,
+		TokenRenewable:     tokenRenewable,
+		LoginRequired:      loginRequired,
+		ReloginWarningLead: reloginWarningLead,
+		ErrorCount:         errorCount,
+		Penalty:            penalty,
 	}
 	m.detailPanel.SetProfile(detail)
 }
@@ -2527,12 +2608,13 @@ func (m Model) mainView() string {
 		} else {
 			profilesPanelView = m.renderProfileList()
 		}
+		profilesPanelView = clampBox(profilesPanelView, m.width, layout.ProfilesHeight)
 
 		var detailPanelView string
 		if m.detailPanel != nil && layout.ShowDetail {
 			m.syncDetailPanel()
 			m.detailPanel.SetSize(m.width, layout.DetailHeight)
-			detailPanelView = m.detailPanel.View()
+			detailPanelView = clampBox(m.detailPanel.View(), m.width, layout.DetailHeight)
 		}
 
 		if detailPanelView != "" {
@@ -2546,7 +2628,7 @@ func (m Model) mainView() string {
 		// Sync and render provider panel
 		m.providerPanel.SetActiveProvider(m.activeProvider)
 		m.providerPanel.SetSize(layout.ProviderWidth, contentHeight)
-		providerPanelView := m.providerPanel.View()
+		providerPanelView := clampBox(m.providerPanel.View(), layout.ProviderWidth, contentHeight)
 
 		// Sync and render profiles panel (center panel)
 		var profilesPanelView string
@@ -2556,13 +2638,14 @@ func (m Model) mainView() string {
 		} else {
 			profilesPanelView = m.renderProfileList()
 		}
+		profilesPanelView = clampBox(profilesPanelView, layout.ProfilesWidth, contentHeight)
 
 		// Sync and render detail panel (right panel)
 		var detailPanelView string
 		if m.detailPanel != nil {
 			m.syncDetailPanel()
 			m.detailPanel.SetSize(layout.DetailWidth, contentHeight)
-			detailPanelView = m.detailPanel.View()
+			detailPanelView = clampBox(m.detailPanel.View(), layout.DetailWidth, contentHeight)
 		}
 
 		// Create panels side by side
@@ -2597,18 +2680,62 @@ func (m Model) mainView() string {
 		)
 	}
 
-	// Add status bar at bottom
-	availableHeight := m.height - lipgloss.Height(content) - 2
-	if availableHeight > 0 {
-		content = lipgloss.JoinVertical(
-			lipgloss.Left,
-			content,
-			lipgloss.NewStyle().Height(availableHeight).Render(""),
-			status,
-		)
+	// Status bar pinned to the bottom row(s). The content above it is cut to
+	// the rows that remain, so a tall panel can never push the status bar
+	// off-screen (it used to be dropped whenever the content overflowed).
+	statusHeight := lipgloss.Height(status)
+	if m.height <= statusHeight {
+		return fitLines(status, m.width, m.height)
 	}
+	return fitLines(content, m.width, m.height-statusHeight) + "\n" + fitLines(status, m.width, statusHeight)
+}
 
-	return content
+// fitLines cuts s to at most width cells per line and height lines, padding
+// short output with blank lines so the result is exactly height lines.
+func fitLines(s string, width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	if width > 0 {
+		for i, ln := range lines {
+			if ansi.StringWidth(ln) > width {
+				lines[i] = ansi.Truncate(ln, width, "")
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// clampBox fits a bordered panel into width x height. A panel taller than
+// height keeps its first height-1 lines and its last (bottom border) line, so
+// it is cut inside the box rather than losing its frame.
+func clampBox(box string, width, height int) string {
+	if height <= 0 {
+		return box
+	}
+	lines := strings.Split(box, "\n")
+	if len(lines) > height {
+		if height >= 2 {
+			lines = append(lines[:height-1:height-1], lines[len(lines)-1])
+		} else {
+			lines = lines[:height]
+		}
+	}
+	if width > 0 {
+		for i, ln := range lines {
+			if ansi.StringWidth(ln) > width {
+				lines[i] = ansi.Truncate(ln, width, "")
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m Model) isCompactLayout() bool {
@@ -3086,6 +3213,9 @@ func (m Model) statusCenterMessage() string {
 func statusSeverityFromMessage(msg string) StatusSeverity {
 	msg = strings.TrimSpace(strings.ToLower(msg))
 	if msg == "" {
+		return StatusInfo
+	}
+	if strings.HasPrefix(msg, "refresh skipped:") {
 		return StatusInfo
 	}
 

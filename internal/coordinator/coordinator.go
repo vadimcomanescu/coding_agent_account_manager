@@ -2,13 +2,18 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/google/uuid"
 )
 
@@ -30,6 +35,20 @@ const (
 	BackendAuto Backend = "auto"
 )
 
+// PaneIdentityResolver resolves the Claude identity used by a running pane.
+// It is called once when a new rate-limit episode is observed. A non-nil
+// result must have provider-verified account and organization IDs bound to
+// the exact grant in use by this pane's current process, with Verified set.
+//
+// A verified credential file alone does not establish this relationship:
+// another process may have switched that file while the pane retains an older
+// grant. The coordinator's HOME, a pane's title or working directory, and a
+// PID without its machine and process provenance are not identity evidence.
+// Return nil when the relationship is unknown or no longer valid. Resolvers
+// must honor ctx and keep work bounded; pane polling must not prompt for
+// credentials or keychain access.
+type PaneIdentityResolver func(ctx context.Context, pane Pane) *identity.Identity
+
 // Config configures the coordinator.
 type Config struct {
 	// Backend specifies which terminal multiplexer to use.
@@ -40,7 +59,8 @@ type Config struct {
 	// PollInterval is how often to check pane output.
 	PollInterval time.Duration
 
-	// AuthTimeout is how long to wait for auth completion.
+	// AuthTimeout is how long an agent has to answer a request once it has
+	// fetched it. Requests no agent has fetched yet wait without a limit.
 	AuthTimeout time.Duration
 
 	// StateTimeout is how long to wait in intermediate states before timing out.
@@ -64,7 +84,14 @@ type Config struct {
 
 	// AuthToken is an optional shared secret required by the coordinator API.
 	// When set, clients must send "Authorization: Bearer <token>".
+	// A token is mandatory when the API listens on a non-loopback address.
 	AuthToken string
+
+	// ResponseReplayWindow is how long a closed request remembers the response
+	// it accepted, so an agent retrying a delivery whose acknowledgement was
+	// lost receives the same acknowledgement instead of an unknown-request
+	// rejection.
+	ResponseReplayWindow time.Duration
 
 	// LoginCooldown is the minimum time between /login injections per pane.
 	LoginCooldown time.Duration
@@ -76,9 +103,19 @@ type Config struct {
 	// This prevents duplicate resume prompts if the state detection triggers multiple times.
 	ResumeCooldown time.Duration
 
+	// MaxLoginRetries is how many times a failed login is retried (by
+	// injecting /login again) within one rate-limit episode.
+	MaxLoginRetries int
+
 	// PaneClient allows injecting a custom pane client (useful for tests).
 	// If nil, one is selected based on Backend.
 	PaneClient PaneClient
+
+	// ResolvePaneIdentity optionally supplies verified identity evidence for
+	// an individual running pane. Nil leaves the account and organization
+	// unknown. The built-in pane backends do not prove which grant a process
+	// holds, so there is deliberately no host-credential fallback.
+	ResolvePaneIdentity PaneIdentityResolver
 
 	// CompactionReminderEnabled enables auto-injection of reminder after compaction.
 	CompactionReminderEnabled bool
@@ -102,7 +139,7 @@ func DefaultConfig() Config {
 	return Config{
 		Backend:                    BackendAuto, // Try WezTerm first, fall back to tmux
 		PollInterval:               500 * time.Millisecond,
-		AuthTimeout:                60 * time.Second,
+		AuthTimeout:                5 * time.Minute,
 		StateTimeout:               30 * time.Second,
 		OutputLines:                100,
 		ResumePrompt:               "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
@@ -110,20 +147,158 @@ func DefaultConfig() Config {
 		LoginCooldown:              5 * time.Second,
 		MethodSelectCooldown:       2 * time.Second,
 		ResumeCooldown:             10 * time.Second,
+		MaxLoginRetries:            2,
 		CompactionReminderEnabled:  false, // Opt-in feature
 		CompactionReminderPrompt:   "Reread AGENTS.md so it's still fresh in your mind.\n",
 		CompactionReminderCooldown: 10 * time.Minute,
 		CompactionReminderRegex:    nil, // Use default Patterns.CompactingBanner
+		ResponseReplayWindow:       15 * time.Minute,
 	}
 }
 
-// AuthRequest represents a pending authentication request.
+// FileConfig is the on-disk coordinator configuration. 'caam setup
+// distributed' writes it to the remote host and 'caam auth-coordinator
+// --config' reads it, so both sides share this one definition.
+type FileConfig struct {
+	Bind           string `json:"bind,omitempty"`
+	Port           int    `json:"port,omitempty"`
+	PollInterval   string `json:"poll_interval,omitempty"`
+	AuthTimeout    string `json:"auth_timeout,omitempty"`
+	StateTimeout   string `json:"state_timeout,omitempty"`
+	ResumePrompt   string `json:"resume_prompt,omitempty"`
+	ResumeCooldown string `json:"resume_cooldown,omitempty"`
+	OutputLines    int    `json:"output_lines,omitempty"`
+	Backend        string `json:"backend,omitempty"`
+	AuthToken      string `json:"auth_token,omitempty"`
+}
+
+// LoadFileConfig reads a FileConfig from path.
+func LoadFileConfig(path string) (FileConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return FileConfig{}, fmt.Errorf("read config: %w", err)
+	}
+	var fc FileConfig
+	if err := json.Unmarshal(data, &fc); err != nil {
+		return FileConfig{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	return fc, nil
+}
+
+// Apply overlays the file settings onto base. Unset fields keep base values.
+func (fc FileConfig) Apply(base Config) (Config, error) {
+	cfg := base
+	durations := []struct {
+		name  string
+		value string
+		dst   *time.Duration
+	}{
+		{"poll_interval", fc.PollInterval, &cfg.PollInterval},
+		{"auth_timeout", fc.AuthTimeout, &cfg.AuthTimeout},
+		{"state_timeout", fc.StateTimeout, &cfg.StateTimeout},
+		{"resume_cooldown", fc.ResumeCooldown, &cfg.ResumeCooldown},
+	}
+	for _, d := range durations {
+		if strings.TrimSpace(d.value) == "" {
+			continue
+		}
+		parsed, err := time.ParseDuration(d.value)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse %s: %w", d.name, err)
+		}
+		if parsed <= 0 {
+			return Config{}, fmt.Errorf("parse %s: must be positive, got %s", d.name, d.value)
+		}
+		*d.dst = parsed
+	}
+	if fc.ResumePrompt != "" {
+		cfg.ResumePrompt = fc.ResumePrompt
+	}
+	if fc.OutputLines < 0 {
+		return Config{}, fmt.Errorf("output_lines must not be negative")
+	}
+	if fc.OutputLines != 0 {
+		cfg.OutputLines = fc.OutputLines
+	}
+	if fc.Backend != "" {
+		backend, err := ParseBackend(fc.Backend)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Backend = backend
+	}
+	if fc.AuthToken != "" {
+		cfg.AuthToken = fc.AuthToken
+	}
+	return cfg, nil
+}
+
+// ParseBackend parses a terminal multiplexer backend name.
+func ParseBackend(value string) (Backend, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "wezterm":
+		return BackendWezTerm, nil
+	case "tmux":
+		return BackendTmux, nil
+	case "auto", "":
+		return BackendAuto, nil
+	default:
+		return "", fmt.Errorf("invalid backend %q: use wezterm, tmux, or auto", value)
+	}
+}
+
+// Auth request lifecycle statuses.
+const (
+	// RequestPending requests are offered to agents via /auth/pending.
+	RequestPending = "pending"
+	// RequestAccepted requests hold an accepted code awaiting injection and
+	// confirmation in the pane.
+	RequestAccepted = "accepted"
+	// RequestCompleted requests finished with a confirmed login.
+	RequestCompleted = "completed"
+	// RequestFailed requests ended with an agent error or a rejected login.
+	RequestFailed = "failed"
+	// RequestExpired requests timed out or lost their pane before an outcome.
+	RequestExpired = "expired"
+)
+
+// Errors returned by ReceiveAuthResponse. The API maps them to distinct HTTP
+// statuses so agents can tell a retryable delivery from a permanent rejection.
+var (
+	// ErrInvalidAuthResponse means the response carried neither a code nor an
+	// error, or carried both.
+	ErrInvalidAuthResponse = errors.New("auth response must carry exactly one of code or error")
+	// ErrUnknownAuthRequest means the coordinator never issued the request.
+	ErrUnknownAuthRequest = errors.New("unknown request")
+	// ErrAuthRequestClosed means the request ended before this response arrived.
+	ErrAuthRequestClosed = errors.New("auth request is closed")
+	// ErrAuthResponseConflict means the request already accepted a different
+	// response; accepted codes are never overwritten.
+	ErrAuthResponseConflict = errors.New("auth request already accepted a different response")
+)
+
+// AuthRequest represents an authentication request issued for a pane.
 type AuthRequest struct {
 	ID        string    `json:"id"`
 	PaneID    int       `json:"pane_id"`
 	URL       string    `json:"url"`
 	CreatedAt time.Time `json:"created_at"`
-	Status    string    `json:"status"` // pending, processing, completed, failed
+	Status    string    `json:"status"` // pending, accepted, completed, failed, expired
+	// ClaimedAt is when an agent first fetched the request. AuthTimeout runs
+	// from here: until an agent is around, the request simply waits.
+	ClaimedAt time.Time `json:"claimed_at,omitzero"`
+	// LimitedAccount identifies the account verified for this pane when it
+	// hit its limit. Account fields are omitted when pane ownership is unknown.
+	// LimitReset is the banner's reset ("3pm (America/New_York)"); the agent
+	// passes over a known account until then.
+	LimitedAccount        string `json:"limited_account,omitempty"`
+	LimitReset            string `json:"limit_reset,omitempty"`
+	LimitedAccountID      string `json:"limited_account_id,omitempty"`
+	LimitedOrganizationID string `json:"limited_organization_id,omitempty"`
+
+	// response is the first valid response accepted for this request.
+	response *AuthResponse
+	closedAt time.Time
 }
 
 // AuthResponse contains the result from the local agent.
@@ -132,6 +307,10 @@ type AuthResponse struct {
 	Code      string `json:"code"`
 	Account   string `json:"account"`
 	Error     string `json:"error,omitempty"`
+	// RetryAfter, with an Error, is when the agent will have an account
+	// again: it declined because every account it may use is at its usage
+	// limit. The pane is left alone until then.
+	RetryAfter time.Time `json:"retry_after,omitzero"`
 }
 
 // Coordinator manages pane monitoring and auth recovery.
@@ -141,6 +320,7 @@ type Coordinator struct {
 	logger     *slog.Logger
 	trackers   map[int]*PaneTracker // paneID -> tracker
 	requests   map[string]*AuthRequest
+	closed     map[string]*AuthRequest // recently closed requests, kept for replay
 	mu         sync.RWMutex
 	stopCh     chan struct{}
 	doneCh     chan struct{}
@@ -202,6 +382,7 @@ func New(config Config) *Coordinator {
 		logger:     logger,
 		trackers:   make(map[int]*PaneTracker),
 		requests:   make(map[string]*AuthRequest),
+		closed:     make(map[string]*AuthRequest),
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 		runID:      runID,
@@ -227,25 +408,16 @@ func selectPaneClient(backend Backend, logger *slog.Logger) PaneClient {
 	case BackendAuto:
 		fallthrough
 	default:
-		// Try WezTerm first (preferred)
-		wezterm := NewWezTermClient()
-		if wezterm.IsAvailable(ctx) {
-			logger.Info("using WezTerm backend (preferred)")
-			return wezterm
+		// WezTerm is preferred; tmux is the fallback. The choice follows
+		// whichever is running, so a multiplexer started after the
+		// coordinator is picked up.
+		auto := newAutoPaneClient(ctx, logger, NewWezTermClient(), NewTmuxClient())
+		if auto.IsAvailable(ctx) {
+			logger.Info("using terminal multiplexer backend", "backend", auto.Backend())
+		} else {
+			logger.Warn("no terminal multiplexer running yet; will use WezTerm or tmux once one starts")
 		}
-
-		// Fall back to tmux
-		tmux := NewTmuxClient()
-		if tmux.IsAvailable(ctx) {
-			logger.Info("WezTerm not available, using tmux backend",
-				"note", "WezTerm is recommended for better integration")
-			return tmux
-		}
-
-		// Neither available - return WezTerm anyway, errors will surface later
-		logger.Warn("no terminal multiplexer detected",
-			"hint", "start WezTerm or tmux before running the coordinator")
-		return wezterm
+		return auto
 	}
 }
 
@@ -332,14 +504,19 @@ func (c *Coordinator) pollPanes(ctx context.Context) {
 		c.processPaneState(ctx, pane)
 	}
 
-	// Clean up trackers for panes that no longer exist
+	// Clean up trackers for panes that no longer exist. Their open requests
+	// can never be delivered, so they stop being offered to agents.
 	c.mu.Lock()
-	for paneID := range c.trackers {
+	for paneID, tracker := range c.trackers {
 		if !seenPanes[paneID] {
 			c.logger.Debug("pane disappeared, removing tracker", "pane_id", paneID)
+			if requestID := tracker.GetRequestID(); requestID != "" {
+				c.closeRequestLocked(requestID, RequestExpired)
+			}
 			delete(c.trackers, paneID)
 		}
 	}
+	c.pruneClosedLocked(time.Now())
 	c.mu.Unlock()
 }
 
@@ -378,7 +555,7 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 	// Handle state-specific logic
 	switch currentState {
 	case StateIdle:
-		c.handleIdleState(ctx, tracker, output)
+		c.handleIdleState(ctx, pane, tracker, output)
 
 	case StateRateLimited:
 		c.handleRateLimitedState(ctx, tracker, output)
@@ -402,19 +579,112 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 		c.handleResumingState(ctx, tracker, output)
 
 	case StateFailed:
-		// Check for timeout and reset
+		// The agent has no account until the hold ends: close the login
+		// screen and leave the pane at its prompt (where Claude Code may
+		// itself continue once its limit resets) instead of retrying.
+		if until := tracker.GetHoldUntil(); time.Now().Before(until) {
+			c.standDown(ctx, tracker, until)
+			return
+		}
+		// After the failure has been visible for StateTimeout, retry the
+		// login (a slow agent or an expired code is often transient) up
+		// to MaxLoginRetries times per rate-limit episode, then leave the
+		// pane to a human.
 		if tracker.TimeSinceStateChange() > c.config.StateTimeout {
-			c.logger.Info("resetting failed pane after timeout",
-				"pane_id", tracker.PaneID)
-
-			c.cleanupRequest(tracker.GetRequestID())
-			tracker.Reset()
+			c.closeRequest(tracker.GetRequestID(), RequestFailed)
+			c.retryOrGiveUp(ctx, tracker, output)
 		}
 	}
 }
 
-func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker, output string) {
+// standDown closes Claude Code's login screen in a pane the agent cannot sign
+// in before until, and returns the pane to IDLE. Esc cancels the login;
+// Claude Code shows "Esc to cancel" on each of its screens.
+func (c *Coordinator) standDown(ctx context.Context, tracker *PaneTracker, until time.Time) {
+	if err := c.paneClient.SendText(ctx, tracker.PaneID, KeyEscape, true); err != nil {
+		c.logger.Error("injection failed",
+			"pane_id", tracker.PaneID,
+			"state", StateFailed.String(),
+			"inject_type", "cancel_login",
+			"error", err,
+			"action", "inject_failed")
+	}
+	tracker.Reset()
+	c.logger.Warn("no account available; leaving the pane until the first limit lifts",
+		"pane_id", tracker.PaneID,
+		"until", until.Format(time.RFC3339),
+		"action", "stand_down")
+}
+
+// retryOrGiveUp re-injects /login into a failed pane while its retry budget
+// lasts, otherwise returns it to IDLE.
+func (c *Coordinator) retryOrGiveUp(ctx context.Context, tracker *PaneTracker, output string) {
+	retries := tracker.GetRetryCount()
+	if retries >= c.config.MaxLoginRetries {
+		c.logger.Warn("login retries exhausted; leaving pane for manual recovery",
+			"pane_id", tracker.PaneID,
+			"retries", retries,
+			"action", "give_up")
+		tracker.Reset()
+		tracker.SetGaveUp(true)
+		return
+	}
+
+	if err := sendKeys(ctx, c.paneClient, tracker.PaneID, LoginKeys(output)); err != nil {
+		c.logger.Error("injection failed",
+			"pane_id", tracker.PaneID,
+			"state", StateFailed.String(),
+			"inject_type", "login_retry",
+			"error", err,
+			"action", "inject_failed")
+		tracker.Reset()
+		return
+	}
+
+	tracker.Reset()
+	tracker.SetRetryCount(retries + 1)
+	tracker.SetState(StateRateLimited)
+	tracker.SetCooldown("login", c.config.LoginCooldown)
+	c.logger.Info("retrying login after failure",
+		"pane_id", tracker.PaneID,
+		"retry", retries+1,
+		"max_retries", c.config.MaxLoginRetries,
+		"action", "login_retry")
+}
+
+// bottomLines is how much of the end of a pane counts as "on screen" for
+// adopting a login in progress.
+const bottomLines = 12
+
+// atBottom reports whether re matches within the last bottomLines non-empty
+// lines of output.
+func atBottom(output string, re *regexp.Regexp) bool {
+	lines := strings.Split(StripANSI(output), "\n")
+	var tail []string
+	for i := len(lines) - 1; i >= 0 && len(tail) < bottomLines; i-- {
+		if strings.TrimSpace(lines[i]) != "" {
+			tail = append(tail, lines[i])
+		}
+	}
+	for _, line := range tail {
+		if re.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Coordinator) handleIdleState(ctx context.Context, pane Pane, tracker *PaneTracker, output string) {
 	detected, metadata := DetectState(output)
+
+	if detected == StateRateLimited && time.Now().Before(tracker.GetHoldUntil()) {
+		// No account until the hold ends. Look at the pane again on the next
+		// poll even if its screen stays the same, so the login starts then.
+		tracker.mu.Lock()
+		tracker.LastOutput = ""
+		tracker.mu.Unlock()
+		return
+	}
 
 	if detected == StateRateLimited {
 		c.logger.Info("state transition",
@@ -425,6 +695,22 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 			"reset_time", metadata["reset_time"],
 			"action", "transition")
 		tracker.SetState(StateRateLimited)
+		// A new rate-limit episode gets a fresh retry budget.
+		tracker.SetRetryCount(0)
+		tracker.SetGaveUp(false)
+		// Only pane-bound evidence can identify the limited account. A host
+		// credential cache may belong to a different pane or a newer login.
+		var limited *identity.Identity
+		if c.config.ResolvePaneIdentity != nil {
+			limited = c.config.ResolvePaneIdentity(ctx, pane)
+		}
+		tracker.SetIdentityLimit(limited, metadata["reset_text"])
+		accountID, organizationID := tracker.GetLimitIdentity()
+		c.logger.Info("usage limit",
+			"pane_id", tracker.PaneID,
+			"account_id", accountID,
+			"organization_id", organizationID,
+			"resets", metadata["reset_text"])
 
 		// Check login cooldown before injecting
 		if tracker.IsOnCooldown("login") {
@@ -437,8 +723,13 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 			return
 		}
 
-		// Auto-inject /login command
-		if err := c.paneClient.SendText(ctx, tracker.PaneID, "/login\n", true); err != nil {
+		// Auto-inject /login, closing the usage-limit menu first if it is open.
+		if RateLimitMenuOpen(output) {
+			c.logger.Info("closing usage-limit menu before /login",
+				"pane_id", tracker.PaneID,
+				"action", "dismiss_menu")
+		}
+		if err := sendKeys(ctx, c.paneClient, tracker.PaneID, LoginKeys(output)); err != nil {
 			c.logger.Error("injection failed",
 				"pane_id", tracker.PaneID,
 				"state", StateRateLimited.String(),
@@ -455,6 +746,33 @@ func (c *Coordinator) handleIdleState(ctx context.Context, tracker *PaneTracker,
 			tracker.SetCooldown("login", c.config.LoginCooldown)
 		}
 		return // Don't check for compaction if rate limited
+	}
+
+	// A login in progress that nothing is driving: the coordinator was
+	// restarted mid-flow (an upgrade, say), or someone typed /login. Pick
+	// it up where it stands, unless the pane was deliberately left for
+	// manual recovery this episode.
+	// The prompt must be on screen now, not just somewhere in scrollback:
+	// adopting a finished login would type a code into a working session.
+	if !tracker.HasGivenUp() {
+		switch {
+		case detected == StateAwaitingMethodSelect && atBottom(output, Patterns.SelectMethod):
+			c.logger.Info("adopting login in progress",
+				"pane_id", tracker.PaneID,
+				"to_state", StateAwaitingMethodSelect.String(),
+				"action", "adopt")
+			tracker.SetState(StateAwaitingMethodSelect)
+			return
+		case detected == StateAwaitingURL && metadata["oauth_url"] != "" && atBottom(output, Patterns.PastePrompt):
+			c.logger.Info("adopting login in progress",
+				"pane_id", tracker.PaneID,
+				"to_state", StateAwaitingURL.String(),
+				"url_redacted", RedactURL(metadata["oauth_url"]),
+				"action", "adopt")
+			tracker.SetOAuthURL(metadata["oauth_url"])
+			tracker.SetState(StateAwaitingURL)
+			return
+		}
 	}
 
 	// Check for compaction reminder (only if enabled and not rate limited)
@@ -547,7 +865,8 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 			"action", "transition")
 		tracker.SetState(StateAwaitingMethodSelect)
 
-		// Check method select cooldown before injecting
+		// Check method select cooldown before injecting; the
+		// AwaitingMethodSelect handler sends once it has passed.
 		if tracker.IsOnCooldown("method_select") {
 			c.logger.Debug("action blocked by cooldown",
 				"pane_id", tracker.PaneID,
@@ -557,25 +876,7 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 				"action", "cooldown_skip")
 			return
 		}
-
-		// Auto-select option 1 (Claude account with subscription)
-		time.Sleep(200 * time.Millisecond)
-		if err := c.paneClient.SendText(ctx, tracker.PaneID, "1\n", true); err != nil {
-			c.logger.Error("injection failed",
-				"pane_id", tracker.PaneID,
-				"state", StateAwaitingMethodSelect.String(),
-				"inject_type", "subscription_select",
-				"error", err,
-				"action", "inject_failed")
-		} else {
-			c.logger.Debug("injection succeeded",
-				"pane_id", tracker.PaneID,
-				"state", StateAwaitingMethodSelect.String(),
-				"inject_type", "subscription_select",
-				"cooldown_set", c.config.MethodSelectCooldown,
-				"action", "inject_success")
-			tracker.SetCooldown("method_select", c.config.MethodSelectCooldown)
-		}
+		c.sendMethodSelect(ctx, tracker, output)
 
 	case StateAwaitingURL:
 		// Skip method select, URL shown directly
@@ -604,8 +905,53 @@ func (c *Coordinator) handleRateLimitedState(ctx context.Context, tracker *PaneT
 	}
 }
 
+// maxSelectSends bounds login-method selections per cycle.
+const maxSelectSends = 3
+
+// sendMethodSelect chooses option 1 (Claude account with subscription) in
+// the login-method menu. Claude Code's menus act on a digit at once, so "1"
+// goes alone: an Enter after it would land on the next screen, the OAuth code
+// prompt. If the menu is still showing on a later attempt with option 1
+// highlighted, Enter confirms it (for a menu where digits only move the
+// highlight).
+func (c *Coordinator) sendMethodSelect(ctx context.Context, tracker *PaneTracker, output string) {
+	time.Sleep(200 * time.Millisecond)
+	sends := tracker.CountSelectSend()
+	key := "1"
+	if sends > 1 && atBottom(output, Patterns.OptionOne) {
+		key = "\n"
+	}
+	if err := c.paneClient.SendText(ctx, tracker.PaneID, key, true); err != nil {
+		c.logger.Error("injection failed",
+			"pane_id", tracker.PaneID,
+			"state", StateAwaitingMethodSelect.String(),
+			"inject_type", "subscription_select",
+			"error", err,
+			"action", "inject_failed")
+		return
+	}
+	c.logger.Debug("injection succeeded",
+		"pane_id", tracker.PaneID,
+		"state", StateAwaitingMethodSelect.String(),
+		"inject_type", "subscription_select",
+		"attempt", sends,
+		"cooldown_set", c.config.MethodSelectCooldown,
+		"action", "inject_success")
+	tracker.SetCooldown("method_select", c.config.MethodSelectCooldown)
+}
+
 func (c *Coordinator) handleAwaitingMethodSelectState(ctx context.Context, tracker *PaneTracker, output string) {
 	detected, metadata := DetectState(output)
+
+	// The menu still showing once the cooldown has passed means the
+	// selection keystroke was lost (sent while the menu was rendering, or
+	// never sent because of a cooldown); select again, a bounded number of
+	// times, instead of waiting out the state timeout and stalling.
+	if detected == StateAwaitingMethodSelect && !tracker.IsOnCooldown("method_select") &&
+		tracker.GetSelectSends() < maxSelectSends {
+		c.sendMethodSelect(ctx, tracker, output)
+		return
+	}
 
 	if detected == StateAwaitingURL {
 		url := metadata["oauth_url"]
@@ -649,12 +995,18 @@ func (c *Coordinator) handleAwaitingURLState(ctx context.Context, tracker *PaneT
 
 	if oauthURL != "" && tracker.GetRequestID() == "" {
 		// Create auth request for local agent
+		limited, reset := tracker.GetLimit()
+		accountID, organizationID := tracker.GetLimitIdentity()
 		req := &AuthRequest{
-			ID:        uuid.New().String(),
-			PaneID:    tracker.PaneID,
-			URL:       oauthURL,
-			CreatedAt: time.Now(),
-			Status:    "pending",
+			ID:                    uuid.New().String(),
+			PaneID:                tracker.PaneID,
+			URL:                   oauthURL,
+			CreatedAt:             time.Now(),
+			Status:                RequestPending,
+			LimitedAccount:        limited,
+			LimitReset:            reset,
+			LimitedAccountID:      accountID,
+			LimitedOrganizationID: organizationID,
 		}
 
 		c.mu.Lock()
@@ -673,7 +1025,8 @@ func (c *Coordinator) handleAwaitingURLState(ctx context.Context, tracker *PaneT
 			"action", "auth_request_created")
 
 		if c.OnAuthRequest != nil {
-			c.OnAuthRequest(req)
+			snapshot := *req
+			c.OnAuthRequest(&snapshot)
 		}
 	}
 
@@ -687,6 +1040,9 @@ func (c *Coordinator) handleAwaitingURLState(ctx context.Context, tracker *PaneT
 		tracker.Reset()
 	}
 }
+
+// agentWaitLogInterval spaces the warnings about a request no agent fetched.
+const agentWaitLogInterval = 10 * time.Minute
 
 func (c *Coordinator) handleAuthPendingState(ctx context.Context, tracker *PaneTracker, output string) {
 	// Check if we received a code
@@ -702,8 +1058,32 @@ func (c *Coordinator) handleAuthPendingState(ctx context.Context, tracker *PaneT
 		return
 	}
 
+	// Only an agent can complete the request, and the pane waits at its
+	// paste prompt, so the timeout runs from when an agent claimed it. While
+	// no agent is around (its machine asleep, say) the request waits rather
+	// than spending the pane's retry budget.
+	claimed := c.requestClaimedAt(tracker.GetRequestID())
+	if claimed.IsZero() {
+		if tracker.TimeSinceStateChange() > c.config.AuthTimeout && !tracker.IsOnCooldown("agent_wait") {
+			c.logger.Warn("no auth agent has fetched the request; still waiting",
+				"pane_id", tracker.PaneID,
+				"state", StateAuthPending.String(),
+				"request_id", tracker.GetRequestID(),
+				"waiting", tracker.TimeSinceStateChange().Round(time.Second),
+				"action", "await_agent")
+			tracker.SetCooldown("agent_wait", agentWaitLogInterval)
+		}
+		return
+	}
+
 	// Check auth timeout
-	if tracker.TimeSinceStateChange() > c.config.AuthTimeout {
+	if time.Since(claimed) > c.config.AuthTimeout {
+		// A response accepted concurrently wins over the timeout; the next
+		// poll moves the pane to CODE_RECEIVED.
+		if !c.expireUnansweredRequest(tracker.GetRequestID()) {
+			return
+		}
+
 		c.logger.Warn("auth timeout",
 			"pane_id", tracker.PaneID,
 			"state", StateAuthPending.String(),
@@ -711,7 +1091,6 @@ func (c *Coordinator) handleAuthPendingState(ctx context.Context, tracker *PaneT
 			"timeout_duration", c.config.AuthTimeout,
 			"action", "auth_timeout")
 
-		c.cleanupRequest(tracker.GetRequestID())
 		tracker.SetErrorMessage("auth timeout")
 		tracker.SetState(StateFailed)
 
@@ -784,6 +1163,7 @@ func (c *Coordinator) handleAwaitingConfirmState(ctx context.Context, tracker *P
 			"state", StateAwaitingConfirm.String(),
 			"request_id", tracker.GetRequestID(),
 			"action", "transition_to_failed")
+		c.closeRequest(tracker.GetRequestID(), RequestFailed)
 		tracker.SetState(StateFailed)
 
 		if c.OnAuthFailed != nil {
@@ -800,13 +1180,42 @@ func (c *Coordinator) handleAwaitingConfirmState(ctx context.Context, tracker *P
 			"timeout_duration", c.config.StateTimeout,
 			"action", "timeout_failed")
 
-		c.cleanupRequest(tracker.GetRequestID())
+		c.closeRequest(tracker.GetRequestID(), RequestExpired)
 		tracker.SetErrorMessage("confirmation timeout")
 		tracker.SetState(StateFailed)
 	}
 }
 
+// continueSettle is how long the session gets to return to its prompt after
+// the post-login screen is dismissed.
+const continueSettle = 2 * time.Second
+
 func (c *Coordinator) handleResumingState(ctx context.Context, tracker *PaneTracker, output string) {
+	// Claude Code confirms a login with "Login successful. Press Enter to
+	// continue"; text typed on that screen is dropped (its newline only
+	// dismisses it), so dismiss it first, once per cycle.
+	if Patterns.PressEnter.MatchString(StripANSI(output)) && !tracker.MarkContinueSent() {
+		if err := c.paneClient.SendText(ctx, tracker.PaneID, "\n", true); err != nil {
+			c.logger.Error("injection failed",
+				"pane_id", tracker.PaneID,
+				"state", StateResuming.String(),
+				"inject_type", "continue",
+				"error", err,
+				"action", "inject_failed")
+			return
+		}
+		tracker.SetCooldown("continue", continueSettle)
+		c.logger.Info("dismissed post-login screen",
+			"pane_id", tracker.PaneID,
+			"state", StateResuming.String(),
+			"request_id", tracker.GetRequestID(),
+			"action", "inject_continue")
+		return
+	}
+	if tracker.IsOnCooldown("continue") {
+		return
+	}
+
 	// Check resume cooldown to prevent duplicate injections
 	if tracker.IsOnCooldown("resume") {
 		c.logger.Debug("action blocked by cooldown",
@@ -827,7 +1236,7 @@ func (c *Coordinator) handleResumingState(ctx context.Context, tracker *PaneTrac
 		"action", "inject_resume")
 
 	time.Sleep(500 * time.Millisecond)
-	if err := c.paneClient.SendText(ctx, tracker.PaneID, c.config.ResumePrompt, true); err != nil {
+	if err := sendKeys(ctx, c.paneClient, tracker.PaneID, PromptKeys(c.config.ResumePrompt)); err != nil {
 		c.logger.Error("injection failed",
 			"pane_id", tracker.PaneID,
 			"state", StateResuming.String(),
@@ -846,14 +1255,9 @@ func (c *Coordinator) handleResumingState(ctx context.Context, tracker *PaneTrac
 		"cooldown_set", c.config.ResumeCooldown,
 		"action", "inject_success")
 
-	// Mark request complete and clean up
+	// Mark request complete
 	requestID := tracker.GetRequestID()
-	c.mu.Lock()
-	if req, ok := c.requests[requestID]; ok {
-		req.Status = "completed"
-		delete(c.requests, requestID)
-	}
-	c.mu.Unlock()
+	c.closeRequest(requestID, RequestCompleted)
 
 	c.logger.Info("auth cycle complete",
 		"pane_id", tracker.PaneID,
@@ -872,85 +1276,170 @@ func (c *Coordinator) handleResumingState(ctx context.Context, tracker *PaneTrac
 }
 
 // ReceiveAuthResponse processes a response from the local agent.
+//
+// Acceptance is replay-safe: the first valid response for a request is
+// stored and never overwritten. Redelivering that same response (an agent
+// retrying after a lost acknowledgement) succeeds without side effects, even
+// after the request has closed, while a different response is rejected with
+// ErrAuthResponseConflict.
 func (c *Coordinator) ReceiveAuthResponse(resp AuthResponse) error {
+	resp.RequestID = strings.TrimSpace(resp.RequestID)
+	resp.Code = strings.TrimSpace(resp.Code)
+	resp.Account = strings.TrimSpace(resp.Account)
+	resp.Error = strings.TrimSpace(resp.Error)
+	// One instant, one value: a redelivered response compares equal.
+	resp.RetryAfter = resp.RetryAfter.UTC().Truncate(time.Second)
+	if resp.RequestID == "" || (resp.Code == "") == (resp.Error == "") {
+		return ErrInvalidAuthResponse
+	}
+
 	c.mu.Lock()
-	req, ok := c.requests[resp.RequestID]
-	if !ok {
+	req, open := c.requests[resp.RequestID]
+	if !open {
+		closed, known := c.closed[resp.RequestID]
 		c.mu.Unlock()
-		c.logger.Warn("unknown auth response",
-			"request_id", resp.RequestID,
-			"reason", "request_not_found",
-			"action", "response_rejected")
-		return fmt.Errorf("unknown request: %s", resp.RequestID)
-	}
-	req.Status = "processing"
-	c.mu.Unlock()
-
-	// Find tracker for this request
-	c.mu.RLock()
-	var tracker *PaneTracker
-	for _, t := range c.trackers {
-		if t.GetRequestID() == resp.RequestID {
-			tracker = t
-			break
+		if !known {
+			c.logger.Warn("unknown auth response",
+				"request_id", resp.RequestID,
+				"reason", "request_not_found",
+				"action", "response_rejected")
+			return fmt.Errorf("%w: %s", ErrUnknownAuthRequest, resp.RequestID)
 		}
+		return c.replayResult(closed, resp)
 	}
-	c.mu.RUnlock()
+	if req.response != nil {
+		c.mu.Unlock()
+		return c.replayResult(req, resp)
+	}
 
-	if tracker == nil {
-		c.logger.Warn("orphaned auth response",
+	tracker := c.trackers[req.PaneID]
+	if tracker == nil || tracker.GetRequestID() != resp.RequestID || tracker.GetState() != StateAuthPending {
+		c.closeRequestLocked(resp.RequestID, RequestExpired)
+		c.mu.Unlock()
+		c.logger.Warn("auth response for inactive pane",
 			"request_id", resp.RequestID,
-			"reason", "tracker_not_found",
+			"pane_id", req.PaneID,
+			"reason", "pane_not_awaiting_code",
 			"action", "response_rejected")
-		return fmt.Errorf("no tracker for request: %s", resp.RequestID)
+		return fmt.Errorf("%w: %s: pane %d is no longer awaiting a code", ErrAuthRequestClosed, resp.RequestID, req.PaneID)
 	}
+
+	accepted := resp
+	req.response = &accepted
+	if resp.Error != "" {
+		tracker.SetErrorMessage(resp.Error)
+		if !resp.RetryAfter.IsZero() {
+			tracker.SetHoldUntil(resp.RetryAfter)
+		}
+		tracker.SetState(StateFailed)
+		c.closeRequestLocked(resp.RequestID, RequestFailed)
+	} else {
+		req.Status = RequestAccepted
+		// The pane moves to CODE_RECEIVED on the next poll.
+		tracker.SetAuthResponse(resp.Code, resp.Account)
+	}
+	c.mu.Unlock()
 
 	if resp.Error != "" {
 		c.logger.Error("auth response error received",
 			"pane_id", tracker.PaneID,
 			"request_id", resp.RequestID,
-			"state", tracker.GetState().String(),
 			"error", resp.Error,
 			"action", "transition_to_failed")
-		tracker.SetErrorMessage(resp.Error)
-		tracker.SetState(StateFailed)
-
-		c.mu.Lock()
-		req.Status = "failed"
-		delete(c.requests, resp.RequestID)
-		c.mu.Unlock()
-
 		if c.OnAuthFailed != nil {
 			c.OnAuthFailed(tracker.PaneID, fmt.Errorf("%s", resp.Error))
 		}
 		return nil
 	}
 
-	tracker.SetAuthResponse(resp.Code, resp.Account)
-	// State will transition on next poll
-
 	c.logger.Info("auth code received from agent",
 		"pane_id", tracker.PaneID,
 		"request_id", resp.RequestID,
-		"state", tracker.GetState().String(),
 		"account", resp.Account,
 		"code_redacted", RedactCode(resp.Code),
 		"action", "code_stored")
-
 	return nil
 }
 
-// GetPendingRequests returns all pending auth requests.
+// replayResult answers a response for a request that already accepted one, or
+// that closed without one.
+func (c *Coordinator) replayResult(req *AuthRequest, resp AuthResponse) error {
+	c.mu.RLock()
+	accepted := req.response
+	status := req.Status
+	c.mu.RUnlock()
+
+	if accepted == nil {
+		c.logger.Warn("auth response for closed request",
+			"request_id", resp.RequestID,
+			"status", status,
+			"action", "response_rejected")
+		return fmt.Errorf("%w: %s (%s)", ErrAuthRequestClosed, resp.RequestID, status)
+	}
+	if *accepted == resp {
+		c.logger.Debug("duplicate auth response acknowledged",
+			"request_id", resp.RequestID,
+			"status", status,
+			"action", "response_replayed")
+		return nil
+	}
+	c.logger.Warn("conflicting auth response",
+		"request_id", resp.RequestID,
+		"status", status,
+		"action", "response_rejected")
+	return fmt.Errorf("%w: %s", ErrAuthResponseConflict, resp.RequestID)
+}
+
+// GetPendingRequests returns snapshots of the requests awaiting an agent,
+// oldest first.
 func (c *Coordinator) GetPendingRequests() []*AuthRequest {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.pendingSnapshotsLocked()
+}
 
-	var pending []*AuthRequest
+// ClaimPendingRequests returns the pending requests for an agent to work on
+// and records when each was first claimed, which starts its AuthTimeout.
+func (c *Coordinator) ClaimPendingRequests() []*AuthRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
 	for _, req := range c.requests {
-		if req.Status == "pending" {
-			pending = append(pending, req)
+		if req.Status == RequestPending && req.ClaimedAt.IsZero() {
+			req.ClaimedAt = now
 		}
 	}
+	return c.pendingSnapshotsLocked()
+}
+
+// requestClaimedAt returns when an agent first claimed the request (zero if
+// no agent has).
+func (c *Coordinator) requestClaimedAt(requestID string) time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if req, ok := c.requests[requestID]; ok {
+		return req.ClaimedAt
+	}
+	return time.Time{}
+}
+
+// pendingSnapshotsLocked returns copies of the pending requests, oldest
+// first. Callers must hold c.mu.
+func (c *Coordinator) pendingSnapshotsLocked() []*AuthRequest {
+	pending := make([]*AuthRequest, 0, len(c.requests))
+	for _, req := range c.requests {
+		if req.Status == RequestPending {
+			snapshot := *req
+			snapshot.response = nil
+			pending = append(pending, &snapshot)
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		if pending[i].CreatedAt.Equal(pending[j].CreatedAt) {
+			return pending[i].ID < pending[j].ID
+		}
+		return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+	})
 	return pending
 }
 
@@ -984,12 +1473,50 @@ func (c *Coordinator) Backend() string {
 	return c.paneClient.Backend()
 }
 
-// cleanupRequest removes a request from the tracking map.
-func (c *Coordinator) cleanupRequest(requestID string) {
+// closeRequest ends a request with the given status.
+func (c *Coordinator) closeRequest(requestID, status string) {
 	if requestID == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closeRequestLocked(requestID, status)
+}
+
+// closeRequestLocked moves an open request to the closed set, where it stays
+// for the replay window so redelivered responses are answered consistently.
+// Callers must hold c.mu.
+func (c *Coordinator) closeRequestLocked(requestID, status string) {
+	req, ok := c.requests[requestID]
+	if !ok {
+		return
+	}
 	delete(c.requests, requestID)
+	req.Status = status
+	req.closedAt = time.Now()
+	if c.config.ResponseReplayWindow > 0 {
+		c.closed[requestID] = req
+	}
+}
+
+// expireUnansweredRequest closes a request as expired unless a response was
+// already accepted for it. It reports whether the request expired.
+func (c *Coordinator) expireUnansweredRequest(requestID string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if req, ok := c.requests[requestID]; ok && req.response != nil {
+		return false
+	}
+	c.closeRequestLocked(requestID, RequestExpired)
+	return true
+}
+
+// pruneClosedLocked forgets closed requests older than the replay window.
+// Callers must hold c.mu.
+func (c *Coordinator) pruneClosedLocked(now time.Time) {
+	for id, req := range c.closed {
+		if now.Sub(req.closedAt) > c.config.ResponseReplayWindow {
+			delete(c.closed, id)
+		}
+	}
 }

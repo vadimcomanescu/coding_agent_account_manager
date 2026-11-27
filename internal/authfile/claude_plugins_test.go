@@ -1,17 +1,15 @@
 package authfile
 
-// Tests for issue #55: Claude Code plugin state must survive account switches.
-// Plugin content, marketplaces, and install records live under
-// ~/.claude/plugins/ (shared; caam never touches them), but plugin ENABLEMENT
-// lives in ~/.claude/settings.json, which caam swaps per account. Restore
-// therefore merges: the vault snapshot is written, but the LIVE machine's
-// enabledPlugins key (value or absence) wins.
+// Regressions for issues #55 and #115: plugin enablement and other live
+// workflow policy must survive switches, while account authentication changes.
 
 import (
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // claudeSettingsFixture builds a vault with a claude profile whose snapshot
@@ -21,6 +19,7 @@ import (
 func claudeSettingsFixture(t *testing.T, vaultSettings, liveSettings string) (*Vault, AuthFileSet, string) {
 	t.Helper()
 	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	vaultDir := filepath.Join(tmp, "vault")
 	home := filepath.Join(tmp, "home")
 
@@ -53,7 +52,11 @@ func claudeSettingsFixture(t *testing.T, vaultSettings, liveSettings string) (*V
 			{Tool: "claude", Path: livePath, Required: false},
 		},
 	}
-	return NewVault(vaultDir), fileSet, livePath
+	vault := NewVault(vaultDir)
+	setClaudeFixtureIdentities(t, vault, map[string]identity.Identity{
+		`{"claudeAiOauth":{"accessToken":"bob-at","refreshToken":"bob-rt"}}`: {AccountID: "verified-bob", OrganizationID: "verified-bob-org"},
+	})
+	return vault, fileSet, livePath
 }
 
 func readJSONMap(t *testing.T, path string) map[string]interface{} {
@@ -70,9 +73,8 @@ func readJSONMap(t *testing.T, path string) map[string]interface{} {
 }
 
 func TestRestorePreservesLiveEnabledPlugins(t *testing.T) {
-	// Bob's snapshot predates any plugin install; the live machine (alice
-	// active) has plugins enabled. After activating bob, plugins must still be
-	// enabled — but bob's own settings must otherwise win.
+	// Bob's snapshot predates any plugin install. Both live plugin enablement
+	// and live model choice must survive, but bob's helper must replace auth.
 	vault, fileSet, livePath := claudeSettingsFixture(t,
 		`{"model":"opus-bob","apiKeyHelper":"/bin/bob-helper"}`,
 		`{"model":"opus-alice","enabledPlugins":{"frontend-design@official":true,"playwright@official":false}}`,
@@ -83,8 +85,8 @@ func TestRestorePreservesLiveEnabledPlugins(t *testing.T) {
 	}
 
 	got := readJSONMap(t, livePath)
-	if got["model"] != "opus-bob" {
-		t.Errorf("model = %v, want bob's snapshot value", got["model"])
+	if got["model"] != "opus-alice" {
+		t.Errorf("model = %v, want the live value", got["model"])
 	}
 	if got["apiKeyHelper"] != "/bin/bob-helper" {
 		t.Errorf("apiKeyHelper = %v, want bob's snapshot value", got["apiKeyHelper"])
@@ -115,8 +117,8 @@ func TestRestoreDropsSnapshotPluginsWhenLiveHasNone(t *testing.T) {
 	if _, exists := got["enabledPlugins"]; exists {
 		t.Errorf("enabledPlugins resurrected from stale snapshot: %v", got)
 	}
-	if got["model"] != "opus-bob" {
-		t.Errorf("model = %v, want bob's snapshot value", got["model"])
+	if got["model"] != "opus-alice" {
+		t.Errorf("model = %v, want the live value", got["model"])
 	}
 }
 
@@ -133,54 +135,58 @@ func TestRestoreSettingsVerbatimWhenNoLiveFile(t *testing.T) {
 	got := readJSONMap(t, livePath)
 	plugins, ok := got["enabledPlugins"].(map[string]interface{})
 	if !ok || plugins["kept@official"] != true {
-		t.Errorf("with no live file the snapshot restores verbatim, got %v", got)
+		t.Errorf("with no live file the snapshot bootstraps settings, got %v", got)
 	}
 }
 
-func TestRestoreSettingsVerbatimWhenLiveUnparseable(t *testing.T) {
+func TestRestoreRejectsUnparseableLiveSettings(t *testing.T) {
 	vault, fileSet, livePath := claudeSettingsFixture(t,
 		`{"model":"opus-bob"}`,
 		`{not json`,
 	)
 
-	if err := vault.Restore(fileSet, "bob"); err != nil {
-		t.Fatalf("Restore: %v", err)
+	if err := vault.Restore(fileSet, "bob"); err == nil {
+		t.Fatal("expected malformed live settings to stop activation")
 	}
-
-	got := readJSONMap(t, livePath) // must now parse: the snapshot replaced it
-	if got["model"] != "opus-bob" {
-		t.Errorf("unparseable live file should be replaced by the snapshot, got %v", got)
+	if raw, err := os.ReadFile(livePath); err != nil || string(raw) != `{not json` {
+		t.Fatalf("live settings changed on failure: %q, %v", raw, err)
+	}
+	if _, err := os.Stat(fileSet.Files[0].Path); !os.IsNotExist(err) {
+		t.Fatalf("credentials were touched before settings validation: %v", err)
 	}
 }
 
-func TestRestoreSettingsVerbatimWhenSnapshotUnparseable(t *testing.T) {
+func TestRestoreRejectsUnparseableSnapshotSettings(t *testing.T) {
+	const live = `{"enabledPlugins":{"x@y":true}}`
 	vault, fileSet, livePath := claudeSettingsFixture(t,
-		`corrupt-snapshot`,
-		`{"enabledPlugins":{"x@y":true}}`,
+		`corrupt-snapshot`, live,
 	)
 
-	if err := vault.Restore(fileSet, "bob"); err != nil {
-		t.Fatalf("Restore: %v", err)
+	if err := vault.Restore(fileSet, "bob"); err == nil {
+		t.Fatal("expected malformed snapshot settings to stop activation")
 	}
-
-	raw, err := os.ReadFile(livePath)
-	if err != nil {
-		t.Fatal(err)
+	if raw, err := os.ReadFile(livePath); err != nil || string(raw) != live {
+		t.Fatalf("live settings changed on failure: %q, %v", raw, err)
 	}
-	if string(raw) != `corrupt-snapshot` {
-		t.Errorf("unparseable snapshot should restore verbatim, got %q", raw)
+	if _, err := os.Stat(fileSet.Files[0].Path); !os.IsNotExist(err) {
+		t.Fatalf("credentials were touched before settings validation: %v", err)
 	}
 }
 
 func TestIsClaudeUserSettings(t *testing.T) {
-	if !isClaudeUserSettings("claude", "/home/u/.claude/settings.json") {
-		t.Error("expected ~/.claude/settings.json to match")
+	for _, path := range []string{
+		"/home/u/.claude/settings.json",
+		"/home/u/other-dir/settings.json",
+	} {
+		if !isClaudeUserSettings("claude", path) {
+			t.Errorf("expected Claude settings at %q to match", path)
+		}
 	}
 	for _, tc := range []struct{ tool, path string }{
-		{"gemini", "/home/u/.gemini/settings.json"},   // other tool
-		{"cursor", "/home/u/.cursor/settings.json"},   // other tool
-		{"claude", "/home/u/.claude/.claude.json"},    // other file
-		{"claude", "/home/u/other-dir/settings.json"}, // wrong parent dir
+		{"gemini", "/home/u/.gemini/settings.json"}, // other tool
+		{"cursor", "/home/u/.cursor/settings.json"}, // other tool
+		{"gemini", "/home/u/other-dir/settings.json"},
+		{"claude", "/home/u/.claude/.claude.json"}, // other file
 	} {
 		if isClaudeUserSettings(tc.tool, tc.path) {
 			t.Errorf("isClaudeUserSettings(%q, %q) unexpectedly true", tc.tool, tc.path)

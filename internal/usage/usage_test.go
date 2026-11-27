@@ -2,14 +2,18 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
 )
 
 func TestUsageInfo_AvailabilityScore(t *testing.T) {
@@ -29,9 +33,9 @@ func TestUsageInfo_AvailabilityScore(t *testing.T) {
 			expected: 0,
 		},
 		{
-			name:     "empty info returns 100",
+			name:     "empty info has no measured capacity",
 			info:     &UsageInfo{},
-			expected: 100,
+			expected: 0,
 		},
 		{
 			name: "primary 50% used",
@@ -45,33 +49,7 @@ func TestUsageInfo_AvailabilityScore(t *testing.T) {
 			info: &UsageInfo{
 				PrimaryWindow: &UsageWindow{Utilization: 1.0},
 			},
-			expected: 0, // a spent window runs nothing until it resets
-		},
-		{
-			// 2026-10-12: an idle account whose weekly window was spent scored 75
-			// and beat one at 19% and 96% with room left (66), so caam limits
-			// --best named an account that could run nothing.
-			name: "weekly window spent, primary idle",
-			info: &UsageInfo{
-				PrimaryWindow:   &UsageWindow{Utilization: 0},
-				SecondaryWindow: &UsageWindow{Utilization: 1.0, ResetsAt: time.Now().Add(10 * time.Hour)},
-			},
-			expected: 0,
-		},
-		{
-			name: "weekly window at 100% whose reset has passed",
-			info: &UsageInfo{
-				SecondaryWindow: &UsageWindow{Utilization: 1.0, ResetsAt: time.Now().Add(-time.Minute)},
-			},
-			expected: 75,
-		},
-		{
-			name: "spent window with credits left",
-			info: &UsageInfo{
-				PrimaryWindow: &UsageWindow{Utilization: 1.0},
-				Credits:       &CreditInfo{HasCredits: true},
-			},
-			expected: 50,
+			expected: 50, // 100 - 50*1.0 = 50
 		},
 		{
 			name: "all windows at 50%",
@@ -102,7 +80,8 @@ func TestUsageInfo_AvailabilityScore(t *testing.T) {
 		{
 			name: "unlimited credits don't penalize",
 			info: &UsageInfo{
-				Credits: &CreditInfo{HasCredits: false, Unlimited: true},
+				PrimaryWindow: &UsageWindow{},
+				Credits:       &CreditInfo{HasCredits: false, Unlimited: true},
 			},
 			expected: 100,
 		},
@@ -339,20 +318,79 @@ func TestMultiProfileFetcher_NilFetcherDoesNotPanic(t *testing.T) {
 	})
 }
 
+type countingLogScanner struct {
+	mu    sync.Mutex
+	scans int
+}
+
+func (s *countingLogScanner) Scan(ctx context.Context, logDir string, since time.Time) (*logs.ScanResult, error) {
+	s.mu.Lock()
+	s.scans++
+	s.mu.Unlock()
+	now := time.Now()
+	return &logs.ScanResult{Provider: "claude", Since: since, Until: now, Entries: []*logs.LogEntry{
+		{Timestamp: now.Add(-3 * time.Hour), Model: "m", InputTokens: 600, OutputTokens: 400, TotalTokens: 1000},
+		{Timestamp: now.Add(-2 * time.Hour), Model: "m", InputTokens: 600, OutputTokens: 400, TotalTokens: 1000},
+		{Timestamp: now.Add(-time.Hour), Model: "m", InputTokens: 600, OutputTokens: 400, TotalTokens: 1000},
+	}}, nil
+}
+
+func (s *countingLogScanner) LogDir() string { return "" }
+
+// Local session logs carry no account identity, so they are read once per
+// call and shared by every profile instead of once per profile.
+func TestMultiProfileFetcherScansLogsOncePerCall(t *testing.T) {
+	scanner := &countingLogScanner{}
+	multi := logs.NewMultiScanner()
+	multi.Register("claude", scanner)
+	m := &MultiProfileFetcher{logScanner: multi}
+	results := m.FetchAllProfiles(context.Background(), "claude", map[string]string{"a": "t", "b": "t", "c": "t", "d": "t"})
+	if len(results) != 4 {
+		t.Fatalf("results = %d, want 4", len(results))
+	}
+	for _, r := range results {
+		if r.Usage == nil || r.Usage.BurnRate == nil {
+			t.Fatalf("%s has no burn rate: %+v", r.ProfileName, r.Usage)
+		}
+	}
+	if scanner.scans != 1 {
+		t.Fatalf("logs scanned %d times for 4 profiles, want once", scanner.scans)
+	}
+	if rows := (&MultiProfileFetcher{logScanner: multi}).FetchAllProfiles(context.Background(), "codex", map[string]string{"x": "t"}); rows[0].Usage.BurnRate != nil {
+		t.Fatal("a provider without a scanner got another provider's burn rate")
+	}
+}
+
 func TestCodexFetcher_Fetch_BalanceParsing(t *testing.T) {
 	tests := []struct {
 		name     string
 		balance  string
 		expected float64
+		absent   bool
+		invalid  bool
 	}{
 		{name: "numeric balance", balance: "12.34", expected: 12.34},
 		{name: "string balance", balance: `"45.67"`, expected: 45.67},
 		{name: "comma balance", balance: `"1,234.50"`, expected: 1234.50},
+		{name: "zero balance", balance: "0", expected: 0},
+		{name: "finite negative balance", balance: "-12.34", expected: -12.34},
+		{name: "null balance", balance: "null", absent: true},
+		{name: "empty string balance", balance: `""`, absent: true},
+		{name: "blank string balance", balance: `"   "`, absent: true},
+		{name: "NaN balance", balance: `"NaN"`, invalid: true},
+		{name: "positive infinite balance", balance: `"+Inf"`, invalid: true},
+		{name: "negative infinite balance", balance: `"-Inf"`, invalid: true},
+		{name: "infinity balance", balance: `"Infinity"`, invalid: true},
+		{name: "negative infinity balance", balance: `"-Infinity"`, invalid: true},
+		{name: "numeric overflow", balance: "1e999", invalid: true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			payload := fmt.Sprintf(`{"plan_type":"pro","rate_limit":{},"credits":{"has_credits":true,"unlimited":false,"balance":%s}}`, tc.balance)
+			// A response without a measured general window is degraded and
+			// returns an error (see the quota-response tests), so carry one
+			// here to test balance parsing on a successful fetch.
+			payload := fmt.Sprintf(`{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":10,"reset_at":1900000000,"limit_window_seconds":18000}},"credits":{"has_credits":true,"unlimited":false,"balance":%s}}`, tc.balance)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path != CodexUsagePath {
 					t.Fatalf("unexpected path: %s", r.URL.Path)
@@ -366,16 +404,46 @@ func TestCodexFetcher_Fetch_BalanceParsing(t *testing.T) {
 			fetcher.baseURL = server.URL
 
 			info, err := fetcher.Fetch(context.Background(), "token")
+			if tc.invalid {
+				if err == nil || info == nil || info.Error == "" || info.QuotaStatus != QuotaUnavailable || info.NumericQuotaKnown() {
+					t.Fatalf("invalid balance accepted as usable quota: info=%+v err=%v", info, err)
+				}
+				if data, marshalErr := json.Marshal(info); marshalErr != nil || !json.Valid(data) {
+					t.Fatalf("invalid balance escaped into usage JSON: %q, %v", data, marshalErr)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("Fetch() error = %v", err)
 			}
-			if info.Credits == nil || info.Credits.Balance == nil {
+			if info.Credits == nil || !info.NumericQuotaKnown() {
+				t.Fatalf("valid balance lost credit metadata or measured quota: %+v", info)
+			}
+			if tc.absent {
+				if info.Credits.Balance != nil {
+					t.Fatalf("absent balance manufactured a number: %v", *info.Credits.Balance)
+				}
+				return
+			}
+			if info.Credits.Balance == nil {
 				t.Fatalf("expected credits balance, got nil")
 			}
 			if got := *info.Credits.Balance; got != tc.expected {
 				t.Fatalf("balance = %v, expected %v", got, tc.expected)
 			}
 		})
+	}
+}
+
+func TestCodexBalanceNonFiniteErrorsDoNotRepeatInput(t *testing.T) {
+	for _, raw := range []string{`"NaN"`, `"+Inf"`, `"-Infinity"`} {
+		var balance codexBalance
+		if err := json.Unmarshal([]byte(raw), &balance); err == nil || err.Error() != "credit balance must be finite" {
+			t.Errorf("non-finite balance error must be bounded and omit provider input: %v", err)
+		}
+		if balance.Value != nil {
+			t.Error("non-finite balance retained a numeric value")
+		}
 	}
 }
 
@@ -517,6 +585,43 @@ func TestUsageInfo_MostConstrainedWindow(t *testing.T) {
 				t.Errorf("MostConstrainedWindow().Utilization = %v, expected %v", util, tc.expected)
 			}
 		})
+	}
+}
+
+func TestUsageInfoMostConstrainedWindowForModel(t *testing.T) {
+	weekly := &UsageWindow{UsedPercent: 20, WindowDuration: 7 * 24 * time.Hour}
+	fable := &UsageWindow{Label: "Fable", UsedPercent: 100} // Unknown duration still constrains usage.
+	sonnetSession := &UsageWindow{Label: "Sonnet", Utilization: 0.4, UsedPercent: 10}
+	sonnetWeekly := &UsageWindow{Label: "Sonnet", Utilization: 0.1, UsedPercent: 75}
+	info := &UsageInfo{
+		SecondaryWindow: weekly,
+		ModelWindows:    map[string]*UsageWindow{"fable": fable, "sonnet": sonnetSession},
+		ScopedWindows:   []*UsageWindow{sonnetSession, sonnetWeekly},
+	}
+	for _, tc := range []struct {
+		model string
+		want  *UsageWindow
+	}{
+		{"", fable},
+		{"fable", fable},
+		{"sonnet", sonnetWeekly},
+		{"opus", weekly},
+	} {
+		if got := info.MostConstrainedWindowForModel(tc.model); got != tc.want {
+			t.Errorf("model %q lost a general or overlapping restriction: got %+v, want %+v", tc.model, got, tc.want)
+		}
+	}
+
+	weekly.UsedPercent = 90
+	if got := info.MostConstrainedWindowForModel("sonnet"); got != weekly {
+		t.Errorf("scoped selection hid the general weekly quota: %+v", got)
+	}
+	if got := (&UsageInfo{SecondaryWindow: weekly}).MostConstrainedWindowForModel("sonnet"); got != weekly {
+		t.Errorf("weekly-only account lost its only general measurement: %+v", got)
+	}
+	var missing *UsageInfo
+	if missing.MostConstrainedWindowForModel("sonnet") != nil {
+		t.Error("missing quota manufactured a window")
 	}
 }
 
@@ -691,10 +796,137 @@ func TestUsageInfo_WindowForModel(t *testing.T) {
 	}
 }
 
+func TestUsageInfoScopedWindowsPreserveModelResetHorizons(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	short := &UsageWindow{
+		Label: "Reasoning model", ModelID: "claude-fable-5", Kind: LimitKindSession,
+		UsedPercent: 10, Utilization: 0.1, WindowDuration: 5 * time.Hour, ResetsAt: now.Add(2 * time.Hour),
+	}
+	long := &UsageWindow{
+		Label: "Fable", Kind: LimitKindWeeklyScoped, UsedPercent: 80, Utilization: 0.8,
+		WindowDuration: 7 * 24 * time.Hour, ResetsAt: now.Add(120 * time.Hour),
+	}
+	opus := &UsageWindow{Label: "Opus", UsedPercent: 30, ResetsAt: now.Add(5 * time.Minute)}
+	for _, windows := range [][]*UsageWindow{{short, long}, {long, short}} {
+		info := &UsageInfo{
+			Provider: "claude", SecondaryWindow: &UsageWindow{UsedPercent: 20, ResetsAt: now.Add(24 * time.Hour)},
+			TertiaryWindow: opus, ModelWindows: map[string]*UsageWindow{"Fable": long}, ScopedWindows: windows,
+		}
+		before, err := json.Marshal(info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, model := range []string{"fable", "claude-fable-5", "CLAUDE-FABLE-5-20261103"} {
+			if got := info.EarliestResetForModel(model); !got.Equal(short.ResetsAt) {
+				t.Fatalf("%s lost the less-used model session reset: %s", model, got)
+			}
+			if got := info.ScopedLimit(model); got != long || info.WindowForModel(model) != long {
+				t.Fatalf("%s did not retain the binding weekly quota: %+v", model, got)
+			}
+			if got := GoverningWindow(info, model); got != long {
+				t.Fatalf("%s did not retain the longest allowance: %+v", model, got)
+			}
+		}
+		if got := info.EarliestResetForModel("sonnet"); !got.Equal(info.SecondaryWindow.ResetsAt) {
+			t.Fatalf("Sonnet borrowed another model's reset: %s", got)
+		}
+		if info.ScopedLimit("sonnet") != nil || info.WindowForModel("sonnet") != nil {
+			t.Fatal("Sonnet inherited an unrelated tertiary or scoped restriction")
+		}
+		if !info.EarliestReset().Equal(opus.ResetsAt) || !info.EarliestResetForModel("").Equal(opus.ResetsAt) {
+			t.Fatal("unknown-model work omitted a reported restriction")
+		}
+		after, err := json.Marshal(info)
+		if err != nil || string(before) != string(after) {
+			t.Fatal("quota inspection mutated the provider's window order or measurements")
+		}
+		var restored UsageInfo
+		if err := json.Unmarshal(before, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if len(restored.ScopedWindows) != 2 || restored.ModelWindows["Fable"].UsedPercent != 80 ||
+			!restored.EarliestResetForModel("fable").Equal(short.ResetsAt) {
+			t.Fatalf("normalized JSON lost the complete windows or existing projection: %+v", restored)
+		}
+	}
+	if !(*UsageInfo)(nil).EarliestResetForModel("fable").IsZero() {
+		t.Fatal("nil usage invented a model reset")
+	}
+}
+
+func TestScopedWindowProjectionIsStableAndPreservesExhaustion(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name        string
+		want, other *UsageWindow
+	}{
+		{
+			name:  "integer exhaustion beats a larger fractional field",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 100, Utilization: 0.2},
+			other: &UsageWindow{Label: "Fable", UsedPercent: 95, Utilization: 0.95},
+		},
+		{
+			name:  "fractional precision remains binding",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 50, Utilization: 0.509},
+			other: &UsageWindow{Label: "Fable", UsedPercent: 50, Utilization: 0.505},
+		},
+		{
+			name:  "equal usage prefers a known longer allowance",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 80, WindowDuration: 7 * 24 * time.Hour},
+			other: &UsageWindow{Label: "Fable", UsedPercent: 80, WindowDuration: 5 * time.Hour},
+		},
+		{
+			name:  "equal duration prefers later reset",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 80, ResetsAt: now.Add(48 * time.Hour)},
+			other: &UsageWindow{Label: "Fable", UsedPercent: 80, ResetsAt: now.Add(24 * time.Hour)},
+		},
+		{
+			name:  "equal usage and horizons order by provider kind",
+			want:  &UsageWindow{Label: "Fable", Kind: "a-scoped", UsedPercent: 80},
+			other: &UsageWindow{Label: "Fable", Kind: "z-scoped", UsedPercent: 80},
+		},
+		{
+			name:  "equal kinds order by provider model identifier",
+			want:  &UsageWindow{Label: "Fable", ModelID: "model-a", UsedPercent: 80},
+			other: &UsageWindow{Label: "Fable", ModelID: "model-z", UsedPercent: 80},
+		},
+		{
+			name:  "equal identifiers order by display label",
+			want:  &UsageWindow{Label: "Fable A", ModelID: "claude-fable-5", UsedPercent: 80},
+			other: &UsageWindow{Label: "Fable Z", ModelID: "claude-fable-5", UsedPercent: 80},
+		},
+		{
+			name:  "display-only scope cannot suppress a measurement",
+			want:  &UsageWindow{Label: "Fable", UsedPercent: 20},
+			other: &UsageWindow{Label: "Fable", Utilization: 1, Unmeasured: true},
+		},
+		{
+			name:  "rolled scope cannot suppress a measured zero",
+			want:  &UsageWindow{Label: "Fable"},
+			other: &UsageWindow{Label: "Fable", Rolled: true, WindowDuration: 7 * 24 * time.Hour},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, windows := range [][]*UsageWindow{{tc.want, tc.other}, {tc.other, tc.want}} {
+				info := &UsageInfo{PrimaryWindow: &UsageWindow{}, ScopedWindows: windows}
+				if got := info.ScopedLimit("fable"); got != tc.want || info.WindowForModel("fable") != tc.want {
+					t.Fatalf("scope projection depended on input order: got=%+v want=%+v", got, tc.want)
+				}
+				if tc.want.UsedPercent == 100 {
+					if !info.IsNearLimitForModel(1, "fable") || info.MostConstrainedWindow() != tc.want || info.AvailabilityScoreForModel("fable") != 85 {
+						t.Fatal("the stronger integer measurement disappeared from quota consumers")
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestCreditInfo(t *testing.T) {
 	t.Run("has credits", func(t *testing.T) {
 		info := &UsageInfo{
-			Credits: &CreditInfo{HasCredits: true},
+			PrimaryWindow: &UsageWindow{},
+			Credits:       &CreditInfo{HasCredits: true},
 		}
 		// Should not penalize score
 		score := info.AvailabilityScore()
@@ -705,7 +937,8 @@ func TestCreditInfo(t *testing.T) {
 
 	t.Run("no credits penalizes", func(t *testing.T) {
 		info := &UsageInfo{
-			Credits: &CreditInfo{HasCredits: false, Unlimited: false},
+			PrimaryWindow: &UsageWindow{},
+			Credits:       &CreditInfo{HasCredits: false, Unlimited: false},
 		}
 		score := info.AvailabilityScore()
 		if score != 90 {

@@ -175,8 +175,8 @@ func refreshTool(ctx context.Context, tool string, threshold time.Duration, dryR
 			fmt.Printf("  Refreshing %-18s... ", tool+"/"+profile)
 		}
 
-		if err := refresh.RefreshProfile(ctx, tool, profile, vault, healthStore); err != nil {
-			if errors.Is(err, refresh.ErrUnsupported) {
+		if err := refresh.RefreshProfile(ctx, tool, profile, vault, healthStore, refresh.WithProfileStore(profileStore)); err != nil && !refresh.IsDeliveryIncomplete(err) {
+			if refresh.IsSkipped(err) {
 				skipped++
 				if !quiet {
 					fmt.Printf("skipped (%v)\n", err)
@@ -188,10 +188,9 @@ func refreshTool(ctx context.Context, tool string, threshold time.Duration, dryR
 				fmt.Printf("failed (%v)\n", err)
 			}
 			continue
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: %v\n", err)
 		}
-
-		// Sync refreshed auth to isolated profile to prevent token drift.
-		syncVaultToIsolated(tool, profile)
 
 		refreshed++
 		if !quiet {
@@ -239,8 +238,8 @@ func refreshSingle(ctx context.Context, tool, profile string, threshold time.Dur
 		fmt.Printf("Refreshing %s... ", key)
 	}
 
-	if err := refresh.RefreshProfile(ctx, tool, profile, vault, healthStore); err != nil {
-		if errors.Is(err, refresh.ErrUnsupported) {
+	if err := refresh.RefreshProfile(ctx, tool, profile, vault, healthStore, refresh.WithProfileStore(profileStore)); err != nil && !refresh.IsDeliveryIncomplete(err) {
+		if refresh.IsSkipped(err) {
 			if !quiet {
 				fmt.Printf("skipped (%v)\n", err)
 			}
@@ -250,10 +249,9 @@ func refreshSingle(ctx context.Context, tool, profile string, threshold time.Dur
 			fmt.Printf("failed (%v)\n", err)
 		}
 		return err
+	} else if err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: %v\n", err)
 	}
-
-	// Sync refreshed auth to isolated profile to prevent token drift.
-	syncVaultToIsolated(tool, profile)
 
 	if !quiet {
 		ttl := refreshedTTL(tool, profile)
@@ -274,6 +272,13 @@ func shouldRefreshProfile(tool, profile string, threshold time.Duration, force b
 
 	// Ensure profile exists.
 	if err := ensureVaultProfileDir(tool, profile); err != nil {
+		return false, "", err
+	}
+
+	if err := refresh.Preflight(tool, profile, vault); err != nil {
+		if refresh.IsSkipped(err) {
+			return false, err.Error(), nil
+		}
 		return false, "", err
 	}
 
@@ -322,8 +327,10 @@ func loadExpiryInfo(tool, profile string) (*health.ExpiryInfo, error) {
 		// Migrate legacy vault filename before reading.
 		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		return health.ParseGeminiExpiry(vaultPath)
-	case "opencode", "cursor", "grok":
-		// No token expiry parsing for opencode/cursor/grok yet
+	case "cursor":
+		return health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
+	case "opencode", "grok":
+		// No caam refresh support for opencode/grok yet.
 		return nil, nil
 	default:
 		return nil, fmt.Errorf("refresh not supported for tool: %s", tool)
@@ -331,7 +338,8 @@ func loadExpiryInfo(tool, profile string) (*health.ExpiryInfo, error) {
 }
 
 func refreshedTTL(tool, profile string) string {
-	// Gemini refresh updates health metadata, not files.
+	// Gemini refresh updates its selected credential file and health metadata.
+	// Report the current credential's expiry from the hydrated snapshot.
 	if tool == "gemini" && healthStore != nil {
 		h, err := healthStore.GetProfile(tool, profile)
 		if err == nil && h != nil && !h.TokenExpiresAt.IsZero() {
@@ -360,22 +368,4 @@ func ensureVaultProfileDir(tool, profile string) error {
 		return fmt.Errorf("profile path is not a directory: %s", path)
 	}
 	return nil
-}
-
-// syncVaultToIsolated propagates refreshed vault auth files to the corresponding
-// isolated profile directory. This prevents token drift where the vault gets a
-// new refresh token but the isolated profile retains the old (now-consumed) one,
-// causing refresh_token_reused errors.
-func syncVaultToIsolated(tool, profile string) {
-	if profileStore == nil {
-		return
-	}
-	prof, err := profileStore.Load(tool, profile)
-	if err != nil {
-		return // No isolated profile for this vault profile; that's fine
-	}
-	// Best-effort sync: log but don't fail the refresh operation.
-	if err := refresh.SyncVaultToIsolatedProfile(tool, profile, vault, prof.BasePath); err != nil {
-		fmt.Fprintf(os.Stderr, "  warning: failed to sync refreshed token to isolated profile: %v\n", err)
-	}
 }

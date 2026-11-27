@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -76,7 +77,10 @@ func runNext(cmd *cobra.Command, args []string) error {
 	}
 
 	fileSet := getFileSet()
-	currentProfile, _ := vault.ActiveProfile(fileSet)
+	currentProfile, err := vault.CurrentProfile(fileSet)
+	if err != nil {
+		return fmt.Errorf("read current auth: %w", err)
+	}
 
 	// List available profiles
 	profiles, err := vault.List(tool)
@@ -88,40 +92,17 @@ func runNext(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
 	}
 
-	if len(profiles) == 1 {
-		if currentProfile == profiles[0] {
-			fmt.Printf("Only one profile available for %s (%s), already active\n", tool, profiles[0])
-			return nil
+	// System snapshots are recovery material, never rotation candidates. Filter
+	// before counting or fetching quota so a backup cannot create a shortcut.
+	var userProfiles []string
+	for _, name := range profiles {
+		if !authfile.IsSystemProfile(name) {
+			userProfiles = append(userProfiles, name)
 		}
-		// Single profile case: just activate it
-		if !dryRun {
-			// Re-snapshot outgoing profile's rotated tokens first (see activate.go).
-			if currentProfile != "" && currentProfile != profiles[0] {
-				if err := vault.ResnapshotOutgoing(fileSet, currentProfile, profiles[0]); err != nil && !quiet {
-					fmt.Printf("Warning: could not re-snapshot outgoing profile %s: %v\n", currentProfile, err)
-				}
-			}
-			if err := vault.Restore(fileSet, profiles[0]); err != nil {
-				return fmt.Errorf("activate failed: %w", err)
-			}
-		}
-		if !quiet {
-			if dryRun {
-				fmt.Printf("Would switch to: %s/%s\n", tool, profiles[0])
-			} else {
-				fmt.Printf("Activated %s profile '%s'\n", tool, profiles[0])
-			}
-		}
-		// Codex daemon check (see issue #21): a running codex app-server caches
-		// auth in-process, so the on-disk swap won't apply to it. Skip on
-		// dry-run (nothing was actually switched).
-		if !dryRun {
-			daemonWarn := checkCodexDaemon(tool, reloadDaemon)
-			if !quiet {
-				printCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
-			}
-		}
-		return nil
+	}
+	profiles = userProfiles
+	if len(profiles) == 0 {
+		return fmt.Errorf("no user profiles available for %s (only system profiles found)", tool)
 	}
 
 	// Load config for rotation algorithm
@@ -151,20 +132,19 @@ func runNext(cmd *cobra.Command, args []string) error {
 
 	// Fetch usage data if --usage-aware is set
 	var usageData map[string]*rotation.UsageInfo
-	if usageAware && (tool == "claude" || tool == "codex") {
+	if usageAware && isLimitsProvider(tool) {
 		if !quiet {
 			fmt.Printf("Fetching real-time usage data for %d profiles...\n", len(profiles))
 		}
 		usageData = fetchUsageDataForProfiles(tool, profiles)
 	} else if usageAware {
-		// Loud fallback (issue #79): real-time limit fetching is implemented for
-		// claude and codex only. Say so — on stderr, even in quiet mode — instead
-		// of silently ignoring the flag the user asked for.
-		fmt.Fprintf(os.Stderr, "caam: --usage-aware is not supported for %q (real-time limits are implemented for claude and codex only); selecting without usage data\n", tool)
+		// Loud fallback (issue #79): say so — on stderr, even in quiet mode —
+		// instead of silently ignoring the flag the user asked for.
+		fmt.Fprintf(os.Stderr, "caam: --usage-aware is not supported for %q (real-time limits are implemented for %s); selecting without usage data\n", tool, strings.Join(limitsProviders, ", "))
 	}
 
 	// Select next profile using rotation
-	selection, err := selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData)
+	selection, err := selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData, force)
 	if err != nil {
 		return err
 	}
@@ -177,7 +157,7 @@ func runNext(cmd *cobra.Command, args []string) error {
 	if selection.Selected == currentProfile && len(profiles) > 1 &&
 		spmCfg.Stealth.Rotation.Policy != "drain" {
 		spmCfg.Stealth.Rotation.Algorithm = "round_robin"
-		selection, err = selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData)
+		selection, err = selectProfileWithRotationAndUsage(tool, profiles, currentProfile, spmCfg, db, usageData, force)
 		if err != nil {
 			return err
 		}
@@ -215,17 +195,26 @@ func runNext(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Re-snapshot outgoing profile's rotated tokens before clobbering the live
-	// file (refresh-token rotation safety; see activate.go / ResnapshotOutgoing).
-	if currentProfile != "" && currentProfile != selection.Selected {
-		if err := vault.ResnapshotOutgoing(fileSet, currentProfile, selection.Selected); err != nil && !quiet {
-			fmt.Printf("Warning: could not re-snapshot outgoing profile %s: %v\n", currentProfile, err)
+	// Preserve the live grant before switching, including unnamed credentials
+	// and tokens rotated since the outgoing profile's last snapshot.
+	switched, err := vault.Switch(fileSet, selection.Selected, authfile.SwitchOptions{
+		BackupMode:     spmCfg.Safety.AutoBackupBeforeSwitch,
+		MaxAutoBackups: spmCfg.Safety.MaxAutoBackups,
+	})
+	if err != nil {
+		return fmt.Errorf("activate failed: %w", err)
+	}
+	currentProfile = switched.PreviousProfile
+	if !quiet {
+		for _, warning := range switched.Warnings {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %s\n", warning)
 		}
 	}
-
-	// Activate selected profile
-	if err := vault.Restore(fileSet, selection.Selected); err != nil {
-		return fmt.Errorf("activate failed: %w", err)
+	if switched.KeptLive {
+		if !quiet {
+			fmt.Printf("Profile %s/%s is already active; kept live credentials\n", tool, selection.Selected)
+		}
+		return nil
 	}
 
 	// Log event. logProfileSwitch also emits a duration-bearing deactivate event
@@ -266,16 +255,35 @@ func pluralize(n int) string {
 // fetchUsageDataForProfiles fetches real-time usage data for all profiles.
 func fetchUsageDataForProfiles(tool string, profiles []string) map[string]*rotation.UsageInfo {
 	vaultDir := authfile.DefaultVaultPath()
-	credentials, err := usage.LoadProfileCredentials(vaultDir, tool)
+	if vault != nil {
+		vaultDir = vault.BasePath()
+	}
+	var credentials map[string]string
+	var err error
+	if tool == "grok" || tool == "cursor" {
+		credentials = nativeRotationCredentials(tool, profiles)
+	} else {
+		credentials, err = usage.LoadProfileCredentials(vaultDir, tool)
+	}
 	if err != nil || len(credentials) == 0 {
-		return nil
+		// Non-nil means usage was requested but no account was measured.
+		// A nil map would silently opt out of quota eligibility checks.
+		return map[string]*rotation.UsageInfo{}
+	}
+	// Query only the candidates in the vault that will actually be activated.
+	// Other profiles (including recovery snapshots) cannot supply their quota.
+	selectedCredentials := make(map[string]string, len(profiles))
+	for _, name := range profiles {
+		if token := credentials[name]; token != "" && !authfile.IsSystemProfile(name) {
+			selectedCredentials[name] = token
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	fetcher := usage.NewMultiProfileFetcher()
-	results := fetcher.FetchAllProfiles(ctx, tool, credentials)
+	results := fetcher.FetchAllProfiles(ctx, tool, selectedCredentials)
 
 	usageData := make(map[string]*rotation.UsageInfo)
 	for _, r := range results {
@@ -291,12 +299,31 @@ func fetchUsageDataForProfiles(tool string, profiles []string) map[string]*rotat
 	return usageData
 }
 
+// Native quota reads must use the same vault and candidate set that will be
+// activated, not an identically named profile in the default vault.
+func nativeRotationCredentials(tool string, profiles []string) map[string]string {
+	v := vault
+	if v == nil {
+		v = authfile.NewVault(authfile.DefaultVaultPath())
+	}
+	credentials := make(map[string]string)
+	for _, name := range profiles {
+		if authfile.IsSystemProfile(name) {
+			continue
+		}
+		path := filepath.Join(v.ProfilePath(tool, name), "auth.json")
+		if locator, err := usage.NativeCredentialLocator(tool, path); err == nil {
+			credentials[name] = locator
+		}
+	}
+	return credentials
+}
+
 // selectProfileWithRotationAndUsage selects a profile using rotation with optional usage data.
-func selectProfileWithRotationAndUsage(tool string, profiles []string, currentProfile string, spmCfg *config.SPMConfig, db *caamdb.DB, usageData map[string]*rotation.UsageInfo) (*rotation.Result, error) {
+func selectProfileWithRotationAndUsage(tool string, profiles []string, currentProfile string, spmCfg *config.SPMConfig, db *caamdb.DB, usageData map[string]*rotation.UsageInfo, ignoreCooldown bool) (*rotation.Result, error) {
 	if len(profiles) == 0 {
 		return nil, fmt.Errorf("no profiles found for %s; create one with 'caam backup %s <name>'", tool, tool)
 	}
-
 	primePlanTypes(tool, profiles)
 
 	algorithm := rotation.AlgorithmSmart
@@ -307,12 +334,14 @@ func selectProfileWithRotationAndUsage(tool string, profiles []string, currentPr
 	}
 
 	selector := rotation.NewSelector(algorithm, healthStore, db)
+	bindRotationVault(selector)
+	selector.SetIgnoreCooldown(ignoreCooldown)
 	applyRotationPolicy(selector, spmCfg, "")
 
-	// Set usage data if available
-	if usageData != nil {
-		selector.SetUsageData(usageData)
-	}
+	// The selector enforces quota eligibility before every algorithm, including
+	// sole candidates and runNext's forced round-robin retry. Nil explicitly
+	// means this invocation did not request quota data.
+	selector.SetUsageData(usageData)
 
 	result, err := selector.Select(tool, profiles, currentProfile)
 	if err != nil {

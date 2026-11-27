@@ -1,0 +1,852 @@
+package usage
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// GrokFetcher reads Grok Build billing through the authenticated native ACP
+// process (`grok agent stdio`, method `_x.ai/billing`). It does not send a
+// prompt and does not call a model.
+type GrokFetcher struct {
+	// Bin overrides the grok executable. Empty looks it up on PATH.
+	Bin string
+}
+
+// NewGrokFetcher creates a fetcher that uses the grok binary on PATH.
+func NewGrokFetcher() *GrokFetcher {
+	return &GrokFetcher{}
+}
+
+// Fetch loads billing for the profile whose GROK_HOME is grokHome (the
+// directory that contains auth.json, or that file's path). The home may be
+// prefixed with "grok-home:" so callers can tell a path from an access token.
+func (f *GrokFetcher) Fetch(ctx context.Context, grokHome string) (*UsageInfo, error) {
+	info := &UsageInfo{
+		Provider:    "grok",
+		FetchedAt:   time.Now(),
+		Source:      SourceAPI,
+		QuotaStatus: QuotaUnavailable,
+	}
+	if f == nil {
+		f = NewGrokFetcher()
+	}
+	authPath, auth, live, err := readNativeLiveCredential("grok", grokHome)
+	if err != nil {
+		info.Error = err.Error()
+		info.QuotaNote = info.Error
+		return info, nil
+	}
+	if !live {
+		home := strings.TrimPrefix(strings.TrimSpace(grokHome), "grok-home:")
+		if home == "" || strings.ContainsAny(home, "\r\n") {
+			info.Error = "no grok profile home"
+			info.QuotaNote = info.Error
+			return info, nil
+		}
+		if st, err := os.Stat(home); err == nil && !st.IsDir() {
+			home = filepath.Dir(home)
+		}
+		authPath = filepath.Join(home, "auth.json")
+		auth, err = os.ReadFile(authPath)
+		if err != nil {
+			info.Error = "grok auth.json not found for this profile"
+			info.QuotaNote = info.Error
+			return info, nil
+		}
+	}
+
+	raw, err := f.queryBilling(ctx, auth)
+	if err != nil {
+		info.Error = err.Error()
+		info.QuotaNote = info.Error
+		return info, nil
+	}
+	parsed := parseGrokBilling(raw, info.FetchedAt)
+	if id, err := nativeCredentialIdentity("grok", auth); err == nil && live {
+		parsed.AccountID = id.AccountID
+		if parsed.AccountID == "" {
+			parsed.AccountID = id.Email
+		}
+	} else if email := grokAccountEmail(authPath); email != "" {
+		parsed.AccountID = email
+	}
+	return parsed, nil
+}
+
+// queryBilling copies the profile's auth into a private GROK_HOME and asks
+// the CLI for `_x.ai/billing`. The copy is removed before returning. Nothing
+// from the credential file is written to the error text.
+func (f *GrokFetcher) queryBilling(ctx context.Context, auth []byte) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// This access-only copy cannot renew itself. Starting Grok with a stale
+	// cache can initiate browser login before the ACP handshake (issue #124).
+	if err := validateGrokBillingAuth(auth, time.Now()); err != nil {
+		return nil, err
+	}
+	stage, err := stageGrokHome(auth)
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(stage)
+	if err := prepareGrokBillingBrowserGuard(stage); err != nil {
+		return nil, err
+	}
+
+	bin := f.Bin
+	if bin == "" {
+		p, lookErr := exec.LookPath("grok")
+		if lookErr != nil {
+			return nil, fmt.Errorf("grok is not installed")
+		}
+		bin = p
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	sock := filepath.Join(stage, "leader.sock")
+	cmd := exec.CommandContext(cctx, bin, "agent", "--no-leader", "stdio", "--leader-socket", sock)
+	cmd.Env = grokChildEnv(stage)
+	cmd.Dir = stage
+	// Bound os/exec's stderr-copy goroutine too if a descendant retains it.
+	cmd.WaitDelay = 100 * time.Millisecond
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, fmt.Errorf("grok billing: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("grok billing: %w", err)
+	}
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start grok agent: %w", err)
+	}
+	// A descendant can retain the protocol pipes after CommandContext kills
+	// the direct child. Close our ends on cancellation to bound Scanner.Scan
+	// and writes as well as the process itself.
+	stopClose := context.AfterFunc(cctx, func() {
+		_ = stdout.Close()
+		_ = stdin.Close()
+	})
+	defer stopClose()
+	defer func() {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	nextID := 1
+	call := func(method string, params any) (json.RawMessage, error) {
+		want := nextID
+		nextID++
+		body, err := json.Marshal(map[string]any{
+			"jsonrpc": "2.0",
+			"id":      want,
+			"method":  method,
+			"params":  params,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := stdin.Write(append(body, '\n')); err != nil {
+			return nil, fmt.Errorf("grok billing request failed")
+		}
+		for sc.Scan() {
+			line := bytes.TrimSpace(sc.Bytes())
+			if len(line) == 0 {
+				continue
+			}
+			var msg struct {
+				ID     *int            `json:"id"`
+				Result json.RawMessage `json:"result"`
+				Error  *struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(line, &msg); err != nil || msg.ID == nil || *msg.ID != want {
+				continue
+			}
+			if msg.Error != nil {
+				if msg.Error.Code == 401 || msg.Error.Code == 403 ||
+					strings.Contains(strings.ToLower(msg.Error.Message), "unauthorized") ||
+					strings.Contains(strings.ToLower(msg.Error.Message), "token expired") {
+					return nil, fmt.Errorf("unauthorized: token expired or invalid")
+				}
+				return nil, fmt.Errorf("grok %s: %s", method, sanitizeProviderText(msg.Error.Message))
+			}
+			return msg.Result, nil
+		}
+		if err := sc.Err(); err != nil {
+			return nil, fmt.Errorf("grok billing response was not readable")
+		}
+		return nil, fmt.Errorf("grok closed before %s completed", method)
+	}
+
+	initialized, err := call("initialize", map[string]any{
+		"protocolVersion": 1,
+		"clientCapabilities": map[string]any{
+			"fs":       map[string]bool{"readTextFile": false, "writeTextFile": false},
+			"terminal": false,
+		},
+		"clientInfo": map[string]string{"name": "caam", "version": "0"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !grokBillingCachedTokenAvailable(initialized) {
+		return nil, fmt.Errorf("grok billing unavailable: compatible cached_token authentication was not advertised; interactive login was not attempted")
+	}
+	// Recheck after initialization too: a slow startup must not spend the
+	// freshness margin and then authenticate a cache the CLI wants to renew.
+	if err := validateGrokBillingAuth(auth, time.Now()); err != nil {
+		return nil, err
+	}
+	authTimer := time.AfterFunc(grokBillingAuthTimeout, cancel)
+	_, authErr := call("authenticate", map[string]any{"methodId": "cached_token"})
+	if !authTimer.Stop() || cctx.Err() != nil {
+		return nil, fmt.Errorf("grok cached-token authentication timed out or was cancelled; interactive login was not attempted")
+	}
+	if authErr != nil {
+		return nil, authErr
+	}
+	// session/new establishes the ACP session the extension is served on.
+	// It is not a model prompt; no session/prompt is sent.
+	if _, err := call("session/new", map[string]any{"cwd": stage, "mcpServers": []any{}}); err != nil {
+		return nil, err
+	}
+	return call("_x.ai/billing", map[string]any{})
+}
+
+const (
+	// Leave room for the native CLI's early-renewal window and clock skew.
+	// A quota probe must not try to replace an unusable cache with a login.
+	grokBillingExpiryMargin = 15 * time.Minute
+	grokBillingAuthTimeout  = 5 * time.Second
+)
+
+// validateGrokBillingAuth checks the exact captured bytes, not a reread of a
+// live home. Unlike health reporting, the latest expiry in a multi-entry file
+// cannot authorize a launch: ANY expired/unknown entry might be selected by
+// Grok. Require every credential entry to carry its own usable access token
+// and absolute deadline. Relative expires_in alone is not a fresh lifetime.
+func validateGrokBillingAuth(auth []byte, now time.Time) error {
+	invalid := fmt.Errorf("grok billing requires a cached access token valid for more than 15 minutes; renew Grok in the home that owns this login before retrying")
+	var root map[string]json.RawMessage
+	if json.Unmarshal(auth, &root) != nil || root == nil {
+		return invalid
+	}
+	isEntry := func(entry map[string]json.RawMessage) bool {
+		for _, key := range []string{"key", "token", "access_token", "accessToken", "refresh_token", "refreshToken", "renewal_token", "auth_mode", "expires_at", "expiresAt", "expiry", "expires_in", "expiresIn"} {
+			if _, ok := entry[key]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	check := func(entry map[string]json.RawMessage) bool {
+		access := ""
+		for _, key := range []string{"key", "access_token", "accessToken", "token"} {
+			if raw, ok := entry[key]; ok {
+				var value string
+				if json.Unmarshal(raw, &value) != nil || value == "" || strings.TrimSpace(value) != value || (access != "" && access != value) {
+					return false
+				}
+				access = value
+			}
+		}
+		known := false
+		for _, key := range []string{"expires_at", "expiresAt", "expiry"} {
+			if raw, ok := entry[key]; ok {
+				deadline := grokBillingDeadline(raw)
+				if deadline.IsZero() || !deadline.After(now.Add(grokBillingExpiryMargin)) {
+					return false
+				}
+				known = true
+			}
+		}
+		return access != "" && known
+	}
+	found := false
+	if isEntry(root) {
+		if !check(root) {
+			return invalid
+		}
+		found = true
+	}
+	for key, raw := range root {
+		var entry map[string]json.RawMessage
+		parsed := json.Unmarshal(raw, &entry) == nil && entry != nil
+		if strings.Contains(key, "::") || (parsed && isEntry(entry)) {
+			if !parsed || !check(entry) {
+				return invalid
+			}
+			found = true
+		}
+	}
+	if !found {
+		return invalid
+	}
+	return nil
+}
+
+func grokBillingDeadline(raw json.RawMessage) time.Time {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		if deadline := parseProviderTime(text); !deadline.IsZero() {
+			return deadline
+		}
+	} else {
+		text = string(raw)
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+	if err != nil || n <= 0 {
+		return time.Time{}
+	}
+	var deadline time.Time
+	if n > 1e12 {
+		deadline = time.UnixMilli(n)
+	} else {
+		deadline = time.Unix(n, 0)
+	}
+	if deadline.Year() > 9999 {
+		return time.Time{}
+	}
+	return deadline
+}
+
+// Only the advertised ACP v1 cached-token flow is suitable for a quota read.
+// A terminal/browser method is not an acceptable fallback, even with that ID.
+func grokBillingCachedTokenAvailable(data json.RawMessage) bool {
+	var result struct {
+		Version int `json:"protocolVersion"`
+		Methods []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		} `json:"authMethods"`
+	}
+	if json.Unmarshal(data, &result) != nil || result.Version != 1 {
+		return false
+	}
+	count := 0
+	for _, method := range result.Methods {
+		if method.ID == "cached_token" {
+			if method.Type != "" && method.Type != "agent" {
+				return false
+			}
+			count++
+		}
+	}
+	return count == 1
+}
+
+// Defense in depth for clients honoring BROWSER or PATH-based openers. This
+// is NOT an OS sandbox: an absolute system opener can bypass these stubs.
+func prepareGrokBillingBrowserGuard(home string) error {
+	dir := filepath.Join(home, ".caam-no-browser")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		return fmt.Errorf("prepare grok browser guard: %w", err)
+	}
+	for _, name := range []string{"browser", "open", "xdg-open", "sensible-browser", "x-www-browser", "gio", "wslview"} {
+		body := "#!/bin/sh\nexit 1\n"
+		if runtime.GOOS == "windows" {
+			name += ".cmd"
+			body = "@exit /b 1\r\n"
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0700); err != nil {
+			return fmt.Errorf("prepare grok browser guard: %w", err)
+		}
+	}
+	return nil
+}
+
+func stageGrokHome(auth []byte) (string, error) {
+	// Native clients can renew an expiring token while handling a read.
+	// Never give this temporary copy a single-use refresh token: consuming
+	// it here could invalidate the real login without updating its owner.
+	readOnlyAuth, err := grokAccessOnlyAuth(auth)
+	if err != nil {
+		return "", err
+	}
+	stage, err := os.MkdirTemp("", "caam-grok-billing-")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(stage, "auth.json"), readOnlyAuth, 0600); err != nil {
+		os.RemoveAll(stage)
+		return "", fmt.Errorf("stage grok auth: %w", err)
+	}
+	// Do not carry hooks, MCP servers, or endpoint overrides into a billing
+	// session. Only the selected credential is needed for this read.
+	return stage, nil
+}
+
+func grokAccessOnlyAuth(auth []byte) ([]byte, error) {
+	var root map[string]any
+	dec := json.NewDecoder(bytes.NewReader(auth))
+	dec.UseNumber()
+	if err := dec.Decode(&root); err != nil || root == nil {
+		return nil, fmt.Errorf("grok credential was not a valid JSON object")
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, fmt.Errorf("grok credential was not a valid JSON object")
+	}
+	stripGrokRenewalSecrets(root)
+	return json.Marshal(root)
+}
+
+func stripGrokRenewalSecrets(value any) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(key))
+			switch normalized {
+			case "refresh", "refreshtoken", "refreshtokens", "renewaltoken", "renewtoken", "clientsecret":
+				delete(value, key)
+			default:
+				stripGrokRenewalSecrets(child)
+			}
+		}
+	case []any:
+		for _, child := range value {
+			stripGrokRenewalSecrets(child)
+		}
+	}
+}
+
+func grokChildEnv(home string) []string {
+	drop := map[string]struct{}{
+		"HOME": {}, "GROK_HOME": {}, "GROK_AUTH": {}, "GROK_AUTH_PATH": {},
+		"GROK_API_KEY": {}, "GROK_DEPLOYMENT_KEY": {}, "XAI_API_KEY": {}, "XAI_API_TOKEN": {},
+		"XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "XDG_CACHE_HOME": {},
+		"XDG_STATE_HOME": {}, "XDG_CONFIG_DIRS": {}, "XDG_DATA_DIRS": {},
+		"BROWSER": {}, "PATH": {},
+	}
+	out := make([]string, 0, 32)
+	for _, kv := range os.Environ() {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if _, skip := drop[strings.ToUpper(key)]; skip {
+			continue
+		}
+		out = append(out, kv)
+	}
+	guard := filepath.Join(home, ".caam-no-browser")
+	browser := filepath.Join(guard, "browser")
+	if runtime.GOOS == "windows" {
+		browser += ".cmd"
+	}
+	path := guard
+	if inherited := os.Getenv("PATH"); inherited != "" {
+		path += string(os.PathListSeparator) + inherited
+	}
+	out = append(out, "BROWSER="+browser, "PATH="+path)
+	out = append(out, "HOME="+home, "GROK_HOME="+home,
+		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
+		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
+		"XDG_CACHE_HOME="+filepath.Join(home, ".cache"),
+		"XDG_STATE_HOME="+filepath.Join(home, ".local", "state"),
+		"XDG_CONFIG_DIRS="+filepath.Join(home, ".config"),
+		"XDG_DATA_DIRS="+filepath.Join(home, ".local", "share"))
+	return out
+}
+
+// Provider errors may echo opaque credentials with no recognizable prefix.
+// Never repeat their text; the caller still identifies the failed ACP method.
+func sanitizeProviderText(_ string) string {
+	return "billing request failed"
+}
+
+// parseGrokBilling turns an `_x.ai/billing` result into UsageInfo.
+// Proto3 may omit zero usage. Only infer it for a valid active period when
+// every usage key is absent; present but unusable values stay unknown.
+func parseGrokBilling(raw []byte, now time.Time) *UsageInfo {
+	info := &UsageInfo{
+		Provider:    "grok",
+		FetchedAt:   now,
+		Source:      SourceAPI,
+		QuotaStatus: QuotaDegraded,
+		QuotaNote:   "grok billing response did not include a usage percentage",
+	}
+	if now.IsZero() {
+		info.FetchedAt = time.Now()
+	}
+	if len(bytes.TrimSpace(raw)) == 0 || !json.Valid(raw) {
+		info.QuotaStatus = QuotaUnavailable
+		info.Error = "grok billing response was not valid JSON"
+		info.QuotaNote = info.Error
+		return info
+	}
+
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil || root == nil {
+		info.QuotaStatus = QuotaUnavailable
+		info.Error = "grok billing response was not a JSON object"
+		info.QuotaNote = info.Error
+		return info
+	}
+
+	info.PlanType = firstString(root, "subscription_tier", "subscriptionTier")
+	bill := &BillingSnapshot{}
+	if v, ok := firstRaw(root, "on_demand_enabled", "onDemandEnabled"); ok {
+		if b, ok := jsonBool(v); ok {
+			bill.OnDemandEnabled = &b
+		}
+	}
+
+	cfgRaw, hasCfg := firstRaw(root, "config")
+	if !hasCfg || string(bytes.TrimSpace(cfgRaw)) == "null" {
+		info.Billing = emptyBilling(bill)
+		if info.PlanType != "" {
+			info.QuotaNote = "grok billing response had no config object, so no usage percentage is available"
+		}
+		return info
+	}
+	var cfg map[string]json.RawMessage
+	if err := json.Unmarshal(cfgRaw, &cfg); err != nil || cfg == nil {
+		info.QuotaStatus = QuotaUnavailable
+		info.Error = "grok billing config was not a JSON object"
+		info.QuotaNote = info.Error
+		return info
+	}
+
+	if period, ok := firstRaw(cfg, "currentPeriod", "current_period"); ok {
+		var p map[string]json.RawMessage
+		if json.Unmarshal(period, &p) == nil {
+			bill.PeriodType = firstString(p, "type", "periodType", "period_type")
+			bill.PeriodStart = firstString(p, "start")
+			bill.PeriodEnd = firstString(p, "end")
+		}
+	}
+	if bill.PeriodStart == "" {
+		bill.PeriodStart = firstString(cfg, "billingPeriodStart", "billing_period_start")
+	}
+	if bill.PeriodEnd == "" {
+		bill.PeriodEnd = firstString(cfg, "billingPeriodEnd", "billing_period_end")
+	}
+	bill.OnDemandCapCents = centPtr(cfg, "onDemandCap", "on_demand_cap")
+	bill.OnDemandUsedCents = centPtr(cfg, "onDemandUsed", "on_demand_used")
+	bill.PrepaidBalanceCents = centPtr(cfg, "prepaidBalance", "prepaid_balance")
+	if v, ok := firstRaw(cfg, "isUnifiedBillingUser", "is_unified_billing_user"); ok {
+		if b, ok := jsonBool(v); ok {
+			bill.Unified = &b
+		}
+	}
+	info.Billing = emptyBilling(bill)
+
+	if bill.PrepaidBalanceCents != nil {
+		has := *bill.PrepaidBalanceCents > 0
+		info.Credits = &CreditInfo{HasCredits: has}
+	}
+
+	reset := parseProviderTime(bill.PeriodEnd)
+	var measured *UsageWindow
+	if pct, ok := jsonFloat(firstPresent(cfg, "creditUsagePercent", "credit_usage_percent")); ok {
+		if pct < 0 || pct > 100 {
+			info.QuotaNote = "grok creditUsagePercent was outside 0-100, so it was not used"
+		} else {
+			measured = percentWindow(pct, reset, bill.PeriodType, bill.PeriodStart, bill.PeriodEnd)
+		}
+	}
+	if measured == nil {
+		limit, limitOK := centValue(cfg, "monthlyLimit", "monthly_limit")
+		used, usedOK := centValue(cfg, "used")
+		if limitOK && usedOK && limit > 0 {
+			pct := float64(used) / float64(limit) * 100
+			if pct < 0 || pct > 100 {
+				info.QuotaNote = "grok used/limit ratio was outside 0-100, so it was not used"
+			} else {
+				measured = percentWindow(pct, reset, bill.PeriodType, bill.PeriodStart, bill.PeriodEnd)
+			}
+		}
+	}
+	if measured == nil {
+		usageAbsent := true
+		for _, key := range []string{"creditUsagePercent", "credit_usage_percent", "used", "monthlyLimit", "monthly_limit"} {
+			// Check map membership, not firstRaw: null is present and must not
+			// be interpreted as proto3's omitted scalar zero.
+			if _, present := cfg[key]; present {
+				usageAbsent = false
+				break
+			}
+		}
+		start := parseProviderTime(bill.PeriodStart)
+		if usageAbsent && grokPeriodConsistent(cfg, start, reset) && !start.IsZero() && reset.After(start) &&
+			!info.FetchedAt.Before(start) && info.FetchedAt.Before(reset) {
+			measured = percentWindow(0, reset, bill.PeriodType, bill.PeriodStart, bill.PeriodEnd)
+		}
+	}
+
+	if measured != nil {
+		info.PrimaryWindow = measured
+		info.QuotaStatus = QuotaOK
+		info.QuotaNote = ""
+		info.Error = ""
+		return info
+	}
+
+	// Period bounds are real even when the percentage is not. Keep them on an
+	// unmeasured window so the reset is visible, and leave the percent unknown.
+	if !reset.IsZero() || bill.PeriodStart != "" {
+		info.PrimaryWindow = &UsageWindow{
+			ResetsAt:       reset,
+			WindowDuration: periodDuration(bill.PeriodType, bill.PeriodStart, bill.PeriodEnd),
+			Kind:           "billing",
+			Label:          "included",
+			Unmeasured:     true,
+		}
+	}
+	return info
+}
+
+// Do not let fallback bounds repair an explicitly malformed or contradictory
+// period when inferring an omitted zero. Every supplied bound must agree.
+func grokPeriodConsistent(cfg map[string]json.RawMessage, start, end time.Time) bool {
+	check := func(obj map[string]json.RawMessage, key string, expected time.Time) bool {
+		if raw, present := obj[key]; present {
+			var s string
+			if json.Unmarshal(raw, &s) != nil {
+				return false
+			}
+			parsed := parseProviderTime(s)
+			return !parsed.IsZero() && parsed.Equal(expected)
+		}
+		return true
+	}
+	for _, key := range []string{"currentPeriod", "current_period"} {
+		if raw, present := cfg[key]; present {
+			var period map[string]json.RawMessage
+			if json.Unmarshal(raw, &period) != nil || period == nil ||
+				!check(period, "start", start) || !check(period, "end", end) {
+				return false
+			}
+			if _, present := period["start"]; !present {
+				return false
+			}
+			if _, present := period["end"]; !present {
+				return false
+			}
+		}
+	}
+	return check(cfg, "billingPeriodStart", start) && check(cfg, "billing_period_start", start) &&
+		check(cfg, "billingPeriodEnd", end) && check(cfg, "billing_period_end", end)
+}
+
+func percentWindow(pct float64, reset time.Time, periodType, start, end string) *UsageWindow {
+	return &UsageWindow{
+		Utilization:    pct / 100,
+		UsedPercent:    int(pct),
+		ResetsAt:       reset,
+		WindowDuration: periodDuration(periodType, start, end),
+		Kind:           "billing",
+		Label:          "included",
+	}
+}
+
+func periodDuration(periodType, start, end string) time.Duration {
+	if s, e := parseProviderTime(start), parseProviderTime(end); !s.IsZero() && e.After(s) {
+		return e.Sub(s)
+	}
+	switch {
+	case strings.Contains(strings.ToUpper(periodType), "WEEK"):
+		return 7 * 24 * time.Hour
+	case strings.Contains(strings.ToUpper(periodType), "MONTH"):
+		return 30 * 24 * time.Hour
+	default:
+		return 0
+	}
+}
+
+func emptyBilling(b *BillingSnapshot) *BillingSnapshot {
+	if b == nil {
+		return nil
+	}
+	if b.PeriodType == "" && b.PeriodStart == "" && b.PeriodEnd == "" &&
+		b.OnDemandCapCents == nil && b.OnDemandUsedCents == nil &&
+		b.PrepaidBalanceCents == nil && b.Unified == nil && b.OnDemandEnabled == nil &&
+		b.LimitType == "" && b.TeamPoolCapCents == nil && b.TeamPoolUsedCents == nil &&
+		b.TeamPoolRemainingCents == nil {
+		return nil
+	}
+	return b
+}
+
+func parseProviderTime(s string) time.Time {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
+func firstString(obj map[string]json.RawMessage, keys ...string) string {
+	raw, ok := firstRaw(obj, keys...)
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(s)
+}
+
+func firstRaw(obj map[string]json.RawMessage, keys ...string) (json.RawMessage, bool) {
+	for _, k := range keys {
+		if raw, ok := obj[k]; ok && len(bytes.TrimSpace(raw)) > 0 && string(bytes.TrimSpace(raw)) != "null" {
+			return raw, true
+		}
+	}
+	return nil, false
+}
+
+func firstPresent(obj map[string]json.RawMessage, keys ...string) json.RawMessage {
+	raw, _ := firstRaw(obj, keys...)
+	return raw
+}
+
+func jsonFloat(raw json.RawMessage) (float64, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return 0, false
+	}
+	if raw[0] == '"' {
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return 0, false
+		}
+		raw = bytes.TrimSpace([]byte(s))
+	}
+	// JSON's numeric grammar rejects suffixes, hexadecimal floats and NaN.
+	// Unmarshaling null into a float succeeds without assigning, so reject it
+	// explicitly rather than inventing a zero measurement.
+	var n float64
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) || json.Unmarshal(raw, &n) != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0, false
+	}
+	return n, true
+}
+
+func jsonBool(raw json.RawMessage) (bool, bool) {
+	var b bool
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return false, false
+	}
+	return b, true
+}
+
+// centPtr returns a cents value when the field is present. A JSON number,
+// a string, or {"val": n} all count. Absence stays nil, including when the
+// key is missing, so a reported zero is preserved.
+func centPtr(obj map[string]json.RawMessage, keys ...string) *int64 {
+	raw, ok := firstRaw(obj, keys...)
+	if !ok {
+		return nil
+	}
+	n, ok := parseCent(raw)
+	if !ok {
+		return nil
+	}
+	return &n
+}
+
+func centValue(obj map[string]json.RawMessage, keys ...string) (int64, bool) {
+	p := centPtr(obj, keys...)
+	if p == nil {
+		return 0, false
+	}
+	return *p, true
+}
+
+func parseCent(raw json.RawMessage) (int64, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, false
+	}
+	if n, ok := jsonInt(raw); ok {
+		return n, true
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return 0, false
+	}
+	// An empty object is proto3's zero Cent: the value was sent and it is 0.
+	if len(obj) == 0 {
+		zero := int64(0)
+		return zero, true
+	}
+	if v, ok := obj["val"]; ok {
+		return jsonInt(v)
+	}
+	return 0, false
+}
+
+// grokAccountEmail returns the account email from auth.json when the file
+// has one. It never returns token material.
+func grokAccountEmail(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var root any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return ""
+	}
+	return findEmail(root)
+}
+
+func findEmail(v any) string {
+	switch t := v.(type) {
+	case map[string]any:
+		if s, ok := t["email"].(string); ok {
+			s = strings.TrimSpace(s)
+			if strings.Contains(s, "@") && len(s) < 200 && !strings.Contains(s, " ") {
+				return s
+			}
+		}
+		for k, child := range t {
+			switch strings.ToLower(k) {
+			case "key", "token", "access_token", "refresh_token", "id_token", "secret":
+				continue
+			}
+			if email := findEmail(child); email != "" {
+				return email
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if email := findEmail(child); email != "" {
+				return email
+			}
+		}
+	}
+	return ""
+}

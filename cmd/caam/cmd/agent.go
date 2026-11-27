@@ -3,15 +3,18 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
 	"github.com/spf13/cobra"
 )
 
@@ -21,8 +24,9 @@ var agentCmd = &cobra.Command{
 	Long: `Receive OAuth URLs from the remote coordinator and complete authentication
 using browser automation.
 
-The auth-agent runs on your local machine (e.g., Mac) where your browser has
-existing Google account sessions. It:
+The auth-agent runs on your local machine (e.g., Mac) and drives its own
+Chrome profile; sign in to your Google accounts there once with
+'caam auth-agent signin'. It:
 1. Receives auth request URLs from the remote coordinator
 2. Opens Chrome and navigates to the OAuth URL
 3. Selects the appropriate Google account (using LRU strategy by default)
@@ -30,11 +34,16 @@ existing Google account sessions. It:
 5. Sends the code back to the coordinator
 
 The coordinator then injects this code into the waiting Claude Code session.
+Codes are redelivered until the coordinator acknowledges them, so a dropped
+connection does not lose a completed login.
 
-SSH Tunnel Setup (run on local Mac):
-  ssh -R 7890:localhost:7891 user@remote-server -N
+TRANSPORT:
+  'caam setup distributed' writes a config whose coordinators carry an "ssh"
+  block: the agent opens its own SSH connection to each host and reaches the
+  loopback-only coordinator API through it, with a per-host token.
 
-This forwards the coordinator's port 7890 to your local agent's port 7891.
+  With --coordinator, forward the port yourself (run on this machine):
+    ssh -N -L 7890:127.0.0.1:7890 user@remote-server
 
 Examples:
   # Start agent with default settings
@@ -44,8 +53,11 @@ Examples:
   caam auth-agent --coordinator http://localhost:7890 \
     --accounts alice@gmail.com,bob@gmail.com
 
-  # Use specific Chrome profile
-  caam auth-agent --chrome-profile ~/Library/Application\ Support/Google/Chrome/Default
+  # Sign in to the Google accounts the agent should use (once per machine)
+  caam auth-agent signin
+
+  # Use a different Chrome user data directory
+  caam auth-agent --chrome-profile ~/caam-chrome
 
   # Verbose logging
   caam auth-agent --verbose`,
@@ -77,7 +89,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agentStrategy, "strategy", "lru",
 		"Account selection strategy: lru, round_robin, random")
 	agentCmd.Flags().StringVar(&agentChromeProfile, "chrome-profile", "",
-		"Chrome user data directory (uses temp profile if empty)")
+		"Chrome user data directory (default: the agent's persistent profile)")
 	agentCmd.Flags().BoolVar(&agentHeadless, "headless", false,
 		"Run Chrome in headless mode (may not work with Google OAuth)")
 	agentCmd.Flags().BoolVar(&agentVerbose, "verbose", false, "Verbose output")
@@ -214,9 +226,7 @@ func runSingleAgent(cmd *cobra.Command, logger *slog.Logger, config agent.Config
 	if len(accounts) > 0 {
 		fmt.Printf("  Accounts: %v\n", accounts)
 	}
-	if chromeProfile != "" {
-		fmt.Printf("  Chrome profile: %s\n", chromeProfile)
-	}
+	fmt.Printf("  Chrome profile: %s\n", agent.ResolveChromeUserDataDir(chromeProfile))
 	fmt.Println("\nWaiting for auth requests...")
 	fmt.Println("Press Ctrl+C to stop.")
 
@@ -274,13 +284,22 @@ func runMultiAgent(cmd *cobra.Command, logger *slog.Logger, config agent.MultiCo
 	fmt.Printf("Auth agent started (multi-coordinator)\n")
 	fmt.Printf("  API: http://localhost:%d\n", config.Port)
 	fmt.Printf("  Coordinators: %d\n", len(config.Coordinators))
+	for _, c := range config.Coordinators {
+		via := c.URL
+		if c.SSH != nil {
+			via = fmt.Sprintf("%s via ssh %s", c.URL, c.SSH.Host)
+		}
+		auth := "no token"
+		if c.Token != "" {
+			auth = "token"
+		}
+		fmt.Printf("    - %s: %s (%s)\n", c.Name, via, auth)
+	}
 	fmt.Printf("  Strategy: %s\n", config.AccountStrategy)
 	if len(config.Accounts) > 0 {
 		fmt.Printf("  Accounts: %v\n", config.Accounts)
 	}
-	if config.ChromeUserDataDir != "" {
-		fmt.Printf("  Chrome profile: %s\n", config.ChromeUserDataDir)
-	}
+	fmt.Printf("  Chrome profile: %s\n", agent.ResolveChromeUserDataDir(config.ChromeUserDataDir))
 	fmt.Println("\nWaiting for auth requests...")
 	fmt.Println("Press Ctrl+C to stop.")
 
@@ -301,30 +320,10 @@ func runMultiAgent(cmd *cobra.Command, logger *slog.Logger, config agent.MultiCo
 	return nil
 }
 
-type agentFileConfig struct {
-	Port             int                          `json:"port"`
-	CoordinatorURL   string                       `json:"coordinator_url"`
-	Coordinator      string                       `json:"coordinator"`
-	CoordinatorToken string                       `json:"coordinator_token"`
-	PollInterval     string                       `json:"poll_interval"`
-	ChromeProfile    string                       `json:"chrome_profile"`
-	Headless         bool                         `json:"headless"`
-	Strategy         string                       `json:"strategy"`
-	Accounts         []string                     `json:"accounts"`
-	Coordinators     []*agent.CoordinatorEndpoint `json:"coordinators"`
-	ChromeUserData   string                       `json:"chrome_user_data_dir"`
-	ChromeProfileDir string                       `json:"chrome_profile_dir"`
-}
-
 func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error) {
-	data, err := os.ReadFile(path)
+	raw, err := agent.LoadFileConfig(path)
 	if err != nil {
-		return false, agent.Config{}, agent.MultiConfig{}, fmt.Errorf("read config: %w", err)
-	}
-
-	var raw agentFileConfig
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return false, agent.Config{}, agent.MultiConfig{}, fmt.Errorf("parse config: %w", err)
+		return false, agent.Config{}, agent.MultiConfig{}, err
 	}
 
 	useMulti := len(raw.Coordinators) > 0
@@ -333,6 +332,14 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 		return false, agent.Config{}, agent.MultiConfig{}, err
 	}
 	if useMulti {
+		for i, c := range raw.Coordinators {
+			if c == nil || strings.TrimSpace(c.URL) == "" {
+				return false, agent.Config{}, agent.MultiConfig{}, fmt.Errorf("config %s: coordinator %d has no url", path, i+1)
+			}
+			if c.SSH != nil && strings.TrimSpace(c.SSH.Host) == "" {
+				return false, agent.Config{}, agent.MultiConfig{}, fmt.Errorf("config %s: coordinator %q has ssh without host", path, c.Name)
+			}
+		}
 		cfg := agent.DefaultMultiConfig()
 		if raw.Port != 0 {
 			cfg.Port = raw.Port
@@ -340,7 +347,7 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 		if pollInterval != 0 {
 			cfg.PollInterval = pollInterval
 		}
-		cfg.ChromeUserDataDir = firstNonEmpty(raw.ChromeProfile, raw.ChromeUserData, raw.ChromeProfileDir)
+		cfg.ChromeUserDataDir = raw.ChromeUserDataDir()
 		cfg.Headless = raw.Headless
 		if raw.Strategy != "" {
 			strategy, err := parseStrategy(raw.Strategy)
@@ -361,7 +368,7 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 	if pollInterval != 0 {
 		cfg.PollInterval = pollInterval
 	}
-	cfg.ChromeUserDataDir = firstNonEmpty(raw.ChromeProfile, raw.ChromeUserData, raw.ChromeProfileDir)
+	cfg.ChromeUserDataDir = raw.ChromeUserDataDir()
 	cfg.Headless = raw.Headless
 	if raw.Strategy != "" {
 		strategy, err := parseStrategy(raw.Strategy)
@@ -430,7 +437,7 @@ var testAuthCmd = &cobra.Command{
 		defer browser.Close()
 
 		fmt.Println("Opening browser for OAuth...")
-		code, account, err := browser.CompleteOAuth(cmd.Context(), url, "")
+		code, account, err := browser.CompleteOAuth(cmd.Context(), url, nil)
 		if err != nil {
 			return fmt.Errorf("OAuth failed: %w", err)
 		}
@@ -440,6 +447,381 @@ var testAuthCmd = &cobra.Command{
 		fmt.Printf("  Account: %s\n", account)
 		return nil
 	},
+}
+
+var (
+	agentSignInConfig  string
+	agentSignInProfile string
+)
+
+// agentSignInCmd opens the agent's Chrome profile so the user can sign in to
+// the Google accounts (and Claude) that unattended OAuth flows will use.
+var agentSignInCmd = &cobra.Command{
+	Use:   "signin",
+	Short: "Sign in to Google accounts in the auth agent's Chrome profile",
+	Long: `Open a Chrome window on the auth agent's own profile with tabs for adding
+Google accounts and signing in to Claude. Sign in to every Google account the
+agent should rotate through, then close the window.
+
+The agent reuses these sessions for every OAuth flow, so this is needed once
+per machine (and again only when Google signs a session out). The profile is
+the config's chrome_profile, or by default <caam data dir>/auth-agent-chrome
+(~/.local/share/caam/auth-agent-chrome, or $CAAM_HOME/data/auth-agent-chrome).`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		profile, err := signInProfileDir(cmd)
+		if err != nil {
+			return err
+		}
+		browser := agent.NewBrowser(agent.BrowserConfig{UserDataDir: profile})
+		out := cmd.OutOrStdout()
+		fmt.Fprintf(out, "Opening Chrome with profile %s\n", browser.UserDataDir())
+		fmt.Fprintln(out, "Sign in to each Google account the agent should use (and to Claude), then close the window.")
+		if err := browser.OpenForSignIn(cmd.Context(), agent.SignInURLs...); err != nil {
+			return err
+		}
+		fmt.Fprintln(out, "Done. Running auth agents pick up the sign-ins on their next OAuth flow.")
+		cfgPath := agentSignInConfig
+		if cfgPath == "" {
+			cfgPath = agent.DefaultConfigPath()
+		}
+		fmt.Fprintf(out, "Add the accounts to rotate through (they go into %s):\n", cfgPath)
+		fmt.Fprintln(out, "  caam auth-agent accounts add <email>...")
+		fmt.Fprintln(out, "Without them every recovery reuses whichever account is offered first. Check with: caam doctor")
+		return nil
+	},
+}
+
+// signInProfileDir picks the profile: --chrome-profile, then the agent
+// config's chrome_profile, then the default.
+func signInProfileDir(cmd *cobra.Command) (string, error) {
+	if cmd.Flags().Changed("chrome-profile") {
+		return agentSignInProfile, nil
+	}
+	path := agentSignInConfig
+	if path == "" {
+		path = agent.DefaultConfigPath()
+	}
+	fc, err := agent.LoadFileConfig(path)
+	switch {
+	case err == nil:
+		return fc.ChromeUserDataDir(), nil
+	case errors.Is(err, os.ErrNotExist) && !cmd.Flags().Changed("config"):
+		return "", nil
+	default:
+		return "", fmt.Errorf("agent config %s: %w", path, err)
+	}
+}
+
+var (
+	agentServiceConfig string
+	agentServiceJSON   bool
+)
+
+// agentServiceCmd manages the auth-agent as a per-user background service.
+var agentServiceCmd = &cobra.Command{
+	Use:   "service",
+	Short: "Run the auth agent as a login service (launchd on macOS, systemd on Linux)",
+	Long: `Install, remove, or inspect a per-user service that runs
+'caam auth-agent --config <path>' at login and restarts it if it crashes.
+
+macOS:  ~/Library/LaunchAgents/com.dicklesworthstone.caam.auth-agent.plist
+        (logs: ~/Library/Logs/caam-auth-agent.log)
+Linux:  ~/.config/systemd/user/caam-auth-agent.service
+        (logs: journalctl --user -u caam-auth-agent)
+
+The config defaults to the one written by 'caam setup distributed'.`,
+}
+
+func newAgentService() (*deploy.AgentService, error) {
+	configPath := agentServiceConfig
+	if configPath == "" {
+		configPath = agent.DefaultConfigPath()
+	}
+	abs, err := filepath.Abs(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve config path: %w", err)
+	}
+	return deploy.NewAgentService(abs)
+}
+
+var agentServiceInstallCmd = &cobra.Command{
+	Use:   "install",
+	Short: "Install and start the auth-agent service",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		svc, err := newAgentService()
+		if err != nil {
+			return err
+		}
+		if _, err := loadAgentConfigForService(svc.ConfigPath); err != nil {
+			return err
+		}
+		path, err := svc.Install(cmd.Context())
+		if err != nil {
+			return err
+		}
+		out := cmd.OutOrStdout()
+		fmt.Fprintf(out, "Installed auth-agent service: %s\n", path)
+		fmt.Fprintf(out, "  Runs: %s auth-agent --config %s\n", svc.Executable, svc.ConfigPath)
+		if logPath := svc.LogPath(); logPath != "" {
+			fmt.Fprintf(out, "  Logs: %s\n", logPath)
+		} else {
+			fmt.Fprintln(out, "  Logs: journalctl --user -u caam-auth-agent -f")
+		}
+		return nil
+	},
+}
+
+var agentServiceUninstallCmd = &cobra.Command{
+	Use:   "uninstall",
+	Short: "Stop and remove the auth-agent service",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		svc, err := newAgentService()
+		if err != nil {
+			return err
+		}
+		path, err := svc.Uninstall(cmd.Context())
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Removed auth-agent service: %s\n", path)
+		return nil
+	},
+}
+
+var agentServiceStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Show whether the auth-agent service is installed and running",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		svc, err := newAgentService()
+		if err != nil {
+			return err
+		}
+		st, err := svc.Status(cmd.Context())
+		if err != nil {
+			return err
+		}
+		out := cmd.OutOrStdout()
+		if agentServiceJSON {
+			enc := json.NewEncoder(out)
+			enc.SetIndent("", "  ")
+			return enc.Encode(st)
+		}
+		fmt.Fprintf(out, "Unit:      %s\n", st.UnitPath)
+		fmt.Fprintf(out, "Installed: %t\n", st.Installed)
+		fmt.Fprintf(out, "Running:   %t\n", st.Running)
+		if st.Detail != "" {
+			fmt.Fprintf(out, "Detail:    %s\n", st.Detail)
+		}
+		if st.LogPath != "" {
+			fmt.Fprintf(out, "Logs:      %s\n", st.LogPath)
+		}
+		return nil
+	},
+}
+
+// loadAgentConfigForService validates the config before a service is
+// installed that would crash-loop on it.
+func loadAgentConfigForService(path string) (bool, error) {
+	useMulti, _, _, err := loadAgentConfig(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("agent config %s not found: run 'caam setup distributed' or pass --config", path)
+	}
+	if err != nil {
+		return false, fmt.Errorf("agent config %s: %w", path, err)
+	}
+	return useMulti, nil
+}
+
+func init() {
+	agentCmd.AddCommand(agentServiceCmd)
+	agentServiceCmd.AddCommand(agentServiceInstallCmd, agentServiceUninstallCmd, agentServiceStatusCmd)
+	agentServiceCmd.PersistentFlags().StringVar(&agentServiceConfig, "config", "",
+		"agent config file (default: the 'caam setup distributed' config)")
+	agentServiceStatusCmd.Flags().BoolVar(&agentServiceJSON, "json", false, "print status as JSON")
+}
+
+func init() {
+	agentCmd.AddCommand(agentSignInCmd)
+	agentSignInCmd.Flags().StringVar(&agentSignInConfig, "config", "",
+		"agent config whose chrome_profile to use (default: the 'caam setup distributed' config)")
+	agentSignInCmd.Flags().StringVar(&agentSignInProfile, "chrome-profile", "",
+		"Chrome user data directory (overrides the config)")
+}
+
+var agentAccountsConfig string
+
+// agentAccountsCmd lists and edits the Google accounts the agent rotates
+// through (the config's "accounts").
+var agentAccountsCmd = &cobra.Command{
+	Use:   "accounts",
+	Short: "List the accounts the auth agent rotates through",
+	Long: `List the Google accounts the auth agent signs panes in with, in order, with
+when each was last used and any hold: an account that hit its usage limit is
+passed over until the limit resets.
+
+Add or remove accounts with 'caam auth-agent accounts add|remove <email>...'.
+Sign in to them first in the agent's Chrome profile: caam auth-agent signin.`,
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path, fc, err := loadAgentAccountsConfig()
+		if err != nil {
+			return err
+		}
+		out := cmd.OutOrStdout()
+		if len(fc.Accounts) == 0 {
+			fmt.Fprintf(out, "No accounts in %s; every recovery reuses whichever account is offered first.\n", path)
+			fmt.Fprintln(out, "Add some with: caam auth-agent accounts add <email>...")
+			return nil
+		}
+		held, err := agent.HeldAccounts(agent.UsagePath(), time.Now())
+		if err != nil {
+			fmt.Fprintf(cmd.ErrOrStderr(), "Warning: %v\n", err)
+		}
+		lastUsed := accountLastUsed(agent.UsagePath())
+		fmt.Fprintf(out, "Accounts (%s, strategy %s):\n", path, firstNonEmpty(fc.Strategy, "lru"))
+		for i, acc := range fc.Accounts {
+			line := fmt.Sprintf("  %d. %s", i+1, acc)
+			if t, ok := lastUsed[strings.ToLower(acc)]; ok && !t.IsZero() {
+				line += "  last used " + t.Local().Format("Jan 2 15:04")
+			}
+			for email, until := range held {
+				if strings.EqualFold(email, acc) {
+					line += "  at its limit until " + until.Local().Format("Jan 2 15:04")
+				}
+			}
+			fmt.Fprintln(out, line)
+		}
+		return nil
+	},
+}
+
+var agentAccountsAddCmd = &cobra.Command{
+	Use:   "add <email>...",
+	Short: "Add accounts for the auth agent to rotate through",
+	Args:  cobra.MinimumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return editAgentAccounts(cmd, func(accounts []string) ([]string, []string, error) {
+			var changed []string
+			for _, email := range args {
+				email = strings.TrimSpace(email)
+				if !strings.Contains(email, "@") || strings.ContainsAny(email, " \t,") {
+					return nil, nil, fmt.Errorf("%q is not an email address", email)
+				}
+				if !containsFold(accounts, email) {
+					accounts = append(accounts, email)
+					changed = append(changed, email)
+				}
+			}
+			return accounts, changed, nil
+		}, "Added")
+	},
+}
+
+var agentAccountsRemoveCmd = &cobra.Command{
+	Use:   "remove <email>...",
+	Short: "Stop the auth agent from using accounts",
+	Args:  cobra.MinimumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return editAgentAccounts(cmd, func(accounts []string) ([]string, []string, error) {
+			var kept, changed []string
+			for _, acc := range accounts {
+				if containsFold(args, acc) {
+					changed = append(changed, acc)
+				} else {
+					kept = append(kept, acc)
+				}
+			}
+			if kept == nil {
+				kept = []string{}
+			}
+			return kept, changed, nil
+		}, "Removed")
+	},
+}
+
+func loadAgentAccountsConfig() (string, agent.FileConfig, error) {
+	path := agentAccountsConfig
+	if path == "" {
+		path = agent.DefaultConfigPath()
+	}
+	fc, err := agent.LoadFileConfig(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return path, fc, fmt.Errorf("agent config %s not found: run 'caam setup distributed' or pass --config", path)
+	}
+	if err != nil {
+		return path, fc, fmt.Errorf("agent config %s: %w", path, err)
+	}
+	return path, fc, nil
+}
+
+// editAgentAccounts applies edit to the config's accounts, saves the config,
+// and restarts an installed agent service so it uses them.
+func editAgentAccounts(cmd *cobra.Command, edit func([]string) (accounts, changed []string, err error), verb string) error {
+	path, fc, err := loadAgentAccountsConfig()
+	if err != nil {
+		return err
+	}
+	accounts, changed, err := edit(append([]string(nil), fc.Accounts...))
+	if err != nil {
+		return err
+	}
+	out := cmd.OutOrStdout()
+	if len(changed) == 0 {
+		fmt.Fprintln(out, "Nothing to change.")
+		return nil
+	}
+	fc.Accounts = accounts
+	if err := agent.WriteFileConfig(path, fc); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s %s in %s.\n", verb, strings.Join(changed, ", "), path)
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if restartInstalledAgentService(ctx, path) {
+		fmt.Fprintln(out, "Restarted the auth-agent service.")
+	}
+	return nil
+}
+
+// accountLastUsed reads when each account was last used, by lowercased email.
+func accountLastUsed(usagePath string) map[string]time.Time {
+	data, err := os.ReadFile(usagePath)
+	if err != nil {
+		return nil
+	}
+	var usages []*agent.AccountUsage
+	if json.Unmarshal(data, &usages) != nil {
+		return nil
+	}
+	out := make(map[string]time.Time, len(usages))
+	for _, u := range usages {
+		if u != nil {
+			out[strings.ToLower(u.Email)] = u.LastUsed
+		}
+	}
+	return out
+}
+
+func containsFold(list []string, s string) bool {
+	for _, item := range list {
+		if strings.EqualFold(item, s) {
+			return true
+		}
+	}
+	return false
+}
+
+func init() {
+	agentCmd.AddCommand(agentAccountsCmd)
+	agentAccountsCmd.AddCommand(agentAccountsAddCmd, agentAccountsRemoveCmd)
+	agentAccountsCmd.PersistentFlags().StringVar(&agentAccountsConfig, "config", "",
+		"agent config file (default: the 'caam setup distributed' config)")
 }
 
 func init() {

@@ -2,9 +2,11 @@ package coordinator
 
 import (
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -59,19 +61,33 @@ func (s PaneState) String() string {
 
 // PaneTracker tracks the state of a single pane.
 type PaneTracker struct {
-	PaneID        int
-	State         PaneState
-	LastCheck     time.Time
-	StateEntered  time.Time
-	OAuthURL      string
-	RequestID     string // ID for auth request
-	ReceivedCode  string // Code received from local agent
-	UsedAccount   string // Account used for auth
-	ErrorMessage  string
-	RetryCount    int
-	LastOutput    string // Cached output for duplicate detection
-	Cooldowns     map[string]time.Time // action -> cooldown expiry
-	mu            sync.RWMutex
+	PaneID       int
+	State        PaneState
+	LastCheck    time.Time
+	StateEntered time.Time
+	OAuthURL     string
+	RequestID    string // ID for auth request
+	ReceivedCode string // Code received from local agent
+	UsedAccount  string // Account used for auth
+	ErrorMessage string
+	RetryCount   int
+	ContinueSent bool // Enter sent to dismiss the post-login screen this cycle
+	SelectSends  int  // login-method selections sent this cycle
+	GaveUp       bool // retries spent this rate-limit episode; left to a human (survives Reset)
+	// LimitedAccount and LimitReset describe this episode's limit: the
+	// account Claude Code was signed in with and the banner's reset. They
+	// survive Reset, so retried logins still report them.
+	LimitedAccount        string
+	LimitReset            string
+	LimitedAccountID      string
+	LimitedOrganizationID string
+	// HoldUntil is when the agent will have an account again after it
+	// declined because all were at their limit; no login is started in the
+	// pane before then. It survives Reset.
+	HoldUntil  time.Time
+	LastOutput string               // Cached output for duplicate detection
+	Cooldowns  map[string]time.Time // action -> cooldown expiry
+	mu         sync.RWMutex
 }
 
 // NewPaneTracker creates a tracker for a pane.
@@ -119,7 +135,102 @@ func (t *PaneTracker) Reset() {
 	t.ReceivedCode = ""
 	t.UsedAccount = ""
 	t.ErrorMessage = ""
+	t.ContinueSent = false
+	t.SelectSends = 0
 	t.Cooldowns = make(map[string]time.Time)
+}
+
+// CountSelectSend records a login-method selection and returns how many were
+// sent this cycle, including this one.
+func (t *PaneTracker) CountSelectSend() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.SelectSends++
+	return t.SelectSends
+}
+
+// SetLimit records the account that hit the limit and when it resets.
+func (t *PaneTracker) SetLimit(account, reset string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.LimitedAccount = account
+	t.LimitReset = reset
+	t.LimitedAccountID = ""
+	t.LimitedOrganizationID = ""
+}
+
+// SetIdentityLimit captures a verified Claude identity supplied by the pane
+// resolver. The caller must establish that the identity belongs to the grant
+// used by this running pane, not merely to a current credential file.
+func (t *PaneTracker) SetIdentityLimit(account *identity.Identity, reset string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.LimitedAccount, t.LimitedAccountID, t.LimitedOrganizationID = "", "", ""
+	t.LimitReset = reset
+	if account != nil && account.Provider == "claude" && account.Verified &&
+		strings.TrimSpace(account.AccountID) != "" && strings.TrimSpace(account.OrganizationID) != "" {
+		t.LimitedAccount = account.Email
+		t.LimitedAccountID = account.AccountID
+		t.LimitedOrganizationID = account.OrganizationID
+	}
+}
+
+func (t *PaneTracker) GetLimitIdentity() (accountID, organizationID string) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.LimitedAccountID, t.LimitedOrganizationID
+}
+
+// GetLimit returns the account that hit the limit and when it resets.
+func (t *PaneTracker) GetLimit() (account, reset string) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.LimitedAccount, t.LimitReset
+}
+
+// SetHoldUntil keeps logins out of the pane until t.
+func (t *PaneTracker) SetHoldUntil(until time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.HoldUntil = until
+}
+
+// GetHoldUntil returns when logins may start in the pane again.
+func (t *PaneTracker) GetHoldUntil() time.Time {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.HoldUntil
+}
+
+// SetGaveUp records whether the pane was left for manual recovery.
+func (t *PaneTracker) SetGaveUp(gaveUp bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.GaveUp = gaveUp
+}
+
+// HasGivenUp reports whether the pane was left for manual recovery.
+func (t *PaneTracker) HasGivenUp() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.GaveUp
+}
+
+// GetSelectSends returns the login-method selections sent this cycle.
+func (t *PaneTracker) GetSelectSends() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.SelectSends
+}
+
+// MarkContinueSent records that the post-login screen was dismissed and
+// reports whether it already had been this cycle.
+func (t *PaneTracker) MarkContinueSent() (alreadySent bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	alreadySent = t.ContinueSent
+	t.ContinueSent = true
+	return alreadySent
 }
 
 // Thread-safe accessors for tracker fields
@@ -194,6 +305,21 @@ func (t *PaneTracker) SetErrorMessage(msg string) {
 	t.ErrorMessage = msg
 }
 
+// GetRetryCount returns how many login retries this episode has used.
+func (t *PaneTracker) GetRetryCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.RetryCount
+}
+
+// SetRetryCount sets the login retry count. Reset leaves it unchanged so the
+// budget spans the whole rate-limit episode.
+func (t *PaneTracker) SetRetryCount(n int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.RetryCount = n
+}
+
 // SetAuthResponse sets the received code and account atomically.
 func (t *PaneTracker) SetAuthResponse(code, account string) {
 	t.mu.Lock()
@@ -259,36 +385,71 @@ var Patterns = struct {
 	LoginFailed      *regexp.Regexp
 	OptionOne        *regexp.Regexp
 	UsageLimitReset  *regexp.Regexp
+	LimitReset       *regexp.Regexp
 	CompactingBanner *regexp.Regexp
+	PressEnter       *regexp.Regexp
+	RateLimitMenu    *regexp.Regexp
+	Busy             *regexp.Regexp
 }{
-	// "You've hit your limit · resets 2pm (America/New_York)"
-	RateLimit: regexp.MustCompile(`You've hit your limit.*resets`),
+	// Claude Code's working spinner: "✻ Thinking… (12s · ↑ 1.2k tokens ·
+	// esc to interrupt)". A session showing it is not stopped at a limit.
+	Busy: regexp.MustCompile(`(?i)\besc to interrupt\b`),
+
+	// "Login successful. Press Enter to continue…"
+	PressEnter: regexp.MustCompile(`(?i)press\s+enter\s+to\s+continue`),
+
+	// The menu Claude Code opens at a usage limit:
+	//   What do you want to do?
+	//   ❯ 1. Stop and wait for limit to reset
+	//     2. Upgrade your plan
+	// Its options vary by account and can list "Switch to usage credits" or
+	// "Add funds to continue with usage credits" first.
+	RateLimitMenu: regexp.MustCompile(`(?i)what do you want to do\?|stop and wait for limit to reset`),
+
+	// Claude Code's limit banners, followed by their reset time on the same
+	// line (which keeps conversation text about limits from matching):
+	//   "You've hit your limit · resets 2pm (America/New_York)"
+	//   "You've hit your session limit · resets 2pm" (also usage, weekly, Opus,
+	//   Sonnet, Fable, usage credit, and spend limits; Claude Code 2.1+)
+	//   "You're out of usage credits · resets 2pm"
+	//   "Claude usage limit reached. Your limit will reset at 2pm (Europe/Paris)."
+	//   "5-hour limit reached ∙ resets 2pm" / "Weekly limit reached ∙ resets Oct 9"
+	// The forms naming a limit must start their line (after any TUI glyphs),
+	// so Claude's own prose ("it looks like you've hit your rate limit…")
+	// does not match. Tolerant of case and of a curly or missing apostrophe.
+	RateLimit: regexp.MustCompile(`(?im)(you['’]?ve hit your limit|^[^\w\n]*you['’]?ve hit your (?:[\w'’-]+ ){1,4}?limit|^[^\w\n]*you['’]?re out of usage credits|usage limit reached|\b(?:5-hour|five-hour|weekly|opus|sonnet)\b[^\n]{0,20}\blimit reached)[^\n]{0,120}\breset`),
 
 	// "Select login method:"
-	SelectMethod: regexp.MustCompile(`Select login method:`),
+	SelectMethod: regexp.MustCompile(`(?i)select login method:`),
 
-	// OAuth URL: https://claude.ai/oauth/authorize?code=true&...
-	OAuthURL: regexp.MustCompile(`https://claude\.ai/oauth/authorize\?[^\s]+`),
+	// OAuth URL: https://claude.ai/oauth/authorize?code=true&... (or on a
+	// claude.com host, which the agent also accepts)
+	OAuthURL: regexp.MustCompile(`https://(?:[a-z0-9-]+\.)?claude\.(?:ai|com)/(?:[A-Za-z0-9_-]+/)*oauth/authorize\?[^\s]+`),
 
 	// "Paste code here if prompted >"
-	PastePrompt: regexp.MustCompile(`Paste code here if prompted`),
+	PastePrompt: regexp.MustCompile(`(?i)paste code here if prompted`),
 
 	// "Logged in as user@example.com" or similar success patterns
-	LoginSuccess: regexp.MustCompile(`(?i)(logged in as|successfully authenticated|welcome back)`),
+	LoginSuccess: regexp.MustCompile(`(?i)(logged in as|login successful|successfully (authenticated|logged in)|welcome back)`),
 
 	// Login failure patterns
 	LoginFailed: regexp.MustCompile(`(?i)(login failed|authentication error|invalid code|expired|error signing)`),
 
-	// "1. Claude account with subscription"
+	// "❯ 1. Claude account with subscription": option 1 highlighted
 	OptionOne: regexp.MustCompile(`[❯>]\s*1\.\s*Claude account`),
 
 	// Extract reset time from rate limit message
-	UsageLimitReset: regexp.MustCompile(`resets\s+(\d+[ap]m)`),
+	UsageLimitReset: regexp.MustCompile(`(?i)resets?\s+(?:at\s+)?(\d+(?::\d+)?\s*[ap]m)`),
 
-	// "Conversation compacted · ctrl+o for history" or similar variants
+	// The whole reset of a limit banner, up to the next "·" separator:
+	// "3pm (America/New_York)", "Oct 9, 3pm", "in 2h 13m"
+	LimitReset: regexp.MustCompile(`(?i)\bresets?\s+(?:at\s+)?([^\n·∙•]{1,60})`),
+
+	// "Conversation compacted (ctrl+o for history)" (Claude Code 2.1), or
+	// "Conversation compacted · ctrl+o for history" and similar variants
 	// Matches with optional box-drawing characters, middot/bullet separators,
 	// and various whitespace. Also handles "Conversation was compacted" variants.
-	CompactingBanner: regexp.MustCompile(`(?i)Conversation\s+(was\s+)?compacted[\s·•\-\|]*ctrl\+?o`),
+	CompactingBanner: regexp.MustCompile(`(?i)Conversation\s+(was\s+)?compacted[\s·•\-\|(]*ctrl\+?o`),
 }
 
 // StripANSI removes ANSI escape codes from terminal output for pattern matching.
@@ -297,70 +458,120 @@ func StripANSI(s string) string {
 	return ansi.Strip(s)
 }
 
+// stateDetectors map output patterns to pane states. Order breaks ties
+// between matches at the same position.
+var stateDetectors = []struct {
+	pattern *regexp.Regexp
+	state   PaneState
+}{
+	{Patterns.LoginSuccess, StateResuming},
+	{Patterns.LoginFailed, StateFailed},
+	{Patterns.OAuthURL, StateAwaitingURL},
+	{Patterns.PastePrompt, StateAwaitingURL},
+	{Patterns.SelectMethod, StateAwaitingMethodSelect},
+	{Patterns.RateLimit, StateRateLimited},
+}
+
 // DetectState analyzes pane output and returns the detected state.
-// Output is ANSI-normalized before pattern matching to handle colored terminal output.
+//
+// The pane's scrollback holds earlier sessions and conversations, so the
+// most recent recognized message decides the state: a fresh rate-limit
+// banner is not masked by an old "Logged in as" or by the word "expired"
+// higher up. Output is ANSI-normalized before matching.
 func DetectState(output string) (PaneState, map[string]string) {
 	metadata := make(map[string]string)
-
-	// Strip ANSI codes for reliable pattern matching
 	normalizedOutput := StripANSI(output)
 
-	// Check for login success first (highest priority)
-	if Patterns.LoginSuccess.MatchString(normalizedOutput) {
-		return StateResuming, metadata
-	}
-
-	// Check for login failure
-	if Patterns.LoginFailed.MatchString(normalizedOutput) {
-		return StateFailed, metadata
-	}
-
-	// Check for OAuth URL (implies awaiting URL state)
-	// Note: URLs should still be extracted from original output to preserve full URL
-	if match := Patterns.OAuthURL.FindString(normalizedOutput); match != "" {
-		// Extract from original to preserve any URL-encoded characters
-		if origMatch := Patterns.OAuthURL.FindString(output); origMatch != "" {
-			metadata["oauth_url"] = origMatch
-		} else {
-			metadata["oauth_url"] = match
+	state := StateIdle
+	latest := -1
+	for _, d := range stateDetectors {
+		if pos := lastMatchStart(d.pattern, normalizedOutput); pos > latest {
+			latest = pos
+			state = d.state
 		}
-		return StateAwaitingURL, metadata
 	}
 
-	// Check for paste prompt (means URL was shown, awaiting code)
-	if Patterns.PastePrompt.MatchString(normalizedOutput) {
-		// Try to extract URL from original output too
-		if match := Patterns.OAuthURL.FindString(output); match != "" {
-			metadata["oauth_url"] = match
+	// A limit banner in a session that is working is text it printed (a diff,
+	// say), not a limit: a stopped session shows no spinner.
+	if state == StateRateLimited && atBottom(normalizedOutput, Patterns.Busy) {
+		state = StateIdle
+	}
+
+	switch state {
+	case StateAwaitingURL:
+		if url := ExtractOAuthURL(output); url != "" {
+			metadata["oauth_url"] = url
 		}
-		return StateAwaitingURL, metadata
-	}
-
-	// Check for login method selection prompt
-	if Patterns.SelectMethod.MatchString(normalizedOutput) {
-		return StateAwaitingMethodSelect, metadata
-	}
-
-	// Check for rate limit last (lowest priority, as it might be in history)
-	if Patterns.RateLimit.MatchString(normalizedOutput) {
-		if match := Patterns.UsageLimitReset.FindStringSubmatch(normalizedOutput); len(match) > 1 {
-			metadata["reset_time"] = match[1]
+	case StateRateLimited:
+		if matches := Patterns.UsageLimitReset.FindAllStringSubmatch(normalizedOutput, -1); len(matches) > 0 {
+			metadata["reset_time"] = matches[len(matches)-1][1]
 		}
-		return StateRateLimited, metadata
+		if reset := limitResetText(normalizedOutput[latest:]); reset != "" {
+			metadata["reset_text"] = reset
+		}
 	}
-
-	return StateIdle, metadata
+	return state, metadata
 }
 
-// ExtractOAuthURL finds and returns the OAuth URL from output.
-// Uses ANSI-stripped output to ensure clean URL extraction without
-// terminal escape codes contaminating the URL.
+// limitResetText returns the reset of the limit banner that starts output,
+// as Claude Code wrote it ("3pm (America/New_York)"), or "".
+func limitResetText(output string) string {
+	line, _, _ := strings.Cut(output, "\n")
+	m := Patterns.LimitReset.FindStringSubmatch(line)
+	if m == nil {
+		return ""
+	}
+	return strings.TrimRight(strings.TrimSpace(m[1]), ".")
+}
+
+// lastMatchStart returns the start of the last match of re in s, or -1.
+func lastMatchStart(re *regexp.Regexp, s string) int {
+	locs := re.FindAllStringIndex(s, -1)
+	if len(locs) == 0 {
+		return -1
+	}
+	return locs[len(locs)-1][0]
+}
+
+// ExtractOAuthURL returns the most recent OAuth URL in the output, so a
+// retried login never reuses the URL of an earlier, abandoned attempt.
+// Matching runs on ANSI-stripped output so escape codes never become part of
+// the URL (e.g., a trailing \x1b[0m).
+//
+// A URL that runs to the end of its line continues on the following lines
+// that hold nothing but URL characters (inside optional indentation or
+// dialog borders): the terminal wrapped it (WezTerm's get-text keeps soft
+// wraps as line breaks) or Claude Code's layout did. A blank line or prose
+// ends it.
 func ExtractOAuthURL(output string) string {
-	// Always use normalized output for URL extraction to avoid ANSI codes
-	// being captured as part of the URL (e.g., trailing \x1b[0m)
-	normalizedOutput := StripANSI(output)
-	return Patterns.OAuthURL.FindString(normalizedOutput)
+	lines := strings.Split(StripANSI(output), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		locs := Patterns.OAuthURL.FindAllStringIndex(lines[i], -1)
+		if len(locs) == 0 {
+			continue
+		}
+		start, end := locs[len(locs)-1][0], locs[len(locs)-1][1]
+		url := strings.TrimRight(lines[i][start:end], boxBorders)
+		if strings.Trim(lines[i][end:], " \t"+boxBorders) != "" {
+			return url // text follows the URL on its line: it is whole
+		}
+		for _, next := range lines[i+1:] {
+			m := urlContinuation.FindStringSubmatch(next)
+			if m == nil {
+				break
+			}
+			url += m[1]
+		}
+		return url
+	}
+	return ""
 }
+
+// boxBorders frame Claude Code's dialogs.
+const boxBorders = "│┃|"
+
+// urlContinuation is a line holding only the next piece of a wrapped URL.
+var urlContinuation = regexp.MustCompile(`^[\s│┃|]*([A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+)[\s│┃|]*$`)
 
 // DetectCompactingBanner checks if the output contains a Claude Code compacting banner.
 // Returns true if detected, along with the matched text (useful for logging/debugging).

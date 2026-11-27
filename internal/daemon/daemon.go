@@ -17,7 +17,9 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/notify"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/update"
 )
 
 // DefaultCheckInterval is the default time between refresh checks.
@@ -47,7 +49,33 @@ type Config struct {
 	// MaxConcurrentRefreshes limits concurrent refresh operations when using AuthPool.
 	// Default: 3
 	MaxConcurrentRefreshes int
+
+	// Notifier receives alerts for credentials that need attention (failed
+	// refreshes, rejected logins, expiring sessions). Repeats of the same
+	// alert are suppressed for AlertInterval. Nil disables alerts.
+	Notifier notify.Notifier
+
+	// AlertInterval is the minimum time between identical alerts.
+	// Default: 1h
+	AlertInterval time.Duration
+
+	// UpdateChecker, when set, is asked every UpdateCheckInterval whether a
+	// newer caam release exists; each new version is announced once through
+	// Notifier. Nothing is installed.
+	UpdateChecker UpdateChecker
+
+	// UpdateCheckInterval is the time between update checks. Default: 24h
+	UpdateCheckInterval time.Duration
 }
+
+// UpdateChecker reports whether a newer caam release exists.
+type UpdateChecker interface {
+	Check(ctx context.Context) (*update.CheckResult, error)
+}
+
+// DefaultAlertInterval keeps a condition that persists across checks from
+// re-alerting every check interval.
+const DefaultAlertInterval = time.Hour
 
 // DefaultConfig returns the default daemon configuration.
 func DefaultConfig() *Config {
@@ -66,9 +94,15 @@ type Daemon struct {
 	logger      *log.Logger
 	logFile     *os.File // Log file handle for cleanup
 	pidFile     *os.File // PID file handle for locking
+	notifier    notify.Notifier
 
 	// backupScheduler handles automatic backups (may be nil if disabled)
 	backupScheduler *BackupScheduler
+
+	// lastUpdateCheck and announcedVersion pace update checks and keep each
+	// new release to one announcement. Used only by the run loop.
+	lastUpdateCheck  time.Time
+	announcedVersion string
 
 	// authPool manages pooled profile states (may be nil if not enabled)
 	authPool *authpool.AuthPool
@@ -84,6 +118,14 @@ type Daemon struct {
 	mu      sync.Mutex
 	running bool
 	stats   Stats
+
+	// reloginWarnings remembers logins already warned about across vault and
+	// live aliases. It is protected by mu; replacement logins have new fingerprints.
+	reloginWarnings map[string]string
+
+	// refreshSkips suppresses repeated notices, never refresh eligibility checks.
+	// It is protected by mu; a changed reason is reported on the next check.
+	refreshSkips map[string]string
 
 	configMu sync.RWMutex // Protects config access during runtime reloads
 }
@@ -133,6 +175,9 @@ func (d *Daemon) isVerbose() bool {
 
 // New creates a new daemon instance.
 func New(vault *authfile.Vault, healthStore *health.Storage, cfg *Config) *Daemon {
+	if vault != nil && healthStore != nil {
+		healthStore.SetVaultPath(vault.BasePath())
+	}
 	if cfg == nil {
 		cfg = DefaultConfig()
 	}
@@ -153,12 +198,22 @@ func New(vault *authfile.Vault, healthStore *health.Storage, cfg *Config) *Daemo
 		}
 	}
 
+	notifier := notify.Nop()
+	if cfg.Notifier != nil {
+		interval := cfg.AlertInterval
+		if interval <= 0 {
+			interval = DefaultAlertInterval
+		}
+		notifier = notify.NewThrottled(cfg.Notifier, interval)
+	}
+
 	d := &Daemon{
 		config:      cfg,
 		vault:       vault,
 		healthStore: healthStore,
 		logger:      logger,
 		logFile:     logFile,
+		notifier:    notifier,
 	}
 
 	// Initialize backup scheduler from global config
@@ -183,6 +238,7 @@ func (d *Daemon) initAuthPool() {
 	// Create pool with callbacks for logging
 	d.authPool = authpool.NewAuthPool(
 		authpool.WithVault(d.vault),
+		authpool.WithHealthStorage(d.healthStore),
 		authpool.WithRefreshThreshold(d.config.RefreshThreshold),
 		authpool.WithOnStateChange(func(profile *authpool.PooledProfile, oldStatus, newStatus authpool.PoolStatus) {
 			if d.isVerbose() {
@@ -211,23 +267,33 @@ func (d *Daemon) initAuthPool() {
 		CheckInterval:    d.config.CheckInterval,
 		RefreshThreshold: d.config.RefreshThreshold,
 		MaxConcurrent:    maxConcurrent,
+		RefreshTimeout:   30 * time.Second,
+		OnReconcileError: func(err error) {
+			d.logger.Printf("Pool: vault reconciliation failed: %v", err)
+		},
 		OnRefreshStart: func(provider, profile string) {
-			if d.isVerbose() {
-				d.logger.Printf("Pool: starting refresh for %s/%s", provider, profile)
-			}
+			d.logger.Printf("Pool: starting refresh for %s/%s", provider, profile)
+		},
+		OnRefreshSkipped: func(provider, profile string, err error) {
+			d.logRefreshSkip(provider, profile, err)
 		},
 		OnRefreshComplete: func(provider, profile string, newExpiry time.Time, err error) {
+			if refresh.IsSkipped(err) {
+				d.logger.Printf("Pool: %s/%s refresh skipped: %v", provider, profile, err)
+				return
+			}
 			d.mu.Lock()
-			if err != nil {
+			if err != nil && !refresh.IsDeliveryIncomplete(err) {
 				d.stats.RefreshErrors++
 				d.mu.Unlock()
 				d.logger.Printf("Pool: %s/%s refresh failed: %v", provider, profile, err)
 			} else {
 				d.stats.RefreshCount++
 				d.mu.Unlock()
-				if d.isVerbose() {
-					d.logger.Printf("Pool: %s/%s refreshed, expires %v",
-						provider, profile, newExpiry.Format(time.RFC3339))
+				d.logger.Printf("Pool: %s/%s refreshed, expires %v",
+					provider, profile, newExpiry.Format(time.RFC3339))
+				if err != nil {
+					d.logger.Printf("Pool: %s/%s credential delivery warning: %v", provider, profile, err)
 				}
 			}
 		},
@@ -354,6 +420,9 @@ func (d *Daemon) Stop() error {
 	}
 	d.running = false
 	d.mu.Unlock()
+	if d.cancel != nil {
+		d.cancel()
+	}
 
 	// Stop pool monitor if running
 	if d.poolMonitor != nil {
@@ -367,10 +436,6 @@ func (d *Daemon) Stop() error {
 				d.logger.Printf("Warning: failed to save pool state: %v", err)
 			}
 		}
-	}
-
-	if d.cancel != nil {
-		d.cancel()
 	}
 
 	// Wait for goroutines to finish with timeout
@@ -461,8 +526,11 @@ func (d *Daemon) runLoop() {
 	// Do an initial check immediately
 	if !shouldUsePoolRefresh() {
 		d.checkAndRefresh()
+	} else {
+		d.checkCursorSessions()
 	}
 	d.checkAndBackup()
+	d.checkForUpdate()
 
 	interval := d.getCheckInterval()
 	if interval <= 0 {
@@ -490,8 +558,11 @@ func (d *Daemon) runLoop() {
 			// Check each iteration in case pool monitor state changed
 			if !shouldUsePoolRefresh() {
 				d.checkAndRefresh()
+			} else {
+				d.checkCursorSessions()
 			}
 			d.checkAndBackup()
+			d.checkForUpdate()
 		}
 	}
 }
@@ -606,7 +677,7 @@ func (d *Daemon) checkAndRefresh() {
 		d.logger.Println("Checking profiles for refresh...")
 	}
 
-	providers := []string{"claude", "codex", "gemini", "opencode", "cursor"}
+	providers := []string{"claude", "codex", "gemini", "grok", "cursor"}
 	var totalChecked int64
 
 	// Use a semaphore to limit concurrency
@@ -623,6 +694,9 @@ func (d *Daemon) checkAndRefresh() {
 		}
 
 		for _, profile := range profiles {
+			if authfile.IsSystemProfile(profile) {
+				continue
+			}
 			totalChecked++
 			wg.Add(1)
 			sem <- struct{}{} // Acquire token
@@ -635,6 +709,7 @@ func (d *Daemon) checkAndRefresh() {
 	}
 
 	wg.Wait()
+	d.checkLiveCursorSession()
 
 	d.mu.Lock()
 	d.stats.ProfilesChecked += totalChecked
@@ -652,12 +727,46 @@ func (d *Daemon) checkProfile(provider, profile string) {
 	if ph == nil {
 		return
 	}
+	if provider == "cursor" {
+		if err := refresh.Preflight(provider, profile, d.vault); refresh.IsSkipped(err) {
+			d.logRefreshSkip(provider, profile, err)
+		}
+		d.warnCursorSession(profile, ph, time.Now())
+		return
+	}
+
+	// Decide from the current credential before announcing any attempt. Repeat
+	// this on every check so a backup can make a previously stale token usable.
+	if err := refresh.Preflight(provider, profile, d.vault); err != nil {
+		if refresh.IsSkipped(err) {
+			d.logRefreshSkip(provider, profile, err)
+		} else {
+			d.mu.Lock()
+			d.stats.RefreshErrors++
+			d.mu.Unlock()
+			d.logger.Printf("%s/%s: refresh preflight failed: %v", provider, profile, err)
+			d.alert(notify.Warning, "Credential check failed", provider, profile, err.Error(),
+				fmt.Sprintf("run 'caam doctor' or log in again and 'caam backup %s %s'", provider, profile))
+		}
+		return
+	}
+	if ph.SelfRefreshing {
+		d.logRefreshSkip(provider, profile, &refresh.UnsupportedError{
+			Provider: provider,
+			Reason:   fmt.Sprintf("the %s CLI renews this credential when it runs", provider),
+		})
+		return
+	}
 
 	// Check if refresh is needed
 	if !refresh.ShouldRefresh(ph, d.getRefreshThreshold()) {
 		if d.isVerbose() && !ph.TokenExpiresAt.IsZero() {
 			ttl := time.Until(ph.TokenExpiresAt)
-			d.logger.Printf("%s/%s: token OK (expires in %v)", provider, profile, ttl.Round(time.Minute))
+			if ttl > 0 {
+				d.logger.Printf("%s/%s: token OK (expires in %v)", provider, profile, ttl.Round(time.Minute))
+			} else {
+				d.logger.Printf("%s/%s: token expired (%v ago)", provider, profile, (-ttl).Round(time.Minute))
+			}
 		}
 		return
 	}
@@ -669,39 +778,135 @@ func (d *Daemon) checkProfile(provider, profile string) {
 	defer cancel()
 
 	err := refresh.RefreshProfile(ctx, provider, profile, d.vault, d.healthStore)
+	if refresh.IsSkipped(err) {
+		// Credentials may change after preflight. Always finish an announced
+		// attempt with its outcome, even when the result is a safe skip.
+		d.logger.Printf("%s/%s: refresh skipped: %v", provider, profile, err)
+		return
+	}
 
 	d.mu.Lock()
-	if err != nil {
+	if err != nil && !refresh.IsDeliveryIncomplete(err) {
 		d.stats.RefreshErrors++
 		d.mu.Unlock()
 
-		// Don't log unsupported errors as failures
-		var unsupErr *refresh.UnsupportedError
-		if ok := isUnsupportedError(err, &unsupErr); ok {
-			if d.isVerbose() {
-				d.logger.Printf("%s/%s: refresh not supported (%s)", provider, profile, unsupErr.Reason)
-			}
-		} else {
-			d.logger.Printf("%s/%s: refresh failed: %v", provider, profile, err)
-		}
+		d.logger.Printf("%s/%s: refresh failed: %v", provider, profile, err)
+		d.alertRefreshFailure(provider, profile, err)
 	} else {
 		d.stats.RefreshCount++
 		d.mu.Unlock()
-		d.logger.Printf("%s/%s: token refreshed successfully", provider, profile)
+		if updated := d.getProfileHealth(provider, profile); updated != nil && !updated.TokenExpiresAt.IsZero() {
+			d.logger.Printf("%s/%s: token refreshed successfully (new expiry %s)", provider, profile, updated.TokenExpiresAt.Format(time.RFC3339))
+		} else {
+			d.logger.Printf("%s/%s: token refreshed successfully (new expiry unavailable)", provider, profile)
+		}
+		if err != nil {
+			d.logger.Printf("%s/%s: credential delivery warning: %v", provider, profile, err)
+		}
 	}
+}
+
+// alert sends a notification; the notifier suppresses repeats.
+func (d *Daemon) alert(level notify.AlertLevel, title, provider, profile, message, action string) {
+	if d.notifier == nil {
+		return
+	}
+	label := provider
+	if profile != "" {
+		label = provider + "/" + profile
+	}
+	if err := d.notifier.Notify(&notify.Alert{
+		Level:     level,
+		Title:     title,
+		Message:   message,
+		Profile:   label,
+		Action:    action,
+		Timestamp: time.Now(),
+	}); err != nil {
+		d.logger.Printf("%s: alert delivery failed: %v", label, err)
+	}
+}
+
+// checkForUpdate asks whether a newer caam release exists when a check is
+// due and announces each new version once.
+func (d *Daemon) checkForUpdate() {
+	if d.config.UpdateChecker == nil {
+		return
+	}
+	interval := d.config.UpdateCheckInterval
+	if interval <= 0 {
+		interval = 24 * time.Hour
+	}
+	if !d.lastUpdateCheck.IsZero() && time.Since(d.lastUpdateCheck) < interval {
+		return
+	}
+	d.lastUpdateCheck = time.Now()
+
+	parent := d.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	res, err := d.config.UpdateChecker.Check(ctx)
+	if err != nil {
+		d.logger.Printf("update check failed: %v", err)
+		return
+	}
+	if res == nil || !res.UpdateAvailable || res.LatestVersion == d.announcedVersion {
+		return
+	}
+	d.announcedVersion = res.LatestVersion
+	d.logger.Printf("caam %s is available (running %s)", res.LatestVersion, res.CurrentVersion)
+	// The version is in the title: alerts are throttled per title, and each
+	// release deserves its own announcement.
+	d.alert(notify.Info, "caam "+res.LatestVersion+" available", "caam", "",
+		fmt.Sprintf("caam %s is available (running %s).", res.LatestVersion, res.CurrentVersion),
+		"caam update, then caam update --remotes for distributed coordinators")
+}
+
+// alertRefreshFailure distinguishes a rejected login, which needs a human,
+// from a failure that may clear on a later check.
+func (d *Daemon) alertRefreshFailure(provider, profile string, err error) {
+	var rejected *refresh.RefreshRejectedError
+	var reused *refresh.RefreshTokenReusedError
+	if errors.As(err, &rejected) || errors.As(err, &reused) {
+		d.alert(notify.Critical, "Login required", provider, profile,
+			fmt.Sprintf("the %s provider rejected this login", provider),
+			fmt.Sprintf("log in to %s again, then run 'caam backup %s %s'", provider, provider, profile))
+		return
+	}
+	d.alert(notify.Warning, "Token refresh failed", provider, profile, err.Error(),
+		"caam retries on the next check; run 'caam refresh "+provider+" "+profile+"' to retry now")
+}
+
+// logRefreshSkip reports a reason once per profile without suppressing future
+// preflight checks or treating a non-attempt as a refresh error.
+func (d *Daemon) logRefreshSkip(provider, profile string, err error) {
+	key := provider + "/" + profile
+	reason := err.Error()
+	d.mu.Lock()
+	if d.refreshSkips == nil {
+		d.refreshSkips = make(map[string]string)
+	}
+	if d.refreshSkips[key] == reason {
+		d.mu.Unlock()
+		return
+	}
+	d.refreshSkips[key] = reason
+	d.mu.Unlock()
+	d.logger.Printf("%s: not refreshed by caam (%s)", key, reason)
 }
 
 // getProfileHealth returns the health data for a profile.
 func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealth {
-	// First try the health store
+	var ph *health.ProfileHealth
 	if d.healthStore != nil {
-		ph, err := d.healthStore.GetProfile(provider, profile)
-		if err == nil && ph != nil && !ph.TokenExpiresAt.IsZero() {
-			return ph
-		}
+		ph, _ = d.healthStore.GetProfile(provider, profile)
 	}
 
-	// Fall back to parsing the auth files directly
+	// Expiry and renewal policy come from the current credential. Cached health
+	// retains account statistics but cannot make an absent or replaced login valid.
 	vaultPath := d.vault.ProfilePath(provider, profile)
 	var expiryInfo *health.ExpiryInfo
 	var err error
@@ -712,11 +917,14 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 	case "codex":
 		expiryInfo, err = health.ParseCodexExpiry(filepath.Join(vaultPath, "auth.json"))
 	case "gemini":
-		// Migrate legacy vault filename before reading.
-		_ = authfile.MigrateGeminiVaultDir(vaultPath)
+		// Passive health reads must not migrate an unused OAuth cache when
+		// settings select an API key or another native authentication method.
 		expiryInfo, err = health.ParseGeminiExpiry(vaultPath)
-	case "opencode", "cursor", "grok":
-		// No token expiry parsing for these providers yet
+	case "cursor":
+		expiryInfo, err = health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
+	case "grok":
+		expiryInfo, err = health.ParseGrokExpiry(filepath.Join(vaultPath, "auth.json"))
+	default:
 		return nil
 	}
 
@@ -724,9 +932,15 @@ func (d *Daemon) getProfileHealth(provider, profile string) *health.ProfileHealt
 		return nil
 	}
 
-	return &health.ProfileHealth{
-		TokenExpiresAt: expiryInfo.ExpiresAt,
+	if ph == nil {
+		ph = &health.ProfileHealth{}
 	}
+	ph.TokenExpiresAt = expiryInfo.ExpiresAt
+	ph.SelfRefreshing = expiryInfo.SelfRefreshing
+	ph.TokenRenewable = expiryInfo.Renewable
+	ph.ReloginWarningLead = expiryInfo.ReloginWarningLead
+	ph.CredentialFingerprint = expiryInfo.Fingerprint
+	return ph
 }
 
 // isUnsupportedError checks if an error is an UnsupportedError.
@@ -849,4 +1063,83 @@ func StopDaemonByPID(pid int) error {
 	}
 
 	return nil
+}
+
+// warnCursorSession logs once per login, without attempting an unsupported
+// refresh. A digest identifies replacement credentials even when they happen
+// to expire at the same instant; no token material is retained or logged.
+func (d *Daemon) warnCursorSession(profile string, ph *health.ProfileHealth, now time.Time) {
+	if ph == nil || ph.TokenExpiresAt.IsZero() || ph.CredentialRenewable() {
+		return
+	}
+	lead := ph.ReloginWarningLead
+	if lead <= 0 {
+		lead = health.CursorReloginLead
+	}
+	if ph.TokenExpiresAt.Sub(now) > lead {
+		return
+	}
+
+	fingerprint := ph.CredentialFingerprint
+	if fingerprint == "" {
+		fingerprint = ph.TokenExpiresAt.UTC().Format(time.RFC3339Nano)
+	}
+	key := fingerprint
+	d.mu.Lock()
+	if d.reloginWarnings == nil {
+		d.reloginWarnings = make(map[string]string)
+	}
+	if d.reloginWarnings[key] == fingerprint {
+		d.mu.Unlock()
+		return
+	}
+	d.reloginWarnings[key] = fingerprint
+	d.mu.Unlock()
+
+	action := health.CursorReloginInstructions(profile)
+	if profile == "" {
+		profile = "active"
+		action = "log in again with cursor-agent login"
+	}
+	ttl := ph.TokenExpiresAt.Sub(now)
+	if ttl <= 0 {
+		d.logger.Printf("cursor/%s: session EXPIRED; %s", profile, action)
+		d.alert(notify.Critical, "Session expired", "cursor", profile, "the Cursor session has expired", action)
+	} else {
+		d.logger.Printf("cursor/%s: session expires in %v; %s", profile, ttl.Round(time.Minute), action)
+		d.alert(notify.Warning, "Session expiring", "cursor", profile,
+			fmt.Sprintf("the Cursor session expires in %v", ttl.Round(time.Minute)), action)
+	}
+}
+
+// checkCursorSessions remains active when the auth pool handles renewable
+// providers. A session that needs a human login must still warn well before
+// the pool's short refresh threshold.
+func (d *Daemon) checkCursorSessions() {
+	profiles, err := d.vault.List("cursor")
+	if err == nil {
+		for _, profile := range profiles {
+			if !authfile.IsSystemProfile(profile) {
+				d.checkProfile("cursor", profile)
+			}
+		}
+	}
+	d.checkLiveCursorSession()
+}
+
+// checkLiveCursorSession inspects the current login using cursor-agent's
+// resolved paths, even when it has not been backed up to a named profile.
+func (d *Daemon) checkLiveCursorSession() {
+	info, err := health.ParseCursorExpiry("")
+	if err != nil || info == nil {
+		return
+	}
+	profile, _ := d.vault.ActiveProfile(authfile.CursorAuthFiles())
+	d.warnCursorSession(profile, &health.ProfileHealth{
+		TokenExpiresAt:        info.ExpiresAt,
+		SelfRefreshing:        info.SelfRefreshing,
+		TokenRenewable:        info.Renewable,
+		ReloginWarningLead:    info.ReloginWarningLead,
+		CredentialFingerprint: info.Fingerprint,
+	}, time.Now())
 }

@@ -4,11 +4,16 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
 // APIServer exposes the coordinator's HTTP API.
@@ -19,8 +24,40 @@ type APIServer struct {
 	token       string
 }
 
-// NewAPIServer creates a new API server.
-func NewAPIServer(coordinator *Coordinator, port int, logger *slog.Logger) *APIServer {
+// DefaultBindAddress keeps the coordinator API reachable only from the host
+// itself; agents reach it through an SSH tunnel.
+const DefaultBindAddress = "127.0.0.1"
+
+// ListenAddress joins a bind host and port into a listen address.
+func ListenAddress(bind string, port int) string {
+	bind = strings.TrimSpace(bind)
+	if bind == "" {
+		bind = DefaultBindAddress
+	}
+	return net.JoinHostPort(bind, strconv.Itoa(port))
+}
+
+// IsLoopbackBind reports whether a bind host only accepts local connections.
+func IsLoopbackBind(bind string) bool {
+	bind = strings.TrimSpace(bind)
+	if bind == "" || strings.EqualFold(bind, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(bind, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+// ValidateListenSecurity refuses to expose the API beyond loopback without a
+// shared secret: the API hands out OAuth URLs and accepts login codes.
+func ValidateListenSecurity(bind, token string) error {
+	if !IsLoopbackBind(bind) && strings.TrimSpace(token) == "" {
+		return fmt.Errorf("coordinator API bound to %q requires an auth token (set --auth-token, auth_token, or CAAM_COORDINATOR_TOKEN)", bind)
+	}
+	return nil
+}
+
+// NewAPIServer creates a new API server listening on bind:port.
+func NewAPIServer(coordinator *Coordinator, bind string, port int, logger *slog.Logger) *APIServer {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -43,7 +80,7 @@ func NewAPIServer(coordinator *Coordinator, port int, logger *slog.Logger) *APIS
 	mux.HandleFunc("GET /panes", api.authMiddleware(api.handleListPanes))
 
 	api.server = &http.Server{
-		Addr:         fmt.Sprintf("127.0.0.1:%d", port),
+		Addr:         ListenAddress(bind, port),
 		Handler:      api.withLogging(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
@@ -62,22 +99,37 @@ func (a *APIServer) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		auth := r.Header.Get("Authorization")
 		const prefix = "Bearer "
 		if !strings.HasPrefix(auth, prefix) {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			writeAPIError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		provided := strings.TrimSpace(auth[len(prefix):])
 		if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			a.logger.Warn("rejected coordinator API request",
+				"path", r.URL.Path,
+				"remote", r.RemoteAddr,
+				"reason", "invalid_token")
+			writeAPIError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		next(w, r)
 	}
 }
 
+// Addr returns the configured listen address.
+func (a *APIServer) Addr() string {
+	return a.server.Addr
+}
+
 // Start begins serving the API.
 func (a *APIServer) Start() error {
 	a.logger.Info("starting API server", "addr", a.server.Addr)
 	return a.server.ListenAndServe()
+}
+
+// Serve serves the API on an existing listener.
+func (a *APIServer) Serve(listener net.Listener) error {
+	a.logger.Info("starting API server", "addr", listener.Addr().String())
+	return a.server.Serve(listener)
 }
 
 // Shutdown gracefully stops the server.
@@ -101,6 +153,7 @@ type HealthResponse struct {
 	Status    string    `json:"status"`
 	Timestamp time.Time `json:"timestamp"`
 	Backend   string    `json:"backend"`
+	Version   string    `json:"version,omitempty"`
 	Uptime    string    `json:"uptime,omitempty"`
 }
 
@@ -109,6 +162,7 @@ func (a *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Status:    "ok",
 		Timestamp: time.Now(),
 		Backend:   a.coordinator.Backend(),
+		Version:   version.Short(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -118,6 +172,7 @@ func (a *APIServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 // StatusResponse is the response from /status endpoint.
 type StatusResponse struct {
 	Running        bool                 `json:"running"`
+	Version        string               `json:"version,omitempty"`
 	Backend        string               `json:"backend"`
 	PaneCount      int                  `json:"pane_count"`
 	PendingAuths   int                  `json:"pending_auths"`
@@ -133,6 +188,16 @@ type PaneStatusResponse struct {
 	RequestID    string    `json:"request_id,omitempty"`
 	Account      string    `json:"account,omitempty"`
 	Error        string    `json:"error,omitempty"`
+	Retries      int       `json:"retries,omitempty"` // login retries used this rate-limit episode
+	// LimitedAccount hit its usage limit in this pane (LimitReset is the
+	// banner's reset). Account fields are omitted without verified pane-bound
+	// evidence. HoldUntil, when set, is when a login may start again after the
+	// agent found no account free.
+	LimitedAccount        string     `json:"limited_account,omitempty"`
+	LimitedAccountID      string     `json:"limited_account_id,omitempty"`
+	LimitedOrganizationID string     `json:"limited_organization_id,omitempty"`
+	LimitReset            string     `json:"limit_reset,omitempty"`
+	HoldUntil             *time.Time `json:"hold_until,omitempty"`
 }
 
 func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -142,19 +207,30 @@ func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	panes := make([]PaneStatusResponse, 0, len(trackers))
 	for _, t := range trackers {
 		t.mu.RLock()
-		panes = append(panes, PaneStatusResponse{
-			PaneID:       t.PaneID,
-			State:        t.State.String(),
-			StateEntered: t.StateEntered,
-			RequestID:    t.RequestID,
-			Account:      t.UsedAccount,
-			Error:        t.ErrorMessage,
-		})
+		status := PaneStatusResponse{
+			PaneID:                t.PaneID,
+			State:                 t.State.String(),
+			StateEntered:          t.StateEntered,
+			RequestID:             t.RequestID,
+			Account:               t.UsedAccount,
+			Error:                 t.ErrorMessage,
+			Retries:               t.RetryCount,
+			LimitedAccount:        t.LimitedAccount,
+			LimitedAccountID:      t.LimitedAccountID,
+			LimitedOrganizationID: t.LimitedOrganizationID,
+			LimitReset:            t.LimitReset,
+		}
+		if t.HoldUntil.After(time.Now()) {
+			hold := t.HoldUntil
+			status.HoldUntil = &hold
+		}
+		panes = append(panes, status)
 		t.mu.RUnlock()
 	}
 
 	resp := StatusResponse{
 		Running:        true,
+		Version:        version.Short(),
 		Backend:        a.coordinator.Backend(),
 		PaneCount:      len(trackers),
 		PendingAuths:   len(pending),
@@ -166,8 +242,10 @@ func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// handleGetPending serves agents: fetching a request claims it, which
+// starts its AuthTimeout.
 func (a *APIServer) handleGetPending(w http.ResponseWriter, r *http.Request) {
-	pending := a.coordinator.GetPendingRequests()
+	pending := a.coordinator.ClaimPendingRequests()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(pending)
@@ -175,46 +253,79 @@ func (a *APIServer) handleGetPending(w http.ResponseWriter, r *http.Request) {
 
 // CompleteRequest is the request body for /auth/complete.
 type CompleteRequest struct {
-	RequestID string `json:"request_id"`
-	Code      string `json:"code"`
-	Account   string `json:"account"`
-	Error     string `json:"error,omitempty"`
+	RequestID  string    `json:"request_id"`
+	Code       string    `json:"code"`
+	Account    string    `json:"account"`
+	Error      string    `json:"error,omitempty"`
+	RetryAfter time.Time `json:"retry_after,omitzero"`
 }
+
+// CompleteAck acknowledges an accepted (or identically redelivered) response.
+type CompleteAck struct {
+	Status    string `json:"status"`
+	RequestID string `json:"request_id"`
+}
+
+// maxCompleteBody bounds /auth/complete bodies; a response is a few hundred bytes.
+const maxCompleteBody = 64 << 10
 
 func (a *APIServer) handleComplete(w http.ResponseWriter, r *http.Request) {
 	var req CompleteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCompleteBody)).Decode(&req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
-	if req.RequestID == "" {
-		http.Error(w, "request_id required", http.StatusBadRequest)
+	if strings.TrimSpace(req.RequestID) == "" {
+		writeAPIError(w, http.StatusBadRequest, "request_id required")
 		return
 	}
 
-	resp := AuthResponse(req)
-
-	if err := a.coordinator.ReceiveAuthResponse(resp); err != nil {
-		a.logger.Error("failed to process auth response",
+	if err := a.coordinator.ReceiveAuthResponse(AuthResponse(req)); err != nil {
+		status := completeErrorStatus(err)
+		a.logger.Warn("auth response rejected",
 			"request_id", req.RequestID,
+			"status", status,
 			"error", err)
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeAPIError(w, status, err.Error())
 		return
 	}
 
-	a.logger.Info("auth response received",
+	a.logger.Info("auth response acknowledged",
 		"request_id", req.RequestID,
 		"account", req.Account)
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(CompleteAck{Status: "accepted", RequestID: req.RequestID})
+}
+
+// completeErrorStatus maps acceptance errors to HTTP statuses. Agents retry
+// only transport failures and 5xx; every status here is final.
+func completeErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrInvalidAuthResponse):
+		return http.StatusBadRequest
+	case errors.Is(err, ErrAuthResponseConflict):
+		return http.StatusConflict
+	case errors.Is(err, ErrAuthRequestClosed):
+		return http.StatusGone
+	case errors.Is(err, ErrUnknownAuthRequest):
+		return http.StatusNotFound
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+func writeAPIError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"status": "error", "error": msg})
 }
 
 func (a *APIServer) handleListPanes(w http.ResponseWriter, r *http.Request) {
 	panes, err := a.coordinator.paneClient.ListPanes(r.Context())
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 

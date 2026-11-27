@@ -8,6 +8,28 @@ import (
 	"time"
 )
 
+func TestCursorReloginStateIsNotPersisted(t *testing.T) {
+	storage := NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	expiry := time.Now().Add(5 * 24 * time.Hour).Truncate(time.Second)
+	if err := storage.UpdateProfile("cursor", "work", &ProfileHealth{
+		TokenExpiresAt: expiry, ReloginWarningLead: CursorReloginLead,
+		TokenRenewable: true, SelfRefreshing: true, CredentialFingerprint: "synthetic-fingerprint",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := storage.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded := store.Profiles["cursor/work"]
+	if loaded == nil || !loaded.TokenExpiresAt.Equal(expiry) {
+		t.Fatalf("stored expiry did not survive: %+v", loaded)
+	}
+	if loaded.ReloginWarningLead != 0 || loaded.TokenRenewable || loaded.SelfRefreshing || loaded.CredentialFingerprint != "" {
+		t.Errorf("report-time credential properties must be re-read from auth.json: %+v", loaded)
+	}
+}
+
 func TestNewStorage(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "health.json")
@@ -182,10 +204,11 @@ func TestStorage_SetTokenExpiry(t *testing.T) {
 		t.Fatalf("SetTokenExpiry failed: %v", err)
 	}
 
-	profile, err := storage.GetProfile("gemini", "personal")
+	stored, err := storage.Load()
 	if err != nil {
-		t.Fatalf("GetProfile failed: %v", err)
+		t.Fatalf("Load failed: %v", err)
 	}
+	profile := stored.Profiles["gemini/personal"]
 	if !profile.TokenExpiresAt.Equal(expiry) {
 		t.Errorf("expiry time mismatch")
 	}
@@ -466,6 +489,9 @@ func TestStorage_GetStatus(t *testing.T) {
 	if err := storage.UpdateProfile("claude", "healthy", health); err != nil {
 		t.Fatalf("UpdateProfile failed: %v", err)
 	}
+	writeHealthVaultJSON(t, filepath.Join(tmpDir, "vault"), "claude", "healthy", ".credentials.json", map[string]any{
+		"claudeAiOauth": map[string]any{"accessToken": "synthetic-access", "expiresAt": health.TokenExpiresAt.UnixMilli()},
+	})
 
 	status, err = storage.GetStatus("claude", "healthy")
 	if err != nil {
@@ -482,6 +508,9 @@ func TestStorage_GetStatus(t *testing.T) {
 	if err := storage.UpdateProfile("claude", "expired", health); err != nil {
 		t.Fatalf("UpdateProfile failed: %v", err)
 	}
+	writeHealthVaultJSON(t, filepath.Join(tmpDir, "vault"), "claude", "expired", ".credentials.json", map[string]any{
+		"claudeAiOauth": map[string]any{"accessToken": "synthetic-access", "expiresAt": health.TokenExpiresAt.UnixMilli()},
+	})
 
 	status, err = storage.GetStatus("claude", "expired")
 	if err != nil {

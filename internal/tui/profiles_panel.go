@@ -14,20 +14,24 @@ import (
 
 // ProfileInfo represents a profile with all displayable information.
 type ProfileInfo struct {
-	Name           string
-	Badge          string
-	ProjectDefault bool
-	AuthMode       string
-	LoggedIn       bool
-	Locked         bool
-	LastUsed       time.Time
-	Account        string
-	Description    string // Free-form notes about this profile's purpose
-	IsActive       bool
-	HealthStatus   health.HealthStatus
-	TokenExpiry    time.Time
-	ErrorCount     int
-	Penalty        float64
+	Name               string
+	Badge              string
+	ProjectDefault     bool
+	AuthMode           string
+	LoggedIn           bool
+	Locked             bool
+	LastUsed           time.Time
+	Account            string
+	Description        string   // Free-form notes about this profile's purpose
+	Tags               []string // User tags (vault and isolated), used by search
+	IsActive           bool
+	HealthStatus       health.HealthStatus
+	TokenExpiry        time.Time
+	TokenRenewable     bool
+	LoginRequired      bool
+	ReloginWarningLead time.Duration
+	ErrorCount         int
+	Penalty            float64
 }
 
 // ProfilesPanel renders the center panel showing profiles for the selected provider.
@@ -226,6 +230,9 @@ func truncateWithEllipsis(s string, maxWidth int) string {
 // formatTUIStatus formats the health status string.
 func formatTUIStatus(pi *ProfileInfo) string {
 	icon := pi.HealthStatus.Icon()
+	if pi.LoginRequired {
+		return icon + " Login required"
+	}
 
 	if pi.TokenExpiry.IsZero() {
 		return icon + " " + formatStatusLabel(pi.HealthStatus)
@@ -233,7 +240,13 @@ func formatTUIStatus(pi *ProfileInfo) string {
 
 	ttl := time.Until(pi.TokenExpiry)
 	if ttl <= 0 {
+		if pi.TokenRenewable {
+			return icon + " Auto-refresh"
+		}
 		return icon + " Expired"
+	}
+	if !pi.TokenRenewable && pi.ReloginWarningLead > 0 && ttl <= pi.ReloginWarningLead {
+		return icon + " Login soon"
 	}
 
 	return icon + " " + formatDuration(ttl)
@@ -513,6 +526,20 @@ func (p *ProfilesPanel) View() string {
 			style = p.styles.Row
 		}
 		rows = append(rows, style.Render(rowStr))
+	}
+
+	// Show only the rows that fit the panel's height (title, column header
+	// and border take the rest), scrolled so the selection stays visible.
+	if p.height > 0 {
+		chrome := lipgloss.Height(title) + lipgloss.Height(header) + 2
+		fit := max(p.height-chrome, 1)
+		if len(rows) > fit {
+			start := 0
+			if p.selected >= fit {
+				start = min(p.selected-fit+1, len(rows)-fit)
+			}
+			rows = rows[start : start+fit]
+		}
 	}
 
 	// Combine header and rows

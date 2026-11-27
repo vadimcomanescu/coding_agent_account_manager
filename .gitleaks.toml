@@ -1,0 +1,11 @@
+# Upstream's tests carry fake JWTs and API keys as fixtures. Keep gitleaks'
+# default rules and skip only Go test files and testdata.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures with fake credentials"
+paths = [
+  '''_test\.go$''',
+  '''(^|/)testdata/''',
+]

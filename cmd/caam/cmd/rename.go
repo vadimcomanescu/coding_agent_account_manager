@@ -3,17 +3,20 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 )
 
 var renameCmd = &cobra.Command{
 	Use:   "rename <tool> <old-name> <new-name>",
-	Short: "Rename a profile (non-destructive copy)",
-	Long: `Rename a profile by creating a copy with a new name.
+	Short: "Rename a vault profile (non-destructive copy)",
+	Long: `Rename a vault profile by creating a copy with a new name.
 
 This is a NON-DESTRUCTIVE operation by default:
   - The original profile is preserved
@@ -21,6 +24,11 @@ This is a NON-DESTRUCTIVE operation by default:
   - Aliases pointing to the old name are optionally migrated
 
 To remove the old profile after copying, use --delete-old (requires confirmation).
+
+Only vault profiles (the ones 'caam backup' saves and 'caam activate' switches
+to) can be renamed. Isolated profiles from 'caam profile add' or 'caam auth
+import' are a separate store. To save an isolated Claude login to the vault:
+  caam backup claude <vault-name> --from-profile <isolated-name>
 
 Examples:
   caam rename claude auto-20260121-143022 work    # Copy to friendly name
@@ -36,6 +44,26 @@ func init() {
 	renameCmd.Flags().Bool("migrate-aliases", true, "migrate aliases from old to new profile")
 	renameCmd.Flags().Bool("json", false, "output in JSON format")
 	renameCmd.Flags().BoolP("yes", "y", false, "skip confirmation for --delete-old")
+}
+
+// renameMissingSourceError explains a rename whose source is not in the vault.
+// Rename copies vault profiles only. An isolated profile of the same name
+// (from `caam profile add` or `caam auth import`) lives in a different store,
+// so say that instead of "not found", and for Claude name the command that
+// saves an isolated login to the vault.
+func renameMissingSourceError(tool, oldName, newName string) error {
+	store := profileStore
+	if store == nil {
+		store = profile.NewStore(profile.DefaultStorePath())
+	}
+	if !store.Exists(tool, oldName) {
+		return fmt.Errorf("source profile %s/%s not found; run 'caam ls %s' to see available profiles", tool, oldName, tool)
+	}
+	if tool == "claude" {
+		return fmt.Errorf("%s/%s is an isolated profile, not a vault profile, and rename only copies vault profiles; to save it to the vault as %q without touching the live login, exit its session and run 'caam backup claude %s --from-profile %s'",
+			tool, oldName, newName, newName, oldName)
+	}
+	return fmt.Errorf("%s/%s is an isolated profile, not a vault profile, and rename only copies vault profiles", tool, oldName)
 }
 
 func runRename(cmd *cobra.Command, args []string) error {
@@ -74,10 +102,20 @@ func runRename(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if !oldExists {
-		return fmt.Errorf("source profile %s/%s not found; run 'caam ls %s' to see available profiles", tool, oldName, tool)
+		return renameMissingSourceError(tool, oldName, newName)
 	}
 	if newExists {
 		return fmt.Errorf("destination profile %s/%s already exists; choose a different name or delete it with 'caam delete %s %s'", tool, newName, tool, newName)
+	}
+
+	// The copy takes only the profile's top-level files. With --delete-old,
+	// refuse up front when the source holds anything else: deleting it
+	// afterwards would lose that data.
+	if deleteOld {
+		if uncopied := uncopiedProfileEntries(vault.ProfilePath(tool, oldName)); len(uncopied) > 0 {
+			return fmt.Errorf("not renaming %s/%s with --delete-old: it contains %s, which rename does not copy; run without --delete-old to copy its files and keep the original",
+				tool, oldName, strings.Join(uncopied, ", "))
+		}
 	}
 
 	// Copy the profile
@@ -122,9 +160,10 @@ func runRename(cmd *cobra.Command, args []string) error {
 	// Delete old profile if requested (with confirmation)
 	if deleteOld {
 		if !skipConfirm {
-			fmt.Printf("Delete old profile %s/%s? This cannot be undone. [y/N]: ", tool, oldName)
+			// Prompt on stderr so --json output on stdout stays parseable.
+			fmt.Fprintf(cmd.ErrOrStderr(), "Delete old profile %s/%s? This cannot be undone. [y/N]: ", tool, oldName)
 			var response string
-			fmt.Scanln(&response)
+			_, _ = fmt.Fscanln(cmd.InOrStdin(), &response)
 			if response != "y" && response != "Y" {
 				if jsonOutput {
 					result["deleted"] = false
@@ -169,4 +208,20 @@ func runRename(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  caam activate %s %s\n", tool, newName)
 
 	return nil
+}
+
+// uncopiedProfileEntries lists the entries in a vault profile directory that
+// Vault.CopyProfile does not copy (it copies top-level files only).
+func uncopiedProfileEntries(profileDir string) []string {
+	entries, err := os.ReadDir(profileDir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			out = append(out, e.Name()+"/")
+		}
+	}
+	return out
 }

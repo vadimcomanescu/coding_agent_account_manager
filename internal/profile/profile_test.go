@@ -2,11 +2,18 @@
 package profile
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // =============================================================================
@@ -637,6 +644,46 @@ func TestStoreLoad(t *testing.T) {
 	}
 }
 
+// Moved from the authfile package, whose tests may not import profile
+// (profile imports authfile for the isolated-to-vault backup bridge).
+func TestStoreLoadCorruptedProfileJSON(t *testing.T) {
+	store := NewStore(t.TempDir())
+	prof, err := store.Create("codex", "corrupt-test", "oauth")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(prof.BasePath, "profile.json"), []byte("{ invalid json"), 0600); err != nil {
+		t.Fatalf("corrupt profile.json: %v", err)
+	}
+	if _, err := store.Load("codex", "corrupt-test"); err == nil {
+		t.Fatal("expected Load() to fail for a corrupted profile.json")
+	}
+}
+
+func TestStoreCreatedProfileLockRoundTrip(t *testing.T) {
+	store := NewStore(t.TempDir())
+	prof, err := store.Create("codex", "lock-test", "oauth")
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if err := prof.Lock(); err != nil {
+		t.Fatalf("Lock() error = %v", err)
+	}
+	if !prof.IsLocked() {
+		t.Fatal("profile should be locked")
+	}
+	info, err := prof.GetLockInfo()
+	if err != nil || info == nil || info.PID != os.Getpid() {
+		t.Fatalf("GetLockInfo() = %+v, %v; want this process", info, err)
+	}
+	if err := prof.Unlock(); err != nil {
+		t.Fatalf("Unlock() error = %v", err)
+	}
+	if prof.IsLocked() {
+		t.Fatal("profile should be unlocked")
+	}
+}
+
 func TestStoreDelete(t *testing.T) {
 	tmpDir := t.TempDir()
 	store := NewStore(tmpDir)
@@ -999,6 +1046,237 @@ func TestStoreCloneWithAuthSymlinkedCodexHome(t *testing.T) {
 
 	if n := cloned.CountAuthFiles(); n == 0 {
 		t.Errorf("CountAuthFiles() = 0, want > 0 after copying auth through symlink")
+	}
+}
+
+func TestStoreCloneWithAuthHandlesInteriorPassthroughs(t *testing.T) {
+	store := NewStore(t.TempDir())
+	source, err := store.Create("claude", "source", "oauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shared, "unrelated-secret"), []byte("synthetic-tool-credential"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	links := []string{
+		filepath.Join(source.HomePath(), ".ssh"),
+		filepath.Join(source.HomePath(), ".cargo"),
+		filepath.Join(source.HomePath(), ".config", "gh"),
+		filepath.Join(source.HomePath(), ".local", "share", "atuin"),
+		filepath.Join(source.HomePath(), ".local", "state", "tool"),
+		filepath.Join(source.HomePath(), ".claude", "skills"),
+		filepath.Join(source.XDGConfigPath(), "gh"),
+		filepath.Join(source.XDGConfigPath(), "claude-code", "plugins"),
+	}
+	for _, link := range links {
+		if err := os.MkdirAll(filepath.Dir(link), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(shared, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	credential := filepath.Join(t.TempDir(), "credential.json")
+	want := `{"claudeAiOauth":{"accessToken":"synthetic-clone-token"}}`
+	if err := os.WriteFile(credential, []byte(want), 0644); err != nil {
+		t.Fatal(err)
+	}
+	relCredential := filepath.Join("xdg_config", "claude-code", ".credentials.json")
+	if err := os.Symlink(credential, filepath.Join(source.BasePath, relCredential)); err != nil {
+		t.Fatal(err)
+	}
+	privatePath := filepath.Join("home", ".config", "cursor", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(source.BasePath, privatePath)), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source.BasePath, privatePath), []byte("synthetic-private-config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotImportProfile(t, source.BasePath)
+	if _, err := store.Create("claude", "copy", "oauth"); err != nil {
+		t.Fatal(err)
+	}
+	cloned, err := store.Clone("claude", "source", "copy", CloneOptions{WithAuth: true, Force: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshotImportProfile(t, source.BasePath); !reflect.DeepEqual(got, before) {
+		t.Fatal("cloning changed the source profile")
+	}
+	for _, link := range links {
+		rel, err := filepath.Rel(source.BasePath, link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(filepath.Join(cloned.BasePath, rel)); !os.IsNotExist(err) {
+			t.Fatalf("ambient passthrough %s was copied into the credential snapshot: %v", rel, err)
+		}
+	}
+	path := filepath.Join(cloned.BasePath, relCredential)
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
+		t.Fatalf("cloned credential is not a private regular file: %v, %v", info, err)
+	}
+	if err := os.WriteFile(credential, []byte("changed original credential"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != want {
+		t.Fatalf("clone shares the original credential: %q, %v", data, err)
+	}
+	data, err = os.ReadFile(filepath.Join(cloned.BasePath, privatePath))
+	if err != nil || string(data) != "synthetic-private-config" {
+		t.Fatalf("private XDG provider data was skipped: %q, %v", data, err)
+	}
+}
+
+func TestStoreClonePreparationFailurePreservesTarget(t *testing.T) {
+	for _, failure := range []string{"directory link", "provider directory link", "dangling link", "dangling root", "file root", "redirected source"} {
+		for _, existing := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/existing=%t", failure, existing), func(t *testing.T) {
+				store := NewStore(t.TempDir())
+				source := seedImportProfile(t, store, "source")
+				targetPath := store.ProfilePath("codex", "target")
+				var before map[string]importProfileEntry
+				if existing {
+					target := seedImportProfile(t, store, "target")
+					before = snapshotImportProfile(t, target.BasePath)
+				}
+				badPath := filepath.Join(source.XDGConfigPath(), "codex", "nested")
+				if err := os.MkdirAll(filepath.Dir(badPath), 0700); err != nil {
+					t.Fatal(err)
+				}
+				switch failure {
+				case "directory link":
+					if err := os.Symlink(t.TempDir(), badPath); err != nil {
+						t.Fatal(err)
+					}
+				case "provider directory link":
+					if err := os.Symlink(t.TempDir(), filepath.Join(source.HomePath(), ".claude")); err != nil {
+						t.Fatal(err)
+					}
+				case "dangling link":
+					if err := os.Symlink(filepath.Join(t.TempDir(), "missing"), badPath); err != nil {
+						t.Fatal(err)
+					}
+				case "dangling root", "file root":
+					if err := os.RemoveAll(source.CodexHomePath()); err != nil {
+						t.Fatal(err)
+					}
+					if failure == "dangling root" {
+						if err := os.Symlink(filepath.Join(t.TempDir(), "missing"), source.CodexHomePath()); err != nil {
+							t.Fatal(err)
+						}
+					} else if err := os.WriteFile(source.CodexHomePath(), []byte("not a credential directory"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				case "redirected source":
+					redirected := *source
+					redirected.BasePath = t.TempDir()
+					data, err := json.Marshal(redirected)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(source.MetaPath(), data, 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				sourceBefore := snapshotImportProfile(t, source.BasePath)
+				if _, err := store.Clone("codex", "source", "target", CloneOptions{WithAuth: true, Force: true}); err == nil {
+					t.Fatal("clone accepted an unusable credential source")
+				}
+				if got := snapshotImportProfile(t, source.BasePath); !reflect.DeepEqual(got, sourceBefore) {
+					t.Fatal("failed clone changed the source profile")
+				}
+				if existing {
+					if got := snapshotImportProfile(t, targetPath); !reflect.DeepEqual(got, before) {
+						t.Fatal("failed force clone changed the existing target")
+					}
+				} else if _, err := os.Lstat(targetPath); !os.IsNotExist(err) {
+					t.Fatalf("failed clone published a partial target: %v", err)
+				}
+				if _, err := os.Lstat(source.LockPath()); !os.IsNotExist(err) {
+					t.Fatalf("failed clone left its source locked: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestStoreCloneForceRetainsPreviousAndHonorsLocks(t *testing.T) {
+	for _, locked := range []string{"", "source", "target"} {
+		t.Run("locked="+locked, func(t *testing.T) {
+			store := NewStore(t.TempDir())
+			source := seedImportProfile(t, store, "source")
+			target := seedImportProfile(t, store, "target")
+			if err := os.WriteFile(filepath.Join(source.CodexHomePath(), "auth.json"), []byte(`{"OPENAI_API_KEY":"synthetic-new-key"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if locked != "" {
+				p := source
+				if locked == "target" {
+					p = target
+				}
+				if err := p.Lock(); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = p.Unlock() })
+			}
+			before := snapshotImportProfile(t, target.BasePath)
+			cloned, err := store.Clone("codex", "source", "target", CloneOptions{WithAuth: true, Force: true})
+			if locked != "" {
+				if err == nil {
+					t.Fatal("clone ignored an active profile lock")
+				}
+				if got := snapshotImportProfile(t, target.BasePath); !reflect.DeepEqual(got, before) {
+					t.Fatal("clone changed a locked profile's target")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			backups, err := filepath.Glob(filepath.Join(store.basePath, ".imports", "codex-target-*", "previous"))
+			if err != nil || len(backups) != 1 {
+				t.Fatalf("previous target was not retained: %v, %v", backups, err)
+			}
+			if got := snapshotImportProfile(t, backups[0]); !reflect.DeepEqual(got, before) {
+				t.Fatal("retained target lost credentials or metadata")
+			}
+			data, err := os.ReadFile(filepath.Join(cloned.CodexHomePath(), "auth.json"))
+			if err != nil || string(data) != `{"OPENAI_API_KEY":"synthetic-new-key"}` {
+				t.Fatalf("clone did not publish the source credential: %q, %v", data, err)
+			}
+			profiles, err := store.List("codex")
+			if err != nil || len(profiles) != 2 {
+				t.Fatalf("recovery entered profile listing: %v, %v", profiles, err)
+			}
+		})
+	}
+}
+
+func TestStoreCloneWithVertexADC(t *testing.T) {
+	store := NewStore(t.TempDir())
+	source, err := store.Create("gemini", "vertex", "vertex-adc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adcDir := filepath.Join(source.BasePath, "gcloud")
+	if err := os.MkdirAll(adcDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	want := `{"type":"authorized_user","client_id":"synthetic-client","refresh_token":"synthetic-refresh"}`
+	if err := os.WriteFile(filepath.Join(adcDir, "application_default_credentials.json"), []byte(want), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cloned, err := store.Clone("gemini", "vertex", "copy", CloneOptions{WithAuth: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(cloned.BasePath, "gcloud", "application_default_credentials.json"))
+	if err != nil || string(data) != want {
+		t.Fatalf("clone lost Vertex ADC credentials: %q, %v", data, err)
 	}
 }
 
@@ -1492,7 +1770,7 @@ func TestLoadIdentity_ClaudeXDGCredentials(t *testing.T) {
 		}
 	})
 
-	t.Run("legacy home-side credentials win when both exist", func(t *testing.T) {
+	t.Run("selected XDG credentials win when both exist", func(t *testing.T) {
 		prof := &Profile{
 			Name:     "second",
 			Provider: "claude",
@@ -1507,8 +1785,8 @@ func TestLoadIdentity_ClaudeXDGCredentials(t *testing.T) {
 		if prof.Identity == nil {
 			t.Fatal("Identity should be loaded")
 		}
-		if prof.Identity.PlanType != "legacy-plan" {
-			t.Errorf("PlanType = %q, want legacy path to take precedence", prof.Identity.PlanType)
+		if prof.Identity.PlanType != "xdg-plan" {
+			t.Errorf("PlanType = %q, want the selected XDG store", prof.Identity.PlanType)
 		}
 	})
 }
@@ -1541,9 +1819,9 @@ func writeClaudeCredentialsExpiring(t *testing.T, path, subscriptionType string,
 }
 
 // TestLoadIdentity_ClaudeStaleLegacyPrecedence is a regression test for issue
-// #72: a stale (expired or corrupt) legacy home/.claude/.credentials.json
-// must not shadow fresh XDG-side credentials, and when both are valid the
-// fresher expiry wins.
+// #72: a stale legacy home/.claude/.credentials.json must not shadow the
+// selected XDG-side credentials. Native selection also remains authoritative
+// when the ignored legacy token happens to have the later expiry (issue #132).
 func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
 	legacyPath := func(prof *Profile) string {
 		return filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
@@ -1592,7 +1870,7 @@ func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
 		}
 	})
 
-	t.Run("both valid: fresher expiry wins", func(t *testing.T) {
+	t.Run("both valid: XDG selection wins regardless of expiry", func(t *testing.T) {
 		prof := newProf(t)
 		writeClaudeCredentialsExpiring(t, legacyPath(prof), "legacy-plan", future)
 		writeClaudeCredentialsExpiring(t, xdgPath(prof), "xdg-plan", fresher)
@@ -1605,7 +1883,7 @@ func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
 			t.Errorf("PlanType = %q, want the fresher-expiry (XDG) identity", prof.Identity.PlanType)
 		}
 
-		// Mirror case: legacy fresher -> legacy wins.
+		// A later legacy expiry must not change which account is reported.
 		prof2 := newProf(t)
 		writeClaudeCredentialsExpiring(t, legacyPath(prof2), "legacy-plan", fresher)
 		writeClaudeCredentialsExpiring(t, xdgPath(prof2), "xdg-plan", future)
@@ -1614,10 +1892,118 @@ func TestLoadIdentity_ClaudeStaleLegacyPrecedence(t *testing.T) {
 		if prof2.Identity == nil {
 			t.Fatal("Identity should be loaded")
 		}
-		if prof2.Identity.PlanType != "legacy-plan" {
-			t.Errorf("PlanType = %q, want the fresher-expiry (legacy) identity", prof2.Identity.PlanType)
+		if prof2.Identity.PlanType != "xdg-plan" {
+			t.Errorf("PlanType = %q, want the selected XDG identity", prof2.Identity.PlanType)
 		}
 	})
+}
+
+func writeBoundProfileClaudeCredential(t *testing.T, path, org string, expires time.Time) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{
+			"accessToken": "synthetic-access-" + org, "refreshToken": "synthetic-refresh-" + org,
+			"expiresAt": expires.UnixMilli(), "subscriptionType": org,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := identity.ClaudeCredentialFingerprint(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := &identity.ClaudeIdentityBinding{
+		Identity: identity.Identity{Provider: "claude", AccountID: "shared-account", OrganizationID: org,
+			Organization: org, Email: "same@example.com", Verified: true},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Unix(1700000000, 0),
+	}
+	metadata, err := json.Marshal(map[string]interface{}{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string][]byte{path: data, filepath.Join(filepath.Dir(path), identity.ClaudeIdentityCacheFile): metadata} {
+		if err := os.WriteFile(name, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return data
+}
+
+func TestLoadIdentityClaudeUsesSelectedOrganizationAcrossRestart(t *testing.T) {
+	store := NewStore(t.TempDir())
+	prof, err := store.Create("claude", "team", "oauth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour).Truncate(time.Second)
+	xdg := filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json")
+	legacy := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
+	writeBoundProfileClaudeCredential(t, xdg, "team-org", past)
+	writeBoundProfileClaudeCredential(t, legacy, "personal-org", time.Now().Add(8*time.Hour))
+	prof.Identity = &identity.Identity{Provider: "claude", OrganizationID: "cached-wrong-org", Verified: true}
+	if err := prof.Save(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		loaded, err := store.Load("claude", "team")
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := loaded.Identity
+		if id == nil || !id.Verified || id.OrganizationID != "team-org" || id.AccountID != "shared-account" ||
+			id.Email != "same@example.com" || !id.ExpiresAt.Equal(past) {
+			t.Fatalf("load did not preserve the selected expired Team identity: %+v", id)
+		}
+		if dir, err := loaded.ClaudeConfigDir(); err != nil || dir != filepath.Dir(xdg) {
+			t.Fatalf("identity disagrees with native source: %q, %v", dir, err)
+		}
+		if err := loaded.Save(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestLoadIdentityClaudeDoesNotReviveIgnoredOrPersistedIdentity(t *testing.T) {
+	for _, changed := range []string{"stale cache", "invalid cache", "malformed credential", "selected helper"} {
+		t.Run(changed, func(t *testing.T) {
+			prof := &Profile{Name: "team", Provider: "claude", BasePath: t.TempDir(),
+				Identity: &identity.Identity{Provider: "claude", AccountID: "cached-account", OrganizationID: "cached-org", Verified: true}}
+			xdg := filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json")
+			legacy := filepath.Join(prof.HomePath(), ".claude", ".credentials.json")
+			writeBoundProfileClaudeCredential(t, legacy, "personal-org", time.Now().Add(8*time.Hour))
+			if err := os.MkdirAll(filepath.Dir(xdg), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if changed == "selected helper" {
+				if err := os.WriteFile(filepath.Join(filepath.Dir(xdg), "settings.json"), []byte(`{"apiKeyHelper":"selected-helper"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				writeBoundProfileClaudeCredential(t, xdg, "team-org", time.Now().Add(-time.Hour))
+				path, replacement := xdg, []byte(`{"claudeAiOauth":{"accessToken":"replacement","refreshToken":"replacement-refresh"}}`)
+				switch changed {
+				case "invalid cache":
+					path, replacement = filepath.Join(filepath.Dir(xdg), identity.ClaudeIdentityCacheFile), []byte(`{"claude_identity":`)
+				case "malformed credential":
+					replacement = []byte(`{"claudeAiOauth":`)
+				}
+				if err := os.WriteFile(path, replacement, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			prof.LoadIdentity()
+			if id := prof.Identity; id != nil && (id.Verified || id.AccountID != "" || id.OrganizationID != "" || id.Email != "") {
+				t.Fatalf("reported another generation's identity: %+v", id)
+			}
+			if dir, err := prof.ClaudeConfigDir(); err != nil || dir != filepath.Dir(xdg) {
+				t.Fatalf("ignored legacy login replaced the selected source: %q, %v", dir, err)
+			}
+		})
+	}
 }
 
 // TestProfileEnsureLayout covers issue #104: a profile whose profile.json
@@ -1693,4 +2079,421 @@ func TestProfileEnsureLayout(t *testing.T) {
 			t.Error("EnsureLayout() = nil, want an error when a file blocks the layout")
 		}
 	})
+}
+
+func TestStoreImportPublishesCompleteFinalPaths(t *testing.T) {
+	store := NewStore(t.TempDir())
+	var staged string
+	result, err := store.Import(context.Background(), "codex", "work", "oauth", false, func(p *Profile) error {
+		staged = p.BasePath
+		p.AuthMode = "api-key"
+		p.Description = "Imported work account"
+		p.Metadata["purpose"] = "development"
+		if err := os.WriteFile(filepath.Join(p.CodexHomePath(), "auth.json"), []byte(`{"OPENAI_API_KEY":"synthetic-import"}`), 0600); err != nil {
+			return err
+		}
+		// Even a provider that writes metadata during preparation must remain
+		// invisible until the complete prepared directory is published.
+		if err := p.Save(); err != nil {
+			return err
+		}
+		all, err := store.ListAll()
+		if err != nil {
+			return err
+		}
+		if len(all) != 0 || store.Exists("codex", "work") {
+			t.Errorf("staged import is already routable: %v", all)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := filepath.Abs(store.ProfilePath("codex", "work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Profile.BasePath != target || result.BackupPath != "" {
+		t.Fatalf("unexpected import result: %+v", result)
+	}
+	loaded, err := store.Load("codex", "work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.BasePath != target || loaded.AuthMode != "api-key" || loaded.Description != "Imported work account" || loaded.Metadata["purpose"] != "development" {
+		t.Fatalf("final metadata was not published: %+v", loaded)
+	}
+	if loaded.IsLocked() {
+		t.Fatal("published profile remained locked after import")
+	}
+	for _, path := range []string{loaded.BasePath, loaded.HomePath(), loaded.XDGConfigPath(), loaded.CodexHomePath()} {
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() || info.Mode().Perm() != 0700 {
+			t.Fatalf("profile directory is not private: %s, %v", path, err)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(loaded.CodexHomePath(), "auth.json")); err != nil || string(data) != `{"OPENAI_API_KEY":"synthetic-import"}` {
+		t.Fatalf("published credential is unavailable at final path: %v", err)
+	}
+	if _, err := os.Lstat(staged); !os.IsNotExist(err) {
+		t.Fatalf("prepared profile remained behind: %v", err)
+	}
+	all, err := store.ListAll()
+	if err != nil || len(all) != 1 || len(all["codex"]) != 1 || all["codex"][0].Name != "work" {
+		t.Fatalf("published profile listing: %v, %v", all, err)
+	}
+}
+
+func TestStoreImportFailurePreservesProfiles(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		name := "new"
+		if existing {
+			name = "existing"
+		}
+		for _, failure := range []string{"prepare", "canceled before import", "canceled during preparation", "changed identity"} {
+			t.Run(name+"/"+failure, func(t *testing.T) {
+				store := NewStore(t.TempDir())
+				target := store.ProfilePath("codex", "work")
+				var previous map[string]importProfileEntry
+				if existing {
+					seedImportProfile(t, store, "work")
+					previous = snapshotImportProfile(t, target)
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				if failure == "canceled before import" {
+					cancel()
+				}
+				called := false
+				preparationFailure := errors.New("synthetic import failure")
+				_, err := store.Import(ctx, "codex", "work", "oauth", existing, func(p *Profile) error {
+					called = true
+					if err := os.WriteFile(filepath.Join(p.CodexHomePath(), "auth.json"), []byte("incomplete"), 0600); err != nil {
+						return err
+					}
+					if err := p.Save(); err != nil {
+						return err
+					}
+					visible, err := store.List("codex")
+					if err != nil {
+						return err
+					}
+					want := 0
+					if existing {
+						want = 1
+					}
+					if len(visible) != want {
+						t.Errorf("preparation changed routable profile count: %d, want %d", len(visible), want)
+					}
+					switch failure {
+					case "prepare":
+						return preparationFailure
+					case "canceled during preparation":
+						cancel()
+					case "changed identity":
+						p.Name = "other"
+					}
+					return nil
+				})
+				if err == nil {
+					t.Fatal("failed preparation published a profile")
+				}
+				if failure == "prepare" && !errors.Is(err, preparationFailure) {
+					t.Fatalf("preparation error was lost: %v", err)
+				}
+				if failure == "canceled before import" && called {
+					t.Fatal("canceled import called the provider")
+				}
+				if existing {
+					if after := snapshotImportProfile(t, target); !reflect.DeepEqual(previous, after) {
+						t.Fatal("failed forced import changed the existing profile")
+					}
+				} else {
+					if _, err := os.Lstat(target); !os.IsNotExist(err) {
+						t.Fatalf("failed import left a destination: %v", err)
+					}
+					all, err := store.ListAll()
+					if err != nil || len(all) != 0 {
+						t.Fatalf("failed import remained listed: %v, %v", all, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestStoreImportForceRetainsCompletePreviousProfile(t *testing.T) {
+	store := NewStore(t.TempDir())
+	previous := seedImportProfile(t, store, "work")
+	before := snapshotImportProfile(t, previous.BasePath)
+	result, err := store.Import(context.Background(), "codex", "work", "oauth", true, func(p *Profile) error {
+		p.Description = "Replacement account"
+		return os.WriteFile(filepath.Join(p.CodexHomePath(), "auth.json"), []byte(`{"access_token":"synthetic-replacement"}`), 0600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BackupPath == "" || result.BackupPath == result.Profile.BasePath {
+		t.Fatalf("previous profile has no recovery directory: %+v", result)
+	}
+	if after := snapshotImportProfile(t, result.BackupPath); !reflect.DeepEqual(before, after) {
+		t.Fatal("replacement did not retain complete previous metadata, history, settings and credentials")
+	}
+	loaded, err := store.Load("codex", "work")
+	if err != nil || loaded.Description != "Replacement account" || loaded.IsLocked() {
+		t.Fatalf("replacement not ready: %+v, %v", loaded, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(loaded.CodexHomePath(), "auth.json")); err != nil || string(data) != `{"access_token":"synthetic-replacement"}` {
+		t.Fatalf("replacement credential not published: %v", err)
+	}
+	all, err := store.ListAll()
+	if err != nil || len(all) != 1 || len(all["codex"]) != 1 {
+		t.Fatalf("recovery copy became a routable account: %v, %v", all, err)
+	}
+}
+
+func TestStoreImportPreservesLockedProfile(t *testing.T) {
+	store := NewStore(t.TempDir())
+	previous := seedImportProfile(t, store, "work")
+	if err := previous.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer previous.Unlock()
+	before := snapshotImportProfile(t, previous.BasePath)
+	called := false
+	_, err := store.Import(context.Background(), "codex", "work", "oauth", true, func(*Profile) error {
+		called = true
+		return nil
+	})
+	if err == nil || called {
+		t.Fatalf("locked profile reached preparation: called=%v, err=%v", called, err)
+	}
+	if after := snapshotImportProfile(t, previous.BasePath); !reflect.DeepEqual(before, after) {
+		t.Fatal("failed import modified an in-use profile or its lock")
+	}
+}
+
+func TestStoreImportSerializesCompetingMutationsAndRunners(t *testing.T) {
+	for _, existing := range []bool{false, true} {
+		name := "new"
+		if existing {
+			name = "existing"
+		}
+		t.Run(name, func(t *testing.T) {
+			base := t.TempDir()
+			store := NewStore(base)
+			seedImportProfile(t, store, "source")
+			if existing {
+				seedImportProfile(t, store, "work")
+			}
+			started, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			t.Cleanup(unblock)
+			done := make(chan error, 1)
+			go func() {
+				_, err := store.Import(context.Background(), "codex", "work", "oauth", existing, func(p *Profile) error {
+					close(started)
+					<-release
+					return os.WriteFile(filepath.Join(p.CodexHomePath(), "auth.json"), []byte(`{"access_token":"synthetic-import"}`), 0600)
+				})
+				done <- err
+			}()
+			select {
+			case <-started:
+			case err := <-done:
+				t.Fatalf("import never reached preparation: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("import preparation timed out")
+			}
+			other := NewStore(base)
+			runner := &Profile{Name: "work", Provider: "codex", BasePath: store.ProfilePath("codex", "work")}
+			attempts := []struct {
+				name string
+				run  func() error
+			}{
+				{"create", func() error { _, err := other.Create("codex", "work", "oauth"); return err }},
+				{"delete", func() error { return other.Delete("codex", "work") }},
+				{"clone", func() error { _, err := other.Clone("codex", "source", "work", CloneOptions{Force: true}); return err }},
+				{"import", func() error {
+					_, err := other.Import(context.Background(), "codex", "work", "oauth", true, func(*Profile) error { return nil })
+					return err
+				}},
+				{"runner lock", runner.Lock},
+				{"runner stale-lock cleanup", runner.LockWithCleanup},
+			}
+			for _, attempt := range attempts {
+				if err := attempt.run(); err == nil {
+					t.Errorf("competing %s succeeded during import", attempt.name)
+				}
+			}
+			if !existing {
+				if _, err := os.Lstat(runner.BasePath); !os.IsNotExist(err) {
+					t.Errorf("runner or competing mutation recreated unpublished destination: %v", err)
+				}
+			}
+			if _, err := other.Create("codex", "unrelated", "oauth"); err != nil {
+				t.Errorf("import blocked an unrelated profile: %v", err)
+			}
+			unblock()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("original import failed after contention: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("import failed to finish")
+			}
+			if err := runner.Lock(); err != nil {
+				t.Fatalf("finished import left runner blocked: %v", err)
+			}
+			if err := runner.Unlock(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestStoreImportRejectsChangedDestinationWithoutRemovingOtherLock(t *testing.T) {
+	store := NewStore(t.TempDir())
+	previous := seedImportProfile(t, store, "work")
+	before := snapshotImportProfile(t, previous.BasePath)
+	moved := filepath.Join(t.TempDir(), "moved-original")
+	const competingLock = "synthetic lock belonging to another writer"
+	_, err := store.Import(context.Background(), "codex", "work", "oauth", true, func(*Profile) error {
+		if err := os.Rename(previous.BasePath, moved); err != nil {
+			return err
+		}
+		replacement := &Profile{Name: "work", Provider: "codex", BasePath: previous.BasePath}
+		if err := replacement.EnsureLayout(); err != nil {
+			return err
+		}
+		if err := replacement.Save(); err != nil {
+			return err
+		}
+		// Simulate an external writer replacing the directory. It does not use
+		// CAAM's mutation gate, so identity checks must preserve its lock.
+		return os.WriteFile(replacement.LockPath(), []byte(competingLock), 0600)
+	})
+	if err == nil {
+		t.Fatal("changed destination was overwritten")
+	}
+	if data, err := os.ReadFile(previous.LockPath()); err != nil || string(data) != competingLock {
+		t.Fatalf("cleanup removed or changed the other writer's lock: %v", err)
+	}
+	after := snapshotImportProfile(t, moved)
+	delete(after, ".lock") // The outside writer moved the original lock with its directory.
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("changed-destination handling lost original profile data")
+	}
+}
+
+func TestStoreImportRejectsUnsafeDestinationPaths(t *testing.T) {
+	for _, kind := range []string{"target file", "target symlink", "provider symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			store := NewStore(t.TempDir())
+			outside := t.TempDir()
+			sentinel := filepath.Join(outside, "keep")
+			if err := os.WriteFile(sentinel, []byte("unrelated native data"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			parent := filepath.Dir(store.ProfilePath("codex", "work"))
+			if kind == "provider symlink" {
+				if err := os.Symlink(outside, parent); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.MkdirAll(parent, 0700); err != nil {
+					t.Fatal(err)
+				}
+				target := store.ProfilePath("codex", "work")
+				if kind == "target file" {
+					if err := os.WriteFile(target, []byte("existing unrelated file"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.Symlink(outside, target); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := snapshotImportProfile(t, outside)
+			blocked := store.ProfilePath("codex", "work")
+			if kind == "provider symlink" {
+				blocked = parent
+			}
+			blockedBefore := snapshotImportProfile(t, blocked)
+			called := false
+			_, err := store.Import(context.Background(), "codex", "work", "oauth", true, func(*Profile) error { called = true; return nil })
+			if err == nil || called {
+				t.Fatalf("unsafe destination reached preparation: called=%v, err=%v", called, err)
+			}
+			if after := snapshotImportProfile(t, outside); !reflect.DeepEqual(before, after) {
+				t.Fatal("unsafe import modified unrelated native files")
+			}
+			if after := snapshotImportProfile(t, blocked); !reflect.DeepEqual(blockedBefore, after) {
+				t.Fatal("unsafe import replaced the blocking file or symlink")
+			}
+		})
+	}
+}
+
+type importProfileEntry struct {
+	Mode    os.FileMode
+	Data    string
+	Link    string
+	ModTime int64
+}
+
+func snapshotImportProfile(t *testing.T, root string) map[string]importProfileEntry {
+	t.Helper()
+	result := make(map[string]importProfileEntry)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		entry := importProfileEntry{Mode: info.Mode()}
+		if info.Mode()&os.ModeSymlink != 0 {
+			entry.Link, err = os.Readlink(path)
+		} else if info.Mode().IsRegular() {
+			var data []byte
+			data, err = os.ReadFile(path)
+			entry.Data, entry.ModTime = string(data), info.ModTime().UnixNano()
+		}
+		result[rel] = entry
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func seedImportProfile(t *testing.T, store *Store, name string) *Profile {
+	t.Helper()
+	p, err := store.Create("codex", name, "api-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Description = "Existing account with important state"
+	p.Tags = []string{"work"}
+	p.Metadata["custom"] = "retained setting"
+	p.BrowserCommand = "configured-browser"
+	if err := p.Save(); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		filepath.Join(p.CodexHomePath(), "auth.json"):  `{"OPENAI_API_KEY":"synthetic-old-key"}`,
+		filepath.Join(p.HomePath(), "session.json"):    `{"history":["important work"]}`,
+		filepath.Join(p.XDGConfigPath(), "settings"):   "private account settings",
+		filepath.Join(p.BasePath, "unknown-state.bin"): "unknown metadata must survive",
+	}
+	for path, data := range files {
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return p
 }

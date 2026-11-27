@@ -6,10 +6,258 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 )
+
+func TestParseCursorExpiry(t *testing.T) {
+	exp := time.Now().Add(11 * 24 * time.Hour).Truncate(time.Second)
+	token := unsignedJWT(t, map[string]any{"type": "session", "exp": exp.Unix()})
+	for _, tc := range []struct {
+		name, access, key string
+		wantErr           bool
+	}{
+		{"session", token, "", false},
+		{"API key", token, "synthetic-key", false},
+		{"key only", "", "synthetic-key", false},
+		{"malformed session", "invalid", "", true},
+		{"missing exp", unsignedJWT(t, map[string]any{"type": "session"}), "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "auth.json")
+			data, err := json.Marshal(map[string]string{"accessToken": tc.access, "refreshToken": tc.access, "apiKey": tc.key})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			info, err := ParseCursorExpiry(path)
+			if tc.wantErr {
+				if !errors.Is(err, ErrNoExpiry) {
+					t.Fatalf("error = %v, want ErrNoExpiry", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Renewable != (tc.key != "") || info.SelfRefreshing != (tc.key != "") || info.HasRefreshToken {
+				t.Fatalf("incorrect renewal semantics: %+v", info)
+			}
+			if tc.access != "" && !info.ExpiresAt.Equal(exp) {
+				t.Fatalf("expiry = %v, want %v", info.ExpiresAt, exp)
+			}
+			if tc.key == "" && info.ReloginWarningLead != 7*24*time.Hour {
+				t.Fatal("missing session lead")
+			}
+			if tc.key != "" && info.ReloginWarningLead != 0 {
+				t.Fatal("API key should not warn for relogin")
+			}
+		})
+	}
+	if _, err := ParseCursorExpiry(filepath.Join(t.TempDir(), "missing")); !errors.Is(err, ErrNoAuthFile) {
+		t.Fatalf("missing error = %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(path, []byte(`{`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseCursorExpiry(path); err == nil || errors.Is(err, ErrNoExpiry) {
+		t.Fatalf("JSON error = %v", err)
+	}
+
+	t.Run("live platform path", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		t.Setenv("USERPROFILE", home)
+		t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+		t.Setenv("APPDATA", filepath.Join(home, "appdata"))
+		t.Setenv("CURSOR_CONFIG_DIR", filepath.Join(home, "config-only"))
+		path := authfile.ResolveCursorPaths(home, runtime.GOOS, os.Getenv).AuthFile
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := json.Marshal(map[string]string{"accessToken": token, "refreshToken": token})
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		info, err := ParseCursorExpiry("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Source != path || !info.ExpiresAt.Equal(exp) {
+			t.Fatalf("live parse = %+v", info)
+		}
+	})
+}
+
+func TestParseCursorExpiryCredentialKinds(t *testing.T) {
+	expiry := time.Date(2030, 10, 6, 12, 0, 0, 0, time.UTC)
+	session := unsignedJWT(t, map[string]any{"exp": expiry.Unix(), "type": "session"})
+	// A process-level key must never make a different vault account renewable.
+	t.Setenv("CURSOR_API_KEY", "SYNTHETIC-AMBIENT-KEY")
+
+	for _, tc := range []struct {
+		name      string
+		auth      map[string]any
+		renewable bool
+		expiry    time.Time
+	}{
+		{"session duplicates token", map[string]any{"accessToken": session, "refreshToken": session}, false, expiry},
+		{"different refresh token still cannot renew", map[string]any{"accessToken": session, "refreshToken": "SYNTHETIC-REFRESH"}, false, expiry},
+		{"access token only", map[string]any{"accessToken": session}, false, expiry},
+		{"blank key is not renewable", map[string]any{"accessToken": session, "refreshToken": session, "apiKey": " \t"}, false, expiry},
+		{"stored API key", map[string]any{"accessToken": session, "refreshToken": session, "apiKey": "SYNTHETIC-KEY"}, true, expiry},
+		{"API key can mint missing token", map[string]any{"apiKey": "SYNTHETIC-KEY"}, true, time.Time{}},
+		{"API key can replace malformed token", map[string]any{"accessToken": "opaque", "apiKey": "SYNTHETIC-KEY"}, true, time.Time{}},
+		{"epoch deadline is expired not unknown", map[string]any{"accessToken": unsignedJWT(t, map[string]any{"exp": 0})}, false, time.Unix(0, 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "auth.json")
+			writeJSON(t, path, tc.auth)
+			info, err := ParseCursorExpiry(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !info.ExpiresAt.Equal(tc.expiry) {
+				t.Errorf("ExpiresAt = %v, want %v", info.ExpiresAt, tc.expiry)
+			}
+			if info.Renewable != tc.renewable || info.SelfRefreshing != tc.renewable {
+				t.Errorf("Renewable=%v SelfRefreshing=%v, want both %v", info.Renewable, info.SelfRefreshing, tc.renewable)
+			}
+			if info.HasRefreshToken {
+				t.Error("Cursor's refreshToken is not a usable refresh credential")
+			}
+			wantLead := CursorReloginLead
+			if tc.renewable {
+				wantLead = 0
+			}
+			if info.ReloginWarningLead != wantLead {
+				t.Errorf("ReloginWarningLead = %v, want %v", info.ReloginWarningLead, wantLead)
+			}
+			if info.NeedsRefresh(100 * 365 * 24 * time.Hour) {
+				t.Error("Cursor session/API-key expiry must not request a caam refresh")
+			}
+			if info.Source != path || len(info.Fingerprint) != 64 {
+				t.Errorf("missing source or credential fingerprint: source=%q, fingerprint length=%d", info.Source, len(info.Fingerprint))
+			}
+		})
+	}
+}
+
+func TestParseCursorExpiryErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want error
+	}{
+		{"empty auth", `{}`, ErrNoExpiry},
+		{"malformed JWT", `{"accessToken":"not-a-jwt","refreshToken":"present"}`, ErrNoExpiry},
+		{"no exp claim", `{"accessToken":"` + unsignedJWT(t, map[string]any{"type": "session"}) + `"}`, ErrNoExpiry},
+		{"invalid exp claim", `{"accessToken":"` + unsignedJWT(t, map[string]any{"exp": "later"}) + `"}`, ErrNoExpiry},
+		{"refresh JWT is not the access token", `{"refreshToken":"` + unsignedJWT(t, map[string]any{"exp": 2000000000}) + `"}`, ErrNoExpiry},
+		{"top level expiry does not replace JWT", `{"expiresAt":2000000000}`, ErrNoExpiry},
+		{"malformed JSON", `{`, nil},
+		{"wrong token type", `{"accessToken":123}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "auth.json")
+			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			info, err := ParseCursorExpiry(path)
+			if info != nil || err == nil {
+				t.Fatalf("ParseCursorExpiry = %+v, %v; want no info and an error", info, err)
+			}
+			if tc.want != nil && !errors.Is(err, tc.want) {
+				t.Errorf("error = %v, want %v", err, tc.want)
+			}
+			if tc.want == nil && errors.Is(err, ErrNoExpiry) {
+				t.Errorf("malformed auth must return a parsing error, got %v", err)
+			}
+		})
+	}
+	t.Run("missing file", func(t *testing.T) {
+		if _, err := ParseCursorExpiry(filepath.Join(t.TempDir(), "auth.json")); !errors.Is(err, ErrNoAuthFile) {
+			t.Errorf("error = %v, want ErrNoAuthFile", err)
+		}
+	})
+	t.Run("unreadable path", func(t *testing.T) {
+		if _, err := ParseCursorExpiry(t.TempDir()); err == nil || errors.Is(err, ErrNoAuthFile) {
+			t.Errorf("error = %v, want a read error", err)
+		}
+	})
+}
+
+func TestParseCursorExpiryLivePaths(t *testing.T) {
+	for _, useXDG := range []bool{false, true} {
+		t.Run(strconv.FormatBool(useXDG), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("USERPROFILE", home)
+			t.Setenv("APPDATA", filepath.Join(home, "roaming"))
+			t.Setenv("XDG_CONFIG_HOME", "")
+			if useXDG {
+				t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "custom-xdg"))
+			}
+			configDir := filepath.Join(home, "separate-cursor-config")
+			t.Setenv("CURSOR_CONFIG_DIR", configDir)
+			path := authfile.ResolveCursorPaths(home, runtime.GOOS, os.Getenv).AuthFile
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			expiry := time.Now().Add(11 * 24 * time.Hour).Truncate(time.Second)
+			writeJSON(t, path, map[string]any{"accessToken": unsignedJWT(t, map[string]any{"exp": expiry.Unix()})})
+			if err := os.MkdirAll(configDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			// Config and credentials have separate resolvers. Reading this
+			// decoy would incorrectly claim that the live session can renew.
+			writeJSON(t, filepath.Join(configDir, "auth.json"), map[string]any{"apiKey": "SYNTHETIC-DECOY"})
+			info, err := ParseCursorExpiry("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Source != path || !info.ExpiresAt.Equal(expiry) || info.Renewable {
+				t.Errorf("live expiry did not use resolved credential path: %+v", info)
+			}
+			if all := ParseAllExpiry(); all["cursor"] == nil || !all["cursor"].ExpiresAt.Equal(expiry) {
+				t.Error("ParseAllExpiry omitted the live Cursor expiry")
+			}
+		})
+	}
+}
+
+func TestCursorLoginFingerprint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "auth.json")
+	parse := func(token, key string) *ExpiryInfo {
+		t.Helper()
+		writeJSON(t, path, map[string]any{"accessToken": token, "refreshToken": token, "apiKey": key})
+		info, err := ParseCursorExpiry(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info
+	}
+	firstToken := unsignedJWT(t, map[string]any{"exp": 2000000000, "jti": "first-login"})
+	secondToken := unsignedJWT(t, map[string]any{"exp": 2000000000, "jti": "second-login"})
+	first := parse(firstToken, "")
+	if second := parse(secondToken, ""); second.Fingerprint == first.Fingerprint {
+		t.Error("replacement login must reset warning identity even with the same expiry")
+	}
+	if repeat := parse(firstToken, ""); repeat.Fingerprint != first.Fingerprint {
+		t.Error("unchanged login must retain its warning identity")
+	}
+	keyLogin := parse(firstToken, "SYNTHETIC-KEY")
+	if rotated := parse(secondToken, "SYNTHETIC-KEY"); rotated.Fingerprint != keyLogin.Fingerprint {
+		t.Error("routine API-key token rotation must retain the key identity")
+	}
+}
 
 func TestParseOAuthFile(t *testing.T) {
 	testdata := "testdata"
@@ -414,6 +662,97 @@ func TestParseGeminiExpiry_OAuthCredsFileWithoutSettingsReturnsNoExpiry(t *testi
 	_, err := ParseGeminiExpiry(tmpDir)
 	if err != ErrNoExpiry {
 		t.Fatalf("expected ErrNoExpiry, got %v", err)
+	}
+}
+
+func TestParseGeminiExpiryCurrentCacheIsAuthoritative(t *testing.T) {
+	for _, tc := range []struct {
+		name, current string
+		wantErr       bool
+	}{
+		{"refreshable current", `{"refresh_token":"synthetic-current-refresh","access_token":"synthetic-current-access","expiry":"2025-12-18T14:00:00Z"}`, false},
+		{"access only current", `{"access_token":"synthetic-current-access","expiry":"2025-12-18T14:00:00Z"}`, false},
+		{"empty current", `{}`, true},
+		{"malformed current", `{`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, file := range []string{"settings.json", "oauth_credentials.json"} {
+				if err := os.WriteFile(filepath.Join(dir, file), []byte(`{"refresh_token":"synthetic-other-refresh","expiry":"2030-01-01T00:00:00Z"}`), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			currentPath := filepath.Join(dir, "oauth_creds.json")
+			if err := os.WriteFile(currentPath, []byte(tc.current), 0600); err != nil {
+				t.Fatal(err)
+			}
+			info, err := ParseGeminiExpiry(dir)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("invalid current source fell back to a stale login: %+v", info)
+				}
+				return
+			}
+			if err != nil || info == nil || info.Source != currentPath || info.ExpiresAt.Year() != 2025 {
+				t.Fatalf("current source not selected: %+v, %v", info, err)
+			}
+			if info.Renewable != (tc.name == "refreshable current") {
+				t.Fatalf("borrowed renewability from another file: %+v", info)
+			}
+		})
+	}
+}
+
+func TestParseGeminiExpiry_LegacyOAuthSnapshot(t *testing.T) {
+	expiry := time.Date(2025, time.December, 18, 14, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name        string
+		body        string
+		renewable   bool
+		currentBody string
+		wantErr     error
+	}{
+		{name: "expired access", body: `{"access_token":"synthetic-legacy","expiry":"2025-12-18T14:00:00Z"}`},
+		{name: "refreshable access", body: `{"access_token":"synthetic-legacy","refresh_token":"synthetic-refresh","expiry":"2025-12-18T14:00:00Z"}`, renewable: true},
+		{name: "unknown expiry stays distinct from missing file", body: `{"access_token":"synthetic-legacy"}`, wantErr: ErrNoExpiry},
+		{name: "current filename takes priority", body: `{"access_token":"synthetic-legacy","expiry":"2020-01-01T00:00:00Z"}`, currentBody: `{"access_token":"synthetic-current","expiry":"2025-12-18T14:00:00Z"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			legacyPath := filepath.Join(dir, "oauth_credentials.json")
+			if err := os.WriteFile(legacyPath, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			currentPath := filepath.Join(dir, "oauth_creds.json")
+			if tc.currentBody != "" {
+				if err := os.WriteFile(currentPath, []byte(tc.currentBody), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			info, err := ParseGeminiExpiry(dir)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("ParseGeminiExpiry error = %v, want %v", err, tc.wantErr)
+			}
+			if err == nil {
+				wantSource := legacyPath
+				if tc.currentBody != "" {
+					wantSource = currentPath
+				}
+				if info.Source != wantSource || !info.ExpiresAt.Equal(expiry) || info.Renewable != tc.renewable || info.HasRefreshToken != tc.renewable {
+					t.Fatalf("unexpected expiry info: %+v", info)
+				}
+			}
+			if got, err := os.ReadFile(legacyPath); err != nil || string(got) != tc.body {
+				t.Fatalf("passive read changed legacy snapshot: %v", err)
+			}
+			if tc.currentBody == "" {
+				if _, err := os.Stat(currentPath); !os.IsNotExist(err) {
+					t.Fatalf("passive read migrated legacy snapshot: %v", err)
+				}
+			} else if got, err := os.ReadFile(currentPath); err != nil || string(got) != tc.currentBody {
+				t.Fatalf("passive read changed current snapshot: %v", err)
+			}
+		})
 	}
 }
 
@@ -1007,6 +1346,48 @@ func TestParseCodexExpiry_ChatGPTMode(t *testing.T) {
 		}
 		if !info.HasRefreshToken {
 			t.Error("HasRefreshToken = false, want true")
+		}
+	})
+
+	t.Run("opaque access token uses refreshed lifetime before stale identity expiry", func(t *testing.T) {
+		for _, explicit := range []any{accessExp.Unix(), accessExp.Format(time.RFC3339)} {
+			path := writeCodexAuthJSON(t, map[string]any{
+				"tokens": map[string]any{
+					"access_token": "synthetic-opaque-access", "refresh_token": "synthetic-renewable",
+					"expires_at": explicit,
+					"id_token":   unsignedJWT(t, map[string]any{"exp": idExp.Unix()}),
+				},
+			})
+			info, err := ParseCodexExpiry(path)
+			if err != nil || !info.ExpiresAt.Equal(accessExp) || !info.Renewable {
+				t.Fatalf("refreshed lifetime was lost: info=%+v err=%v", info, err)
+			}
+		}
+	})
+
+	t.Run("current access JWT outranks stale nested refresh metadata", func(t *testing.T) {
+		path := writeCodexAuthJSON(t, map[string]any{
+			"tokens": map[string]any{
+				"access_token": unsignedJWT(t, map[string]any{"exp": accessExp.Unix()}),
+				"expires_at":   idExp.Unix(),
+			},
+		})
+		info, err := ParseCodexExpiry(path)
+		if err != nil || !info.ExpiresAt.Equal(accessExp) {
+			t.Fatalf("stale metadata overrode the native access token: info=%+v err=%v", info, err)
+		}
+	})
+
+	t.Run("unparseable nested expiry still permits identity fallback", func(t *testing.T) {
+		path := writeCodexAuthJSON(t, map[string]any{
+			"tokens": map[string]any{
+				"access_token": "synthetic-opaque-access", "expires_at": "unknown",
+				"id_token": unsignedJWT(t, map[string]any{"exp": accessExp.Unix()}),
+			},
+		})
+		info, err := ParseCodexExpiry(path)
+		if err != nil || !info.ExpiresAt.Equal(accessExp) {
+			t.Fatalf("valid expiry fallback was lost: info=%+v err=%v", info, err)
 		}
 	})
 

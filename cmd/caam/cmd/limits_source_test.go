@@ -1,18 +1,373 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 )
+
+type limitsCountingLogScanner struct{ scans atomic.Int32 }
+
+func (s *limitsCountingLogScanner) Scan(_ context.Context, _ string, since time.Time) (*logs.ScanResult, error) {
+	s.scans.Add(1)
+	now := time.Now()
+	return &logs.ScanResult{Since: since, Until: now, Entries: []*logs.LogEntry{
+		{Timestamp: now.Add(-3 * time.Hour), TotalTokens: 1000},
+		{Timestamp: now.Add(-2 * time.Hour), TotalTokens: 1000},
+		{Timestamp: now.Add(-time.Hour), TotalTokens: 1000},
+	}}, nil
+}
+
+func (*limitsCountingLogScanner) LogDir() string { return "" }
+
+func limitsSourceFixture(t *testing.T) *namespaceFixture {
+	t.Helper()
+	f := newNamespaceFixture(t)
+	f.vaultDir, f.lookup.VaultDir = getVaultDir(), getVaultDir()
+	oldProfiles := profileStore
+	profileStore = f.store
+	t.Cleanup(func() { profileStore = oldProfiles })
+	t.Setenv("CAAM_SHALLOW_HOMES_DIR", f.shallow.BaseDir())
+	return f
+}
+
+// Create a listed profile without requiring it to hold a usable credential.
+func limitsSourceCredentialPath(t *testing.T, f *namespaceFixture, provider, source, name string) string {
+	t.Helper()
+	var path string
+	switch source {
+	case credNamespaceVault:
+		file := "auth.json"
+		if provider == "claude" {
+			file = ".credentials.json"
+		}
+		path = filepath.Join(f.vaultDir, provider, name, file)
+	case credNamespaceIsolated:
+		p, err := f.store.Create(provider, name, "oauth")
+		if err != nil {
+			t.Fatal(err)
+		}
+		path = filepath.Join(p.CodexHomePath(), "auth.json")
+		if provider == "claude" {
+			path = filepath.Join(p.XDGConfigPath(), "claude-code", ".credentials.json")
+		}
+	case credNamespaceShallow:
+		if _, err := f.shallow.Create(name, shallow.CreateOptions{Provider: provider}); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		path, err = f.shallow.CredentialPath(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unexpected fixture source %q", source)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// Issue #139: batching inside MultiProfileFetcher is ineffective when limits
+// invokes it separately for every profile in the selected namespace.
+func TestLimitsNamespaceScansLogsOnce(t *testing.T) {
+	for _, provider := range []string{"codex", "claude"} {
+		for _, source := range credNamespaces {
+			t.Run(provider+"/"+source, func(t *testing.T) {
+				responses := make(map[string]string)
+				for i := 0; i < 13; i++ {
+					responses[fmt.Sprintf("seat-%02d", i)] = subscriptionQuotaResponse(provider, i*5)
+				}
+				responses["seat-12"] = "" // A failed API read must keep its diagnostic row.
+				setupSubscriptionQuotaProfiles(t, provider, responses)
+				f := limitsSourceFixture(t)
+				credential := func(token string) string {
+					if provider == "claude" {
+						return fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"expiresAt":4102444800000}}`, token)
+					}
+					return fmt.Sprintf(`{"access_token":%q}`, token)
+				}
+				for name := range responses {
+					path := limitsSourceCredentialPath(t, f, provider, source, name)
+					writeQuotaSelectionFile(t, path, credential(name))
+					if source != credNamespaceVault {
+						// The same name in another namespace belongs to another login.
+						other := limitsSourceCredentialPath(t, f, provider, credNamespaceVault, name)
+						writeQuotaSelectionFile(t, other, credential("ignored-"+name))
+					}
+				}
+				for _, name := range []string{"missing", "malformed"} {
+					path := limitsSourceCredentialPath(t, f, provider, source, name)
+					if name == "malformed" {
+						writeQuotaSelectionFile(t, path, "{")
+					}
+					otherSource := credNamespaceVault
+					if source == credNamespaceVault {
+						otherSource = credNamespaceIsolated
+					}
+					other := limitsSourceCredentialPath(t, f, provider, otherSource, name)
+					writeQuotaSelectionFile(t, other, credential("ignored-"+name))
+				}
+				transport := http.DefaultTransport
+				var requests atomic.Int32
+				http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+					requests.Add(1)
+					return transport.RoundTrip(req)
+				})
+				scanner := &limitsCountingLogScanner{}
+				fetcher := usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner))
+				for invocation, profileName := range []string{"", "seat-00"} {
+					cmd := quotaAdviceCommand("", "", false)
+					for flag, value := range map[string]string{"source": source, "profile": profileName} {
+						if err := cmd.Flags().Set(flag, value); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var output bytes.Buffer
+					cmd.SetOut(&output)
+					if err := runLimitsWithFetcher(cmd, []string{provider}, fetcher); err != nil {
+						t.Fatal(err)
+					}
+					var rows []usage.ProfileUsage
+					if err := json.Unmarshal(output.Bytes(), &rows); err != nil {
+						t.Fatal(err)
+					}
+					wantRows := 13
+					if profileName != "" {
+						wantRows = 1
+					}
+					if len(rows) != wantRows || scanner.scans.Load() != int32(invocation+1) || requests.Load() != int32(13+invocation) {
+						t.Fatalf("profile=%q: rows=%d scans=%d requests=%d; want %d rows, %d scans, %d requests",
+							profileName, len(rows), scanner.scans.Load(), requests.Load(), wantRows, invocation+1, 13+invocation)
+					}
+					seen := make(map[string]bool)
+					for _, row := range rows {
+						if _, ok := responses[row.ProfileName]; !ok || seen[row.ProfileName] || row.Provider != provider || row.Usage == nil || row.Usage.ProfileName != row.ProfileName {
+							t.Fatalf("lost profile identity or returned an unusable credential: %+v", row)
+						}
+						seen[row.ProfileName] = true
+						if rate := row.Usage.BurnRate; rate == nil || rate.SampleSize != 3 || rate.TokensPerHour != 1500 {
+							t.Fatalf("%s lost the shared burn-rate data: %+v", row.ProfileName, rate)
+						}
+						if row.ProfileName == "seat-12" {
+							if !strings.Contains(row.Usage.Error, "503") {
+								t.Fatalf("API failure lost its diagnostic: %+v", row.Usage)
+							}
+						} else {
+							i, err := strconv.Atoi(strings.TrimPrefix(row.ProfileName, "seat-"))
+							if err != nil || row.Usage.Error != "" || row.Usage.SecondaryWindow == nil || row.Usage.SecondaryWindow.UsedPercent != i*5 {
+								t.Fatalf("%s read another profile's quota: %+v", row.ProfileName, row.Usage)
+							}
+						}
+						if profileName != "" && (row.ProfileName != profileName || row.CredentialSource == nil || row.CredentialSource.Namespace != source) {
+							t.Fatalf("named profile selection changed: %+v", row)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestLimitsCachedNamespacesDoNotFetchOrScan(t *testing.T) {
+	for _, source := range append([]string{""}, credNamespaces...) {
+		t.Run("source="+source, func(t *testing.T) {
+			setupSubscriptionQuotaProfiles(t, "claude", nil)
+			f := limitsSourceFixture(t)
+			ns := source
+			if ns == "" {
+				ns = credNamespaceVault
+			}
+			for i := 0; i < 13; i++ {
+				name := fmt.Sprintf("seat-%02d", i)
+				limitsSourceCredentialPath(t, f, "claude", ns, name)
+				path := f.lookup.claudeJSONPath(ns, "claude", name)
+				cache := fmt.Sprintf(`{"cachedUsageUtilization":{"fetchedAtMs":%d,"accountUuid":%q,"utilization":%s}}`,
+					time.Now().UnixMilli(), name, subscriptionQuotaResponse("claude", i*5))
+				writeQuotaSelectionFile(t, path, cache)
+			}
+			var requests atomic.Int32
+			http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+				requests.Add(1)
+				return nil, fmt.Errorf("offline limits attempted an API request")
+			})
+			scanner := &limitsCountingLogScanner{}
+			cmd := quotaAdviceCommand("", "", true)
+			if err := cmd.Flags().Set("source", source); err != nil {
+				t.Fatal(err)
+			}
+			var output bytes.Buffer
+			cmd.SetOut(&output)
+			if err := runLimitsWithFetcher(cmd, []string{"claude"}, usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner))); err != nil {
+				t.Fatal(err)
+			}
+			var rows []usage.ProfileUsage
+			if err := json.Unmarshal(output.Bytes(), &rows); err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 13 || scanner.scans.Load() != 0 || requests.Load() != 0 {
+				t.Fatalf("offline rows=%d scans=%d requests=%d; want 13, 0, 0", len(rows), scanner.scans.Load(), requests.Load())
+			}
+			for i, row := range rows {
+				if row.ProfileName != fmt.Sprintf("seat-%02d", i) || row.Usage == nil || row.Usage.Error != "" || row.Usage.Source != usage.SourceCache || row.Usage.SecondaryWindow == nil || row.Usage.SecondaryWindow.UsedPercent != i*5 || row.Usage.BurnRate != nil {
+					t.Fatalf("cached profile required credentials or lost its snapshot: %+v", row)
+				}
+			}
+		})
+	}
+}
+
+func TestLimitsNamespaceWithoutUsableCredentialsDoesNotScan(t *testing.T) {
+	for _, source := range credNamespaces {
+		t.Run(source, func(t *testing.T) {
+			setupSubscriptionQuotaProfiles(t, "codex", nil)
+			f := limitsSourceFixture(t)
+			scanner := &limitsCountingLogScanner{}
+			for _, populated := range []bool{false, true} {
+				if populated {
+					limitsSourceCredentialPath(t, f, "codex", source, "missing")
+					path := limitsSourceCredentialPath(t, f, "codex", source, "malformed")
+					writeQuotaSelectionFile(t, path, "{")
+				}
+				cmd := quotaAdviceCommand("", "", false)
+				if err := cmd.Flags().Set("source", source); err != nil {
+					t.Fatal(err)
+				}
+				var output bytes.Buffer
+				cmd.SetOut(&output)
+				if err := runLimitsWithFetcher(cmd, []string{"codex"}, usage.NewMultiProfileFetcher(usage.WithLogScanner(scanner))); err != nil {
+					t.Fatal(err)
+				}
+				if strings.TrimSpace(output.String()) != "[]" || scanner.scans.Load() != 0 {
+					t.Fatalf("empty namespace fetched usage: output=%s scans=%d", output.String(), scanner.scans.Load())
+				}
+			}
+		})
+	}
+}
+
+func TestCachedVaultUsageFollowsActiveClaudeConfigDirectory(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	cache := func(account string, percent int) string {
+		return fmt.Sprintf(`{"cachedUsageUtilization":{"fetchedAtMs":1792580400000,"accountUuid":%q,"utilization":{"five_hour":null,"seven_day":{"utilization":%d,"resets_at":"2099-01-05T00:00:00Z"}}}}`, account, percent)
+	}
+	for _, tc := range []struct {
+		name                                  string
+		explicit, ambient, missing, malformed bool
+	}{
+		{"injected explicit directory", true, false, false, false},
+		{"ambient explicit directory", true, true, false, false},
+		{"missing selected cache", true, false, true, false},
+		{"malformed selected cache", true, false, false, true},
+		{"default home state", false, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newNamespaceFixture(t)
+			f.lookup.Now = now
+			f.vaultClaude(t, "work", now.Add(time.Hour), true)
+			f.vaultClaude(t, "inactive", now.Add(time.Hour), true)
+			f.lookup.ActiveName = func(string) string { return "work" }
+			dir := ""
+			selected := filepath.Join(f.lookup.LiveHome, ".claude.json")
+			if tc.explicit {
+				dir = filepath.Join(f.root, "explicit-config")
+				selected = filepath.Join(dir, ".claude.json")
+				writeQuotaSelectionFile(t, filepath.Join(f.lookup.LiveHome, ".claude.json"), cache("unrelated-home", 0))
+			}
+			f.lookup.LiveEnv = func(key string) string {
+				if key == "CLAUDE_CONFIG_DIR" {
+					return dir
+				}
+				return ""
+			}
+			if tc.ambient {
+				t.Setenv("CLAUDE_CONFIG_DIR", dir)
+				f.lookup.LiveEnv = nil
+			}
+			if !tc.missing {
+				body := cache("selected-account", 100)
+				if tc.malformed {
+					body = "{"
+				}
+				writeQuotaSelectionFile(t, selected, body)
+			}
+			writeQuotaSelectionFile(t, filepath.Join(f.vaultDir, "claude", "work", ".claude.json"), cache("saved-account", 25))
+			inactive := filepath.Join(f.vaultDir, "claude", "inactive", ".claude.json")
+			writeQuotaSelectionFile(t, inactive, cache("inactive-account", 50))
+			before := captureQuotaSelectionTree(t, f.root)
+			resolved, err := resolveProfileCredential(f.lookup, "claude", "work", credNamespaceVault)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for source, path := range map[string]string{
+				"named": resolved.Selected.ClaudeJSON,
+				"bulk":  f.lookup.claudeJSONPath(credNamespaceVault, "claude", "work"),
+			} {
+				if path != selected {
+					t.Fatalf("%s selected %s, want %s", source, path, selected)
+				}
+				row := cachedProfileUsage("claude", "work", path, now)
+				if row.Usage == nil {
+					t.Fatal("missing cached diagnostic row")
+				}
+				if tc.missing || tc.malformed {
+					if row.Usage.Error == "" || row.Usage.NumericQuotaKnown() {
+						t.Fatalf("%s borrowed unselected cache capacity: %+v", source, row.Usage)
+					}
+				} else if row.Usage.AccountID != "selected-account" || !row.Usage.NumericQuotaKnown() || !row.Usage.IsNearLimit(1) || row.Usage.PrimaryWindow != nil {
+					t.Fatalf("%s read another account or lost the weekly-only cap: %+v", source, row.Usage)
+				}
+				var best bytes.Buffer
+				if err := renderBestProfile(&best, "json", []usage.ProfileUsage{row}, 0.8, ""); err != nil || strings.TrimSpace(best.String()) != "null" {
+					t.Fatalf("%s recommended an exhausted or unmeasured active account: %s, %v", source, best.String(), err)
+				}
+			}
+			if got := f.lookup.claudeJSONPath(credNamespaceVault, "claude", "inactive"); got != inactive {
+				t.Fatalf("inactive profile borrowed live state: %s", got)
+			}
+			assertQuotaSelectionTree(t, f.root, before)
+		})
+	}
+}
+
+func TestClaudeJSONPathExplicitDirectoryWithoutHome(t *testing.T) {
+	root := t.TempDir()
+	vaultDir := filepath.Join(root, "vault")
+	selected := filepath.Join(root, "selected")
+	lookup := credentialLookup{
+		VaultDir: vaultDir,
+		LiveEnv: func(key string) string {
+			if key == "CLAUDE_CONFIG_DIR" {
+				return selected
+			}
+			return ""
+		},
+		ActiveName: func(string) string { return "work" },
+	}
+	if got, want := lookup.claudeJSONPath(credNamespaceVault, "claude", "work"), filepath.Join(selected, ".claude.json"); got != want {
+		t.Fatalf("explicit directory without HOME: got %q, want %q", got, want)
+	}
+	lookup.LiveEnv = func(string) string { return "" }
+	if got, want := lookup.claudeJSONPath(credNamespaceVault, "claude", "work"), filepath.Join(vaultDir, "claude", "work", ".claude.json"); got != want {
+		t.Fatalf("missing directory and HOME: got %q, want %q", got, want)
+	}
+}
 
 // Issue #100: `caam limits --profile NAME` read <vault>/<provider>/<name> and
 // said nothing about it, so a healthy Claude account whose isolated-profile
@@ -80,6 +435,7 @@ func newNamespaceFixture(t *testing.T) *namespaceFixture {
 		Profiles: f.store,
 		Shallow:  f.shallow,
 		LiveHome: realHome,
+		LiveEnv:  func(string) string { return "" },
 		Now:      time.Now(),
 	}
 	return f
@@ -111,6 +467,112 @@ func (f *namespaceFixture) shallowClaude(t *testing.T, name string, expires time
 		t.Fatal(err)
 	}
 	claudeCreds(t, path, expires, refreshable)
+}
+
+func TestResolveLiveCredentialUsesCanonicalPathsAndSavedIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, goos string
+		env                  map[string]string
+		path                 string
+	}{
+		{"grok default", "grok", "linux", nil, "home/.grok/auth.json"},
+		{"grok override", "grok", "linux", map[string]string{"GROK_HOME": "grok-custom"}, "grok-custom/auth.json"},
+		{"cursor linux default", "cursor", "linux", nil, "home/.config/cursor/auth.json"},
+		{"cursor linux XDG", "cursor", "linux", map[string]string{"XDG_CONFIG_HOME": "xdg", "CURSOR_CONFIG_DIR": "metadata-only"}, "xdg/cursor/auth.json"},
+		{"cursor macOS", "cursor", "darwin", map[string]string{"XDG_CONFIG_HOME": "xdg"}, "home/.cursor/auth.json"},
+		{"cursor windows", "cursor", "windows", map[string]string{"APPDATA": "appdata"}, "appdata/Cursor/auth.json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newNamespaceFixture(t)
+			f.lookup.LiveOS = tc.goos
+			f.lookup.LiveEnv = func(key string) string {
+				if v := tc.env[key]; v != "" {
+					return filepath.Join(f.root, v)
+				}
+				return ""
+			}
+			livePath := filepath.Join(f.root, filepath.FromSlash(tc.path))
+			savedPath := filepath.Join(f.vaultDir, tc.provider, "work", "auth.json")
+			auth := `{"user_id":"seat-A","access_token":"SYNTHETIC"}`
+			if tc.provider == "cursor" {
+				token := "e30." + base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"seat-A"}`)) + ".SYNTHETIC"
+				auth = `{"accessToken":"` + token + `"}`
+			}
+			writeNativeTestCredential(t, savedPath, auth)
+			writeNativeTestCredential(t, livePath, auth)
+			res, err := resolveProfileCredential(f.lookup, tc.provider, "work", credNamespaceLive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Selected.Namespace != credNamespaceLive || res.Selected.Path != livePath || !res.Explicit {
+				t.Fatalf("selected live source = %+v", res.Selected)
+			}
+			report := res.report()
+			if report.Namespace != "live" || report.Path != livePath || !report.Explicit {
+				t.Fatalf("source report = %+v", report)
+			}
+			if len(report.Alternatives) != 1 || report.Alternatives[0].Namespace != credNamespaceVault {
+				t.Fatalf("missing saved source metadata: %+v", report)
+			}
+			defaultSource, err := resolveProfileCredential(f.lookup, tc.provider, "work", "")
+			if err != nil || defaultSource.Selected.Namespace != credNamespaceVault || len(defaultSource.Alternatives) != 0 {
+				t.Fatalf("live source changed default resolution: %+v %v", defaultSource, err)
+			}
+		})
+	}
+}
+
+func TestResolveLiveCredentialFailsClosed(t *testing.T) {
+	f := newNamespaceFixture(t)
+	writeNativeTestCredential(t, filepath.Join(f.vaultDir, "grok", "work", "auth.json"), `{"user_id":"seat-A"}`)
+	writeNativeTestCredential(t, filepath.Join(f.lookup.LiveHome, ".grok", "auth.json"), `{"user_id":"seat-B"}`)
+	for _, tc := range []struct{ provider, name, message string }{
+		{"grok", "work", "does not match"},
+		{"grok", "unsaved", "saved credential is missing"},
+		{"grok", "", "requires a saved account"},
+		{"grok", "_original", "requires a saved account"},
+		{"claude", "work", "grok and cursor only"},
+		{"codex", "work", "grok and cursor only"},
+	} {
+		t.Run(tc.provider+"/"+tc.name, func(t *testing.T) {
+			_, err := resolveProfileCredential(f.lookup, tc.provider, tc.name, credNamespaceLive)
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("error = %v, want %q", err, tc.message)
+			}
+		})
+	}
+	if _, err := namespaceProfileNames(f.lookup, credNamespaceLive, "grok"); err == nil {
+		t.Fatal("live source listed unnamed or unverified accounts")
+	}
+}
+
+func TestNativeCredentialSourceStateRequiresUnexpiredAccess(t *testing.T) {
+	now := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	for _, provider := range []string{"grok", "cursor"} {
+		for _, tc := range []struct {
+			name, state string
+			expires     time.Time
+		}{
+			{"expired", credStateExpired, now.Add(-time.Hour)},
+			{"expiry boundary", credStateExpired, now},
+			{"unexpired", credStateHealthy, now.Add(time.Hour)},
+		} {
+			t.Run(provider+"/"+tc.name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "auth.json")
+				auth := fmt.Sprintf(`{"key":"SYNTHETIC-ACCESS","refresh_token":"SYNTHETIC-REFRESH","expires_at":%q}`, tc.expires.Format(time.RFC3339))
+				if provider == "cursor" {
+					payload := fmt.Sprintf(`{"sub":"seat-A","exp":%d}`, tc.expires.Unix())
+					token := "e30." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".SYNTHETIC"
+					auth = fmt.Sprintf(`{"accessToken":%q,"apiKey":"SYNTHETIC-RENEWAL"}`, token)
+				}
+				writeNativeTestCredential(t, path, auth)
+				state, expires := (credentialLookup{Now: now}).credentialState(provider, path)
+				if state != tc.state || !expires.Equal(tc.expires) {
+					t.Fatalf("source state=%s expiry=%v, want %s %v", state, expires, tc.state, tc.expires)
+				}
+			})
+		}
+	}
 }
 
 // TestResolveProfileCredentialRefusesTheStaleVaultCopy is the reported bug.
@@ -324,6 +786,122 @@ func TestCachedProfileUsage(t *testing.T) {
 	none := cachedProfileUsage("claude", "none", "", now)
 	if none.Usage.Error != usage.ErrNoCachedUsage.Error() {
 		t.Errorf("empty path row = %+v", none.Usage)
+	}
+}
+
+// Issue #133: an inapplicable session must not erase a usable weekly quota,
+// and a decoded but unsafe snapshot must retain its evidence and real age.
+// These are synthetic response shapes, not a captured verified-Ultra payload.
+func TestCachedProfileUsagePreservesPartialQuotaEvidence(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	fetched := now.Add(-3 * time.Hour)
+	for _, tc := range []struct {
+		name, limits          string
+		known, weekly, scoped bool
+	}{
+		{
+			name: "null session with weekly and scoped quotas",
+			limits: `[
+				{"kind":"session","group":"session","percent":null,"resets_at":null},
+				{"kind":"weekly_all","group":"weekly","percent":42,"resets_at":"2099-01-05T00:00:00Z"},
+				{"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"2099-01-05T00:00:00Z","scope":{"model":{"display_name":"Fable"}}}
+			]`,
+			known: true, weekly: true, scoped: true,
+		},
+		{
+			name:   "only inapplicable quotas",
+			limits: `[{"kind":"session","percent":null,"resets_at":null}]`,
+		},
+		{
+			name: "only model scoped quota",
+			limits: `[
+				{"kind":"session","percent":null},
+				{"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"2099-01-05T00:00:00Z","scope":{"model":{"display_name":"Fable"}}}
+			]`,
+			scoped: true,
+		},
+		{
+			name: "unknown restriction beside weekly quota",
+			limits: `[
+				{"kind":"weekly_all","group":"weekly","percent":42,"resets_at":"2099-01-05T00:00:00Z"},
+				{"kind":"future_general_limit","group":"monthly","percent":100,"resets_at":"2099-02-01T00:00:00Z"}
+			]`,
+			weekly: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), ".claude.json")
+			body := fmt.Sprintf(`{"cachedUsageUtilization":{"fetchedAtMs":%d,"accountUuid":"synthetic-account","utilization":{"limits":%s}}}`,
+				fetched.UnixMilli(), tc.limits)
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			row := cachedProfileUsage("claude", "cached-seat", path, now)
+			u := row.Usage
+			if u == nil || u.Provider != "claude" || u.ProfileName != "cached-seat" ||
+				u.Source != usage.SourceCache || u.AccountID != "synthetic-account" || !u.FetchedAt.Equal(fetched) {
+				t.Fatalf("cached evidence lost its identity or timestamp: %+v", u)
+			}
+			if u.PrimaryWindow != nil || (u.SecondaryWindow != nil) != tc.weekly || (u.ScopedLimit("fable") != nil) != tc.scoped {
+				t.Fatalf("cache fabricated a session or discarded measured windows: %+v", u)
+			}
+			if tc.weekly && u.SecondaryWindow.UsedPercent != 42 {
+				t.Fatalf("weekly measurement changed: %+v", u.SecondaryWindow)
+			}
+			if tc.scoped && u.ScopedLimit("fable").UsedPercent != 100 {
+				t.Fatalf("scoped measurement changed: %+v", u.ScopedLimit("fable"))
+			}
+			if u.NumericQuotaKnown() != tc.known || (u.Error == "") != tc.known {
+				t.Fatalf("cached quota eligibility = %+v, want known=%v", u, tc.known)
+			}
+			if !tc.known && (u.QuotaStatus != usage.QuotaDegraded || u.QuotaNote == "" || u.AvailabilityScore() != 0) {
+				t.Fatalf("unsafe snapshot was not explicitly degraded: %+v", u)
+			}
+			if got := formatCacheAge(u, now); got != "3h0m ago" {
+				t.Fatalf("partial snapshot age = %q, want the original age", got)
+			}
+
+			rows := []usage.ProfileUsage{row}
+			var output strings.Builder
+			if err := renderLimits(&output, "json", rows, ""); err != nil {
+				t.Fatal(err)
+			}
+			var decoded []usage.ProfileUsage
+			if err := json.Unmarshal([]byte(output.String()), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if len(decoded) != 1 || decoded[0].Usage == nil || decoded[0].Usage.PrimaryWindow != nil ||
+				decoded[0].Usage.QuotaStatus != u.QuotaStatus || decoded[0].Usage.AccountID != u.AccountID ||
+				!decoded[0].Usage.FetchedAt.Equal(fetched) || (decoded[0].Usage.SecondaryWindow != nil) != tc.weekly {
+				t.Fatalf("JSON lost absent-window or degraded-evidence semantics: %s", output.String())
+			}
+			output.Reset()
+			if err := renderBestProfile(&output, "json", rows, 0.8, "sonnet"); err != nil {
+				t.Fatal(err)
+			}
+			if gotNull := strings.TrimSpace(output.String()) == "null"; gotNull == tc.known {
+				t.Fatalf("best-profile selection ignored quota validity: %s", output.String())
+			}
+			for _, mode := range usage.RankModes {
+				ranked := usage.RankProfiles(rows, usage.RankOptions{Mode: mode, Model: "sonnet", Now: now})
+				if (ranked.Selected != nil) != tc.known {
+					t.Fatalf("%s ranking ignored quota validity: %+v", mode, ranked)
+				}
+				if tc.scoped {
+					forFable := usage.RankProfiles(rows, usage.RankOptions{Mode: mode, Model: "fable", Now: now})
+					if forFable.Selected != nil {
+						t.Fatalf("%s ranking ignored the exhausted scoped quota: %+v", mode, forFable)
+					}
+				}
+			}
+			adapted := toRotationUsageInfo("cached-seat", u, "fable")
+			if (adapted.Error == "") != tc.known || (!tc.known && adapted.AvailScore != 0) {
+				t.Fatalf("rotation adapter treated degraded data as measured: %+v", adapted)
+			}
+			if tc.known && (adapted.SecondaryPercent != 42 || adapted.ScopedPercent != 100 || adapted.ResetsAt == nil) {
+				t.Fatalf("weekly-only rotation lost quota restrictions: %+v", adapted)
+			}
+		})
 	}
 }
 

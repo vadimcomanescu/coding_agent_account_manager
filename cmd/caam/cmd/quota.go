@@ -419,9 +419,10 @@ func buildQuotaRow(scan quotaScan, name, shallowHome, path, source string, activ
 	row.Email, row.Plan = formatIdentityDisplay(id)
 
 	// A missing, older, or corrupt .claude.json all mean the same thing to the
-	// reader: this profile has nothing to report yet.
-	cached, err := usage.ReadCachedClaudeUsage(path, scan.now)
-	if err != nil {
+	// reader: this profile has nothing to report yet. An incomplete or rolled
+	// snapshot comes back with an error and its windows, which are still shown.
+	cached, _ := usage.ReadCachedClaudeUsage(path, scan.now)
+	if cached == nil {
 		return row
 	}
 

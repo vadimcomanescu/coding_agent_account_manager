@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/setup"
 	"github.com/spf13/cobra"
 )
@@ -34,7 +35,8 @@ var setupDistributedCmd = &cobra.Command{
 	Long: `Automatically configures the distributed auth recovery system across machines.
 
 This command:
-1. Parses your WezTerm config to discover SSH domains
+1. Discovers SSH domains in your WezTerm config, plus any --host machines
+   (tmux users can name hosts with --host and skip WezTerm entirely)
 2. Uses Tailscale (if available) for optimal connectivity
 3. Deploys coordinators to remote machines
 4. Generates local agent configuration
@@ -46,6 +48,7 @@ Examples:
   caam setup distributed                     # Auto-detect everything
   caam setup distributed --dry-run           # Preview what would be done
   caam setup distributed --remotes css,csd   # Only setup specific domains
+  caam setup distributed --host ubuntu@build1 --host gpu:2222   # Hosts outside WezTerm
   caam setup distributed --no-tailscale      # Use public IPs only`,
 	RunE: runSetupDistributed,
 }
@@ -59,8 +62,10 @@ func init() {
 	setupDistributedCmd.Flags().Bool("print-script", false, "print a pasteable setup script and exit")
 	setupDistributedCmd.Flags().Int("local-port", 7891, "port for local auth-agent")
 	setupDistributedCmd.Flags().Int("remote-port", 7890, "port for remote coordinators")
-	setupDistributedCmd.Flags().StringSlice("remotes", nil, "limit setup to these domain names")
+	setupDistributedCmd.Flags().StringSlice("remotes", nil, "limit setup to these WezTerm domain names")
+	setupDistributedCmd.Flags().StringArray("host", nil, "coordinator host as [user@]host[:port] or a ~/.ssh/config alias (repeatable; no WezTerm config needed)")
 	setupDistributedCmd.Flags().Bool("no-tailscale", false, "disable Tailscale (use public IPs)")
+	setupDistributedCmd.Flags().Bool("rotate-tokens", false, "issue new coordinator API tokens instead of keeping existing ones")
 }
 
 func runSetupDistributed(cmd *cobra.Command, args []string) error {
@@ -76,6 +81,8 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	localPort, _ := cmd.Flags().GetInt("local-port")
 	remotePort, _ := cmd.Flags().GetInt("remote-port")
 	remotes, _ := cmd.Flags().GetStringSlice("remotes")
+	hosts, _ := cmd.Flags().GetStringArray("host")
+	rotateTokens, _ := cmd.Flags().GetBool("rotate-tokens")
 
 	if noTailscale {
 		useTailscale = false
@@ -87,26 +94,33 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 		LocalPort:     localPort,
 		RemotePort:    remotePort,
 		Remotes:       remotes,
+		Hosts:         hosts,
 		DryRun:        dryRun,
+		RotateTokens:  rotateTokens,
 	}
 
 	orch := setup.NewOrchestrator(opts)
 
 	// Discovery phase
 	fmt.Println("Discovering machines...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	discoverCtx, cancelDiscover := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelDiscover()
 
-	if err := orch.Discover(ctx); err != nil {
+	if err := orch.Discover(discoverCtx); err != nil {
 		return fmt.Errorf("discovery failed: %w", err)
 	}
+
+	// Deployment uploads or installs binaries, starts services, and verifies
+	// each host in turn; it gets its own, longer budget.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
 
 	// Print discovery results
 	orch.PrintDiscoveryResults()
 
 	remoteMachines := orch.GetRemoteMachines()
 	if len(remoteMachines) == 0 {
-		return fmt.Errorf("no remote machines to setup; add SSH domains to WezTerm config or specify hosts with --remote")
+		return fmt.Errorf("no remote machines to setup; add SSH domains to your WezTerm config or name hosts with --host")
 	}
 
 	if printScript {
@@ -116,6 +130,7 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 			LocalPort:     localPort,
 			RemotePort:    remotePort,
 			Remotes:       remotes,
+			Hosts:         hosts,
 		})
 		if err != nil {
 			return err
@@ -174,6 +189,9 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 		} else {
 			fmt.Printf("  ✗ %s: %v\n", dr.Machine, dr.Error)
 		}
+		for _, w := range dr.Warnings {
+			fmt.Printf("      ⚠ %s\n", w)
+		}
 	}
 
 	if result.LocalConfigPath != "" {
@@ -193,12 +211,42 @@ func runSetupDistributed(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	if dryRun {
 		fmt.Println("Run without --dry-run to apply these changes.")
+	} else if successCount > 0 && restartInstalledAgentService(ctx, result.LocalConfigPath) {
+		fmt.Println("The auth-agent service was restarted with the updated configuration.")
+		fmt.Println("Check it with: caam auth-agent service status")
 	} else if successCount > 0 {
-		fmt.Println("Start the local agent:")
-		fmt.Printf("  caam auth-agent --config %s\n", result.LocalConfigPath)
-		fmt.Println()
-		fmt.Println("Or run it as a background service.")
+		fmt.Println("1. Sign in to the Google accounts the agent should use (once per machine):")
+		fmt.Println("     caam auth-agent signin")
+		fmt.Println("   and add them to the rotation:")
+		fmt.Printf("     caam auth-agent accounts add --config %s <email>...\n", result.LocalConfigPath)
+		fmt.Println("2. Run the local agent as a login service:")
+		fmt.Println("     caam auth-agent service install")
+		fmt.Println("   or in the foreground:")
+		fmt.Printf("     caam auth-agent --config %s\n", result.LocalConfigPath)
 	}
 
 	return nil
+}
+
+// restartInstalledAgentService restarts an installed auth-agent service so it
+// loads the coordinators and tokens setup just wrote. It reports whether a
+// service was restarted.
+func restartInstalledAgentService(ctx context.Context, configPath string) bool {
+	if configPath == "" {
+		return false
+	}
+	svc, err := deploy.NewAgentService(configPath)
+	if err != nil {
+		return false
+	}
+	st, err := svc.Status(ctx)
+	if err != nil || !st.Installed {
+		return false
+	}
+	if _, err := svc.Install(ctx); err != nil {
+		fmt.Printf("Warning: could not restart the auth-agent service: %v\n", err)
+		fmt.Println("Restart it with: caam auth-agent service install")
+		return false
+	}
+	return true
 }

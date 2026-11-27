@@ -1,23 +1,43 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
-	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	caamexec "github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
-	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/wrap"
+	"github.com/creack/pty"
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 )
+
+type runInvocation struct {
+	Account string   `json:"account"`
+	Input   string   `json:"input"`
+	Args    []string `json:"args"`
+	WorkDir string   `json:"work_dir"`
+}
 
 // TestHelperProcess_Run is the entry point for the mock process for run tests.
 func TestHelperProcess_Run(t *testing.T) {
@@ -25,180 +45,798 @@ func TestHelperProcess_Run(t *testing.T) {
 		return
 	}
 
-	mode := os.Getenv("MOCK_RUN_MODE")
-	switch mode {
+	data, err := os.ReadFile(os.Getenv("MOCK_AUTH_PATH"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(90)
+	}
+	var auth struct {
+		OAuth struct {
+			AccessToken string `json:"accessToken"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(data, &auth) != nil || auth.OAuth.AccessToken == "" {
+		os.Exit(91)
+	}
+	var input []byte
+	if os.Getenv("MOCK_SKIP_STDIN") != "1" { // e.g. `codex exec`, which never reads stdin
+		input, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			os.Exit(92)
+		}
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		os.Exit(93)
+	}
+	var args []string
+	for i, arg := range os.Args {
+		if arg == "--" {
+			args = os.Args[i+1:]
+			break
+		}
+	}
+	logFile, err := os.OpenFile(os.Getenv("MOCK_RUN_LOG"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
+	if err != nil {
+		os.Exit(94)
+	}
+	err = json.NewEncoder(logFile).Encode(runInvocation{auth.OAuth.AccessToken, string(input), args, wd})
+	closeErr := logFile.Close()
+	if err != nil || closeErr != nil {
+		os.Exit(95)
+	}
+	switch os.Getenv("MOCK_RUN_MODE") {
 	case "success":
-		fmt.Println("Command success")
+		fmt.Println("Success: this document explains rate limit handling.")
 		os.Exit(0)
-	case "ratelimit":
-		fmt.Println("Error: rate limit exceeded")
-		os.Exit(1)
+	case "normal-failure":
+		fmt.Fprintln(os.Stderr, "Error: compilation failed")
+		os.Exit(23)
 	case "failover":
-		// Fail first time (if profile is work), succeed second time (if profile is personal)
-		authPath := os.Getenv("MOCK_AUTH_PATH")
-		content, _ := os.ReadFile(authPath)
-		if string(content) == `{"token":"work"}` {
-			fmt.Println("Error: rate limit exceeded")
-			os.Exit(1)
-		} else {
-			fmt.Println("Command success (failover)")
+		if auth.OAuth.AccessToken != "z-active" {
+			fmt.Println("Command success after failover")
 			os.Exit(0)
 		}
+	case "all-limited":
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown mode: %s\n", mode)
-		os.Exit(1)
+		os.Exit(96)
+	}
+	fmt.Fprintln(os.Stderr, "Error: rate limit exceeded")
+	os.Exit(42)
+}
+
+// This helper is reached through Runner's real os/exec path, including the
+// Cursor fallback that does not use SmartRunner's injectable command factory.
+func TestHelperProcess_InteractiveRun(t *testing.T) {
+	if os.Getenv("GO_WANT_INTERACTIVE_RUN_HELPER") != "1" {
+		return
+	}
+	if err := os.WriteFile(os.Getenv("INTERACTIVE_RUN_MARKER"), []byte("launched"), 0600); err != nil {
+		os.Exit(91)
+	}
+	os.Exit(0)
+}
+
+type interactiveRunProvider struct {
+	provider.Provider
+	commandCalls int
+}
+
+func (p *interactiveRunProvider) DefaultBin() string {
+	p.commandCalls++
+	return os.Args[0]
+}
+
+func setupInteractiveRun(t *testing.T, native provider.Provider) (*cobra.Command, *interactiveRunProvider, string) {
+	t.Helper()
+	oldRegistry, oldRunner, oldGetWd := registry, runner, getWd
+	t.Cleanup(func() { registry, runner, getWd = oldRegistry, oldRunner, oldGetWd })
+	prov := &interactiveRunProvider{Provider: native}
+	registry = provider.NewRegistry()
+	registry.Register(prov)
+	runner = caamexec.NewRunner(registry)
+	profileStore = profile.NewStore(filepath.Join(os.Getenv("CAAM_HOME"), "profiles"))
+	getWd = func() (string, error) { return os.Getenv("HOME"), nil }
+	require.NoError(t, config.DefaultConfig().Save())
+	terminal, input, err := pty.Open()
+	if err != nil {
+		t.Skipf("interactive regression requires a PTY: %v", err)
+	}
+	t.Cleanup(func() { terminal.Close(); input.Close() })
+	marker := filepath.Join(t.TempDir(), "interactive-child")
+	t.Setenv("GO_WANT_INTERACTIVE_RUN_HELPER", "1")
+	t.Setenv("INTERACTIVE_RUN_MARKER", marker)
+	cmd := &cobra.Command{Use: "run <tool>", RunE: runWrap, SilenceErrors: true, SilenceUsage: true}
+	addRunFlags(cmd)
+	cmd.SetIn(input)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	return cmd, prov, marker
+}
+
+func TestInteractiveRunChecksActiveCursorCredential(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, algorithm := range []string{"smart", "round_robin", "random"} {
+		for _, tc := range []struct {
+			name       string
+			expiry     time.Time
+			apiKey     bool
+			opaque     bool
+			rejection  string
+			cooldown   bool
+			wantReason string
+		}{
+			{name: "expired session", expiry: now.Add(-time.Hour), wantReason: "log in again"},
+			{name: "expiry boundary", expiry: now, wantReason: "log in again"},
+			{name: "valid session", expiry: now.Add(time.Hour)},
+			{name: "renewable expired token", expiry: now.Add(-time.Hour), apiKey: true},
+			{name: "API key without token", apiKey: true},
+			{name: "opaque expiry stays unknown", opaque: true},
+			{name: "current provider rejection", expiry: now.Add(time.Hour), apiKey: true, rejection: "current", wantReason: "log in again"},
+			{name: "replacement clears old rejection", expiry: now.Add(time.Hour), rejection: "previous"},
+			{name: "current account in cooldown", expiry: now.Add(time.Hour), cooldown: true, wantReason: "cooldown"},
+		} {
+			t.Run(algorithm+"/"+tc.name, func(t *testing.T) {
+				paths := setupCursorHealthVault(t)
+				cmd, prov, marker := setupInteractiveRun(t, cursor.New())
+				// Ambient keys are scrubbed by global execution and cannot rescue
+				// an expired browser login from a different account.
+				t.Setenv("CURSOR_API_KEY", "SYNTHETIC-AMBIENT-KEY")
+				data := cursorHealthCredential(t, tc.expiry, tc.apiKey)
+				if tc.opaque {
+					data = []byte(`{"accessToken":"SYNTHETIC-OPAQUE-SESSION"}`)
+				}
+				require.NoError(t, os.MkdirAll(filepath.Dir(paths.AuthFile), 0700))
+				require.NoError(t, os.WriteFile(paths.AuthFile, data, 0600))
+				configPath := filepath.Join(paths.ConfigDir, "cli-config.json")
+				require.NoError(t, os.MkdirAll(paths.ConfigDir, 0700))
+				require.NoError(t, os.WriteFile(configPath, []byte(`{"theme":"light"}`), 0600))
+				require.NoError(t, vault.Backup(authfile.CursorAuthFiles(), "active"))
+				changedConfig := []byte(`{"theme":"dark","lastUpdateCheck":123}`)
+				require.NoError(t, os.WriteFile(configPath, changedConfig, 0600))
+				current, err := vault.CurrentProfile(authfile.CursorAuthFiles())
+				require.NoError(t, err)
+				require.Equal(t, "active", current, "config churn must not hide the active credential")
+				require.NoError(t, healthStore.SetTokenExpiry("cursor", "active", now.Add(-90*24*time.Hour)))
+				if tc.rejection != "" {
+					fingerprint := "previous-replaced-credential"
+					if tc.rejection == "current" {
+						info, err := health.ParseCursorExpiry(paths.AuthFile)
+						require.NoError(t, err)
+						fingerprint = info.Fingerprint
+					}
+					require.NoError(t, healthStore.RecordProviderVerification("cursor", "active", health.ProviderVerification{
+						Reason: "access_token_rejected", Fingerprint: fingerprint,
+					}))
+				}
+				if tc.cooldown {
+					db, err := getDB()
+					require.NoError(t, err)
+					_, err = db.SetCooldown("cursor", "active", time.Now(), time.Hour, "synthetic regression")
+					require.NoError(t, err)
+				}
+				before := snapshotKeepaliveCLIFiles(t, vault.BasePath())
+				cmd.SetArgs([]string{"cursor", "--quiet", "--algorithm", algorithm, "--", "-test.run=^TestHelperProcess_InteractiveRun$"})
+				err = cmd.Execute()
+				if tc.wantReason != "" {
+					require.ErrorContains(t, err, tc.wantReason)
+					require.NotContains(t, err.Error(), "caam refresh")
+					require.Zero(t, prov.commandCalls, "blocked credential reached command construction")
+					require.NoFileExists(t, marker)
+					require.NoDirExists(t, profileStore.ProfilePath("cursor", "active"), "blocked launch created a transient profile")
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, 1, prov.commandCalls)
+					require.FileExists(t, marker, "eligible credential did not reach the real child path")
+				}
+				after, err := os.ReadFile(paths.AuthFile)
+				require.NoError(t, err)
+				require.Equal(t, data, after, "launch check changed native credentials")
+				afterConfig, err := os.ReadFile(configPath)
+				require.NoError(t, err)
+				require.Equal(t, changedConfig, afterConfig)
+				require.Equal(t, before, snapshotKeepaliveCLIFiles(t, vault.BasePath()), "launch check changed the vault")
+			})
+		}
+	}
+}
+
+func TestInteractiveRunUsesLiveClaudeGrant(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, tc := range []struct {
+		name        string
+		savedExpiry time.Time
+		liveExpiry  time.Time
+		refresh     bool
+		rejectSaved bool
+		wantLogin   bool
+	}{
+		{name: "expired live grant with healthy snapshot", savedExpiry: now.Add(time.Hour), liveExpiry: now.Add(-time.Hour), wantLogin: true},
+		{name: "healthy live grant with expired snapshot", savedExpiry: now.Add(-time.Hour), liveExpiry: now.Add(time.Hour)},
+		{name: "renewable expired live grant", savedExpiry: now.Add(time.Hour), liveExpiry: now.Add(-time.Hour), refresh: true},
+		{name: "new live grant replaces rejected snapshot", savedExpiry: now.Add(-time.Hour), liveExpiry: now.Add(time.Hour), rejectSaved: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setupCursorHealthVault(t)
+			t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+			tools = map[string]func() authfile.AuthFileSet{"claude": authfile.ClaudeAuthFiles}
+			cmd, prov, marker := setupInteractiveRun(t, claude.New())
+			authPath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")
+			require.NoError(t, os.MkdirAll(filepath.Dir(authPath), 0700))
+			credential := func(token string, expiry time.Time) []byte {
+				oauth := map[string]any{"accessToken": token, "expiresAt": expiry.UnixMilli(), "accountId": "synthetic-account"}
+				if tc.refresh {
+					oauth["refreshToken"] = "SYNTHETIC-REFRESH-" + token
+				}
+				data, err := json.Marshal(map[string]any{"claudeAiOauth": oauth})
+				require.NoError(t, err)
+				return data
+			}
+			saved := credential("SYNTHETIC-SAVED", tc.savedExpiry)
+			live := credential("SYNTHETIC-LIVE", tc.liveExpiry)
+			bindingFor := func(data []byte) *identity.ClaudeIdentityBinding {
+				binding := claudeCLIIdentityBinding(t, data, "synthetic-org", "Test organization")
+				binding.Identity.AccountID = "synthetic-account"
+				return binding
+			}
+			vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+				return bindingFor(data), nil
+			}
+			require.NoError(t, os.WriteFile(authPath, saved, 0600))
+			require.NoError(t, vault.Backup(authfile.ClaudeAuthFiles(), "active"))
+			if tc.rejectSaved {
+				info, err := health.ParseClaudeExpiry(os.Getenv("CLAUDE_CONFIG_DIR"))
+				require.NoError(t, err)
+				require.NoError(t, healthStore.RecordProviderVerification("claude", "active", health.ProviderVerification{
+					Reason: "access_token_rejected", Fingerprint: info.Fingerprint,
+				}))
+			}
+			require.NoError(t, os.WriteFile(authPath, live, 0600))
+			// This test concerns launch health after an identity-preserving
+			// refresh. Model provider confirmation of both generations; an
+			// embedded accountId alone cannot prove an opaque token's owner.
+			liveBinding, err := json.Marshal(map[string]any{"claude_identity": bindingFor(live)})
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(authPath), identity.ClaudeIdentityCacheFile), liveBinding, 0600))
+			current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
+			require.NoError(t, err)
+			require.Equal(t, "active", current, "rotated grant must remain owned by the same account")
+			before := snapshotKeepaliveCLIFiles(t, vault.BasePath())
+			cmd.SetArgs([]string{"claude", "--quiet", "--", "-test.run=^TestHelperProcess_InteractiveRun$"})
+			err = cmd.Execute()
+			if tc.wantLogin {
+				require.ErrorContains(t, err, "log in again")
+				require.Zero(t, prov.commandCalls)
+				require.NoFileExists(t, marker)
+				require.NoDirExists(t, profileStore.ProfilePath("claude", "active"))
+			} else {
+				require.NoError(t, err)
+				require.FileExists(t, marker)
+			}
+			after, err := os.ReadFile(authPath)
+			require.NoError(t, err)
+			require.Equal(t, live, after)
+			require.Equal(t, before, snapshotKeepaliveCLIFiles(t, vault.BasePath()))
+		})
 	}
 }
 
 func TestRunCommand_Extended(t *testing.T) {
-	// TODO: This test needs redesign. The SmartRunner uses PTY-based monitoring
-	// and expects long-running interactive CLI sessions where it can:
-	// 1. Detect rate limit patterns in output
-	// 2. Inject login commands via PTY
-	// 3. Wait for login completion
-	// The current mock process exits immediately, which doesn't allow the
-	// handoff flow to complete. The test needs a mock that simulates a
-	// long-running process with rate limit output patterns.
-	t.Skip("Test requires redesign: SmartRunner PTY flow incompatible with immediate-exit mocks")
-
-	h := testutil.NewExtendedHarness(t)
-	defer h.Close()
-
-	// 1. Setup
-	h.StartStep("Setup", "Create vault and mock globals")
-	
-	rootDir := h.TempDir
-	vaultDir := filepath.Join(rootDir, "vault")
-	
-	// Create database path
-	dbDir := filepath.Join(rootDir, "db")
-	require.NoError(t, os.MkdirAll(dbDir, 0755))
-	
-	// Override DB path
-	h.SetEnv("HOME", rootDir)
-	h.SetEnv("XDG_DATA_HOME", rootDir)
-	configDir := filepath.Join(rootDir, "caam")
-	h.SetEnv("CAAM_HOME", configDir)
-	h.SetEnv("XDG_CONFIG_HOME", rootDir)
-
-	// Write config
-	require.NoError(t, os.MkdirAll(filepath.Join(rootDir, "caam"), 0755))
-	configPath := filepath.Join(rootDir, "caam", "config.json")
-	configJSON := `{"wrap": {"initial_delay": "10ms"}}`
-	require.NoError(t, os.WriteFile(configPath, []byte(configJSON), 0600))
-	
-	// Override vault, tools, and profileStore
-	originalVault := vault
-	originalTools := make(map[string]func() authfile.AuthFileSet)
-	for k, v := range tools {
-		originalTools[k] = v
+	tests := []struct {
+		name      string
+		settings  string
+		flags     []string
+		mode      string
+		wantCalls int
+		wantExit  int
+		wantLimit bool
+		wantFinal string
+	}{
+		{"success keeps current account", `{}`, nil, "success", 1, 0, false, "z-active"},
+		{"failed command preserves exit", `{}`, nil, "normal-failure", 1, 23, false, "z-active"},
+		{"headless Claude fails over", `{"max_retries":1}`, nil, "failover", 2, 0, true, "a-ready"},
+		{"global zero disables retry", `{"max_retries":0}`, nil, "all-limited", 1, 42, true, "z-active"},
+		{"provider zero disables retry", `{"max_retries":4,"providers":{"claude":{"max_retries":0}}}`, nil, "all-limited", 1, 42, true, "z-active"},
+		{"provider budget overrides global", `{"max_retries":0,"providers":{"claude":{"max_retries":2}}}`, nil, "all-limited", 3, 42, true, "m-other"},
+		{"CLI zero overrides provider", `{"providers":{"claude":{"max_retries":2}}}`, []string{"--max-retries", "0"}, "all-limited", 1, 42, true, "z-active"},
+		{"CLI enables retry over provider zero", `{"providers":{"claude":{"max_retries":0}}}`, []string{"--max-retries", "1"}, "all-limited", 2, 42, true, "a-ready"},
+		{"exhausted accounts are not reused", `{"max_retries":10,"cooldown_duration":"0s"}`, nil, "all-limited", 3, 42, true, "m-other"},
 	}
-	originalRegistry := registry
-	originalExecCommand := caamexec.ExecCommand
-	originalGetWd := getWd
-	originalProfileStore := profileStore
-	defer func() {
-		vault = originalVault
-		tools = originalTools
-		registry = originalRegistry
-		caamexec.ExecCommand = originalExecCommand
-		getWd = originalGetWd
-		profileStore = originalProfileStore
-	}()
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, stdout, stderr, root, logPath := setupHeadlessRun(t, tc.settings, tc.mode)
+			input := "first line\nsecond line: café\n"
+			cmd.SetIn(strings.NewReader(input))
+			args := append([]string{"claude", "--quiet", "--algorithm", "round_robin"}, tc.flags...)
+			cmd.SetArgs(append(args, "--", "-p", "test prompt"))
+			err := cmd.Execute()
+			require.Equal(t, tc.wantExit, ExitCode(err), "error: %v; stderr: %s", err, stderr)
+			if tc.wantExit != 0 {
+				var exitErr *caamexec.ExitCodeError
+				require.ErrorAs(t, err, &exitErr)
+			}
+			calls := readRunInvocations(t, logPath)
+			require.Len(t, calls, tc.wantCalls)
+			require.Equal(t, "z-active", calls[0].Account, "startup must retain the current account")
+			seen := map[string]bool{}
+			for _, call := range calls {
+				require.False(t, seen[call.Account], "rate-limited account was reused")
+				seen[call.Account] = true
+				require.Equal(t, input, call.Input, "every launch must receive the full piped input")
+				require.Equal(t, []string{"claude", "-p", "test prompt"}, call.Args)
+				// The child reports its physical cwd; macOS temp dirs sit
+				// behind /var -> /private/var.
+				wantDir, err := filepath.EvalSymlinks(root)
+				require.NoError(t, err)
+				gotDir, err := filepath.EvalSymlinks(call.WorkDir)
+				require.NoError(t, err)
+				require.Equal(t, wantDir, gotDir)
+			}
+			current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
+			require.NoError(t, err)
+			require.Equal(t, tc.wantFinal, current)
+			db, err := getDB()
+			require.NoError(t, err)
+			sessions, err := db.GetWrapSessions("claude", time.Time{}, 10)
+			require.NoError(t, err)
+			require.Len(t, sessions, 1)
+			require.Equal(t, tc.wantLimit, sessions[0].RateLimitHit)
+			require.Equal(t, tc.wantExit, sessions[0].ExitCode)
+			if tc.wantCalls > 1 {
+				require.Equal(t, fmt.Sprintf("retries: %d", tc.wantCalls-1), sessions[0].Notes)
+			}
+			if tc.wantExit == 0 {
+				require.Contains(t, stdout.String(), "uccess")
+			}
+			require.NotContains(t, stdout.String(), "Switching")
+			require.NotContains(t, stdout.String(), "Waiting")
+		})
+	}
+}
 
-	vault = authfile.NewVault(vaultDir)
+// Replace only quota HTTP: setupHeadlessRun owns the selected vault, runner,
+// command factory, database, and their cleanup. Per-token read counts allow
+// quota changes between precheck, recovery selection, and activation without
+// wall-clock-dependent responses or real provider traffic.
+func installRunQuotaResponses(
+	t *testing.T,
+	response func(profile string, read int) string,
+) func() map[string]int {
+	t.Helper()
+	oldTransport := http.DefaultTransport
+	var mu sync.Mutex
+	requests := make(map[string]int)
 
-	// Create isolated profile store in temp directory
-	profilesDir := filepath.Join(rootDir, "caam", "profiles")
-	require.NoError(t, os.MkdirAll(profilesDir, 0755))
-	profileStore = profile.NewStore(profilesDir)
+	http.DefaultTransport = quotaTestTransport(func(req *http.Request) (*http.Response, error) {
+		if req.URL.String() != usage.ClaudeUsageURL {
+			return nil, fmt.Errorf("unexpected quota URL %s", req.URL)
+		}
+		name := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+		mu.Lock()
+		requests[name]++
+		read := requests[name]
+		mu.Unlock()
 
-	// Setup registry
+		body := response(name, read)
+		status := http.StatusOK
+		if body == "" {
+			status = http.StatusServiceUnavailable
+		}
+		return &http.Response{
+			StatusCode: status,
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+
+	return func() map[string]int {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make(map[string]int, len(requests))
+		for name, count := range requests {
+			out[name] = count
+		}
+		return out
+	}
+}
+
+func TestRunPrecheckEnforcesQuotaThroughoutRetries(t *testing.T) {
+	weekly := func(percent int) string {
+		return subscriptionQuotaResponse("claude", percent)
+	}
+	const scoped = `{"seven_day":{"utilization":20},"limits":[{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"}}}]}`
+	for _, tc := range []struct {
+		name       string
+		backup     string
+		after      string
+		changeAt   int
+		model      string
+		wantBackup bool
+	}{
+		{name: "exhausted weekly quota", backup: weekly(100)},
+		{name: "failed quota read", backup: ""},
+		{name: "malformed percentage", backup: `{"seven_day":{"utilization":true}}`},
+		{
+			name:   "no measured general quota",
+			backup: `{"five_hour":{"utilization":null},"limits":[{"kind":"weekly_scoped","percent":0,"scope":{"model":{"display_name":"Fable"}}}]}`,
+		},
+		{
+			name:       "weekly only backup",
+			backup:     `{"five_hour":{"utilization":null},"seven_day":{"utilization":20}}`,
+			wantBackup: true,
+		},
+		{name: "measured zero backup", backup: weekly(0), wantBackup: true},
+		{
+			name:       "recovery may exceed the advisory precheck threshold",
+			backup:     weekly(85),
+			wantBackup: true,
+		},
+		{name: "requested model exhausted", backup: scoped, model: "fable"},
+		{name: "unrelated model remains available", backup: scoped, model: "sonnet", wantBackup: true},
+		{name: "quota changes after precheck", backup: weekly(20), after: weekly(100), changeAt: 2},
+		{name: "read fails after precheck", backup: weekly(20), after: "", changeAt: 2},
+		{name: "quota changes during backoff", backup: weekly(20), after: weekly(100), changeAt: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, _, stderr, _, logPath := setupHeadlessRun(t,
+				`{"max_retries":1,"initial_delay":"1ms","max_delay":"1ms"}`,
+				"all-limited",
+			)
+			counts := installRunQuotaResponses(t, func(name string, read int) string {
+				switch name {
+				case "z-active":
+					return weekly(100)
+				case "a-ready":
+					return weekly(10)
+				case "m-other":
+					if tc.changeAt > 0 && read >= tc.changeAt {
+						return tc.after
+					}
+					return tc.backup
+				default:
+					return ""
+				}
+			})
+			args := []string{
+				"claude", "--precheck", "--quiet",
+				"--algorithm", "round_robin", "--", "-p", "retry fixture",
+			}
+			if tc.model != "" {
+				args = append(args, "--model", tc.model)
+			}
+			cmd.SetArgs(args)
+			err := cmd.Execute()
+
+			// Every launched helper deliberately reports a limit. A blocked
+			// selection may return a selection error rather than exit42.
+			require.NotZero(t, ExitCode(err), "error=%v stderr=%s", err, stderr)
+			calls := readRunInvocations(t, logPath)
+			var accounts []string
+			for _, call := range calls {
+				accounts = append(accounts, call.Account)
+			}
+			want := []string{"a-ready"}
+			if tc.wantBackup {
+				want = append(want, "m-other")
+			}
+			require.Equal(t, want, accounts)
+
+			current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
+			require.NoError(t, err)
+			require.Equal(t, want[len(want)-1], current)
+
+			requests := counts()
+			require.GreaterOrEqual(t, requests["m-other"], 2,
+				"recovery reused the initial precheck snapshot")
+			if tc.changeAt == 3 {
+				require.GreaterOrEqual(t, requests["m-other"], 3,
+					"chosen backup was not remeasured after backoff")
+			}
+			require.Equal(t, 1, requests["a-ready"],
+				"recovery should measure remaining candidates, not the attempted account")
+		})
+	}
+}
+
+func TestRunPrecheckPreservesAdvisoryFirstAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		current   string
+		alternate string
+	}{
+		{
+			name:      "current quota unknown",
+			current:   `{}`,
+			alternate: subscriptionQuotaResponse("claude", 10),
+		},
+		{
+			name:      "all accounts exhausted",
+			current:   subscriptionQuotaResponse("claude", 100),
+			alternate: subscriptionQuotaResponse("claude", 100),
+		},
+		{
+			name:      "no replacement below threshold",
+			current:   subscriptionQuotaResponse("claude", 90),
+			alternate: subscriptionQuotaResponse("claude", 85),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, _, stderr, _, logPath := setupHeadlessRun(t, `{}`, "success")
+			counts := installRunQuotaResponses(t, func(name string, _ int) string {
+				if name == "z-active" {
+					return tc.current
+				}
+				return tc.alternate
+			})
+			cmd.SetArgs([]string{"claude", "--precheck", "--quiet", "--", "-p", "fixture"})
+			require.NoError(t, cmd.Execute(), "stderr=%s", stderr)
+			calls := readRunInvocations(t, logPath)
+			require.Len(t, calls, 1)
+			require.Equal(t, "z-active", calls[0].Account)
+			require.Positive(t, counts()["z-active"], "precheck was not exercised")
+		})
+	}
+}
+
+func TestRunWithoutPrecheckDoesNotFetchQuota(t *testing.T) {
+	cmd, _, stderr, _, logPath := setupHeadlessRun(t, `{"max_retries":1}`, "failover")
+	counts := installRunQuotaResponses(t, func(string, int) string { return "" })
+
+	cmd.SetArgs([]string{
+		"claude", "--quiet", "--algorithm", "round_robin",
+		"--", "-p", "fixture",
+	})
+	require.NoError(t, cmd.Execute(), "stderr=%s", stderr)
+	calls := readRunInvocations(t, logPath)
+	require.Len(t, calls, 2)
+	require.Equal(t, "z-active", calls[0].Account)
+	require.Equal(t, "a-ready", calls[1].Account)
+	require.Empty(t, counts(), "ordinary retries unexpectedly fetched subscription quota")
+}
+
+func TestRunPrecheckCancellationDuringRecoveryDoesNotSwitch(t *testing.T) {
+	cmd, _, stderr, _, logPath := setupHeadlessRun(t, `{"max_retries":1}`, "all-limited")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd.SetContext(ctx)
+
+	counts := installRunQuotaResponses(t, func(name string, read int) string {
+		switch name {
+		case "z-active":
+			return subscriptionQuotaResponse("claude", 100)
+		case "a-ready":
+			return subscriptionQuotaResponse("claude", 10)
+		case "m-other":
+			// The first read belongs to initial precheck. Cancel when the
+			// attempted account has failed and recovery remeasures its backup.
+			// Even a successful measurement cannot authorize a cancelled run.
+			if read == 2 {
+				cancel()
+			}
+			return subscriptionQuotaResponse("claude", 20)
+		default:
+			return ""
+		}
+	})
+	cmd.SetArgs([]string{
+		"claude", "--precheck", "--quiet", "--algorithm", "round_robin",
+		"--", "-p", "fixture",
+	})
+	require.ErrorIs(t, cmd.Execute(), context.Canceled, "stderr=%s", stderr)
+	calls := readRunInvocations(t, logPath)
+	require.Len(t, calls, 1)
+	require.Equal(t, "a-ready", calls[0].Account)
+	require.GreaterOrEqual(t, counts()["m-other"], 2,
+		"cancellation did not exercise recovery quota refresh")
+	current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
+	require.NoError(t, err)
+	require.Equal(t, "a-ready", current, "cancelled recovery changed the active account")
+}
+
+// A stdin pipe that stays open (ssh without -n, a harness that keeps its
+// end open, streaming input) must not block `caam run` before the CLI starts.
+// v0.1.22 passed such input straight through (#120).
+func TestRunDoesNotWaitForOpenStdinPipe(t *testing.T) {
+	cmd, _, stderr, _, logPath := setupHeadlessRun(t, `{}`, "success")
+	t.Setenv("MOCK_SKIP_STDIN", "1")
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close(); _ = r.Close() })
+	cmd.SetIn(r)
+	cmd.SetArgs([]string{"claude", "--quiet", "--", "-p", "test prompt"})
+	done := make(chan error, 1)
+	go func() { done <- cmd.Execute() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err, "stderr: %s", stderr)
+	case <-time.After(30 * time.Second):
+		t.Fatal("caam run read stdin to EOF before starting the CLI")
+	}
+	require.Len(t, readRunInvocations(t, logPath), 1)
+}
+
+func TestRunInputReplayable(t *testing.T) {
+	regular, err := os.CreateTemp(t.TempDir(), "prompt")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = regular.Close() })
+	null, err := os.Open(os.DevNull)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = null.Close() })
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close(); _ = r.Close() })
+
+	require.True(t, runInputReplayable(strings.NewReader("prompt")), "in-memory input is finite")
+	require.True(t, runInputReplayable(regular), "a redirected regular file is finite")
+	require.True(t, runInputReplayable(null), "/dev/null is finite; retries must keep working")
+	require.False(t, runInputReplayable(r), "a pipe may never close")
+}
+
+func setupHeadlessRun(t *testing.T, settings, mode string) (*cobra.Command, *bytes.Buffer, *bytes.Buffer, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "data"))
+	t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(root, "claude"))
+	oldVault, oldRegistry, oldRunner := vault, registry, runner
+	oldStore, oldHealth, oldDB := profileStore, healthStore, globalDB
+	oldExec, oldGetWd := wrap.ExecCommand, getWd
+	t.Cleanup(func() {
+		if globalDB != nil && globalDB != oldDB {
+			require.NoError(t, globalDB.Close())
+		}
+		vault, registry, runner = oldVault, oldRegistry, oldRunner
+		profileStore, healthStore, globalDB = oldStore, oldHealth, oldDB
+		wrap.ExecCommand, getWd = oldExec, oldGetWd
+	})
+	globalDB = nil
+	vault = authfile.NewVault(filepath.Join(root, "vault"))
+	profileStore = profile.NewStore(filepath.Join(root, "profiles"))
+	healthStore = health.NewStorage(filepath.Join(root, "health.json"))
 	registry = provider.NewRegistry()
 	registry.Register(claude.New())
-	
-	// Define target location for restore
-	homeDir := filepath.Join(rootDir, "home")
-	targetPath := filepath.Join(homeDir, "auth.json")
-	require.NoError(t, os.MkdirAll(homeDir, 0755))
-	
-	// Setup profiles in vault
-	// 1. Active profile (alphabetically first)
-	activeDir := filepath.Join(vaultDir, "claude", "active_profile")
-	require.NoError(t, os.MkdirAll(activeDir, 0755))
-	require.NoError(t, os.WriteFile(filepath.Join(activeDir, "auth.json"), []byte(`{"token":"work"}`), 0600))
-	
-	// 2. Backup profile
-	backupDir := filepath.Join(vaultDir, "claude", "backup_profile")
-	require.NoError(t, os.MkdirAll(backupDir, 0755))
-	require.NoError(t, os.WriteFile(filepath.Join(backupDir, "auth.json"), []byte(`{"token":"personal"}`), 0600))
-	
-	tools["claude"] = func() authfile.AuthFileSet {
-		return authfile.AuthFileSet{
-			Tool: "claude",
-			Files: []authfile.AuthFileSpec{
-				{Path: targetPath, Required: true},
-			},
+	runner = caamexec.NewRunner(registry)
+	getWd = func() (string, error) { return root, nil }
+	global := config.DefaultConfig()
+	global.Wrap.InitialDelay, global.Wrap.MaxDelay = 0, 0
+	global.Wrap.Jitter = false
+	require.NoError(t, json.Unmarshal([]byte(settings), &global.Wrap))
+	require.NoError(t, global.Save())
+	fileSet := authfile.ClaudeAuthFiles()
+	authPath := filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(authPath), 0700))
+	knownCredentials := make(map[string]*identity.ClaudeIdentityBinding)
+	vault.ClaudeIdentityVerifier = func(_ context.Context, data []byte) (*identity.ClaudeIdentityBinding, error) {
+		binding, ok := knownCredentials[string(data)]
+		if !ok {
+			return nil, errors.New("unknown headless-run fixture credential")
 		}
+		return binding, nil
 	}
-	
-	getWd = func() (string, error) {
-		return rootDir, nil
+	for _, name := range []string{"a-ready", "m-other", "z-active"} {
+		data := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":%d}}`, name, "synthetic-refresh-"+name, time.Now().Add(time.Hour).UnixMilli())
+		knownCredentials[data] = claudeCLIIdentityBinding(t, []byte(data), "org-"+name, "Test "+name)
+		require.NoError(t, os.WriteFile(authPath, []byte(data), 0600))
+		require.NoError(t, vault.Backup(fileSet, name))
 	}
-	
-h.EndStep("Setup")
-	
-	// 2. Test Success
-	h.StartStep("Success", "Test successful run")
-	
-	caamexec.ExecCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
-		cs := []string{"-test.run=^TestHelperProcess_Run$", "--", name}
-		cs = append(cs, args...)
-		cmd := exec.CommandContext(ctx, os.Args[0], cs...)
-		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "MOCK_RUN_MODE=success")
-		return cmd
+	logPath := filepath.Join(root, "invocations.jsonl")
+	wrap.ExecCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		childArgs := append([]string{"-test.run=^TestHelperProcess_Run$", "--", name}, args...)
+		child := exec.CommandContext(ctx, os.Args[0], childArgs...)
+		child.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "MOCK_RUN_MODE="+mode, "MOCK_AUTH_PATH="+authPath, "MOCK_RUN_LOG="+logPath)
+		return child
 	}
-	
-	runCmd.Flags().Set("quiet", "true")
-	err := runWrap(runCmd, []string{"claude", "prompt"})
-	require.NoError(t, err)
-	
-h.EndStep("Success")
-	
-	// 3. Test Failover
-	h.StartStep("Failover", "Test rate limit failover")
-	
-	runCmd.Flags().Set("max-retries", "1")
-	runCmd.Flags().Set("cooldown", "30m")
-	runCmd.Flags().Set("quiet", "true")
-	runCmd.Flags().Set("algorithm", "round_robin")
-	
-	db, _ := caamdb.Open()
-	db.ClearAllCooldowns()
-	db.Close()
-	
-	caamexec.ExecCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
-		cs := []string{"-test.run=^TestHelperProcess_Run$", "--", name}
-		cs = append(cs, args...)
-		cmd := exec.CommandContext(ctx, os.Args[0], cs...)
-		cmd.Env = append(os.Environ(), 
-			"GO_WANT_HELPER_PROCESS=1", 
-			"MOCK_RUN_MODE=failover",
-			"MOCK_AUTH_PATH="+targetPath,
-		)
-		return cmd
+	cmd := &cobra.Command{Use: "run <tool>", Args: cobra.MinimumNArgs(1), RunE: runWrap, SilenceErrors: true, SilenceUsage: true}
+	addRunFlags(cmd)
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	cmd.SetOut(stdout)
+	cmd.SetErr(stderr)
+	cmd.SetIn(strings.NewReader(""))
+	return cmd, stdout, stderr, root, logPath
+}
+
+func readRunInvocations(t *testing.T, path string) []runInvocation {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
 	}
-	
-	err = runWrap(runCmd, []string{"claude", "prompt"})
 	require.NoError(t, err)
-	
-db, err = caamdb.Open()
+	var calls []runInvocation
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	for {
+		var call runInvocation
+		err := decoder.Decode(&call)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		require.NoError(t, err)
+		calls = append(calls, call)
+	}
+	return calls
+}
+
+func TestRunRejectsInvalidRetrySettingsBeforeActivation(t *testing.T) {
+	for _, tc := range []struct {
+		name, settings string
+		flags          []string
+	}{
+		{"negative retries", `{"max_retries":-1}`, nil},
+		{"negative provider delay", `{"providers":{"claude":{"initial_delay":"-1s"}}}`, nil},
+		{"zero multiplier", `{"backoff_multiplier":0}`, nil},
+		{"inverted delays", `{"initial_delay":"2s","max_delay":"1s"}`, nil},
+		{"negative flag", `{}`, []string{"--max-retries", "-1"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd, _, _, _, logPath := setupHeadlessRun(t, tc.settings, "success")
+			before, err := os.ReadFile(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json"))
+			require.NoError(t, err)
+			args := append([]string{"claude"}, tc.flags...)
+			cmd.SetArgs(append(args, "--", "-p", "test prompt"))
+			require.ErrorContains(t, cmd.Execute(), "invalid retry settings")
+			require.Empty(t, readRunInvocations(t, logPath))
+			after, err := os.ReadFile(filepath.Join(os.Getenv("CLAUDE_CONFIG_DIR"), ".credentials.json"))
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+		})
+	}
+}
+
+type cancelRunWaitWriter struct {
+	bytes.Buffer
+	cancel context.CancelFunc
+}
+
+func (w *cancelRunWaitWriter) Write(data []byte) (int, error) {
+	if bytes.Contains(bytes.ToLower(data), []byte("waiting")) {
+		w.cancel()
+	}
+	return w.Buffer.Write(data)
+}
+
+func TestRunCancellationDuringBackoffDoesNotSwitch(t *testing.T) {
+	cmd, _, _, _, logPath := setupHeadlessRun(t, `{"initial_delay":"1h","max_delay":"1h"}`, "all-limited")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd.SetContext(ctx)
+	cmd.SetErr(&cancelRunWaitWriter{cancel: cancel})
+	cmd.SetArgs([]string{"claude", "--", "-p", "test prompt"})
+	require.ErrorIs(t, cmd.Execute(), context.Canceled)
+	calls := readRunInvocations(t, logPath)
+	require.Len(t, calls, 1)
+	current, err := vault.CurrentProfile(authfile.ClaudeAuthFiles())
 	require.NoError(t, err)
-	defer db.Close()
-	
-	ev, err := db.ActiveCooldown("claude", "active_profile", time.Now())
-	require.NoError(t, err)
-	require.NotNil(t, ev, "Active profile should be in cooldown")
-	
-h.EndStep("Failover")
+	require.Equal(t, "z-active", current)
+}
+
+func TestRunNativeExecutionModes(t *testing.T) {
+	for _, tc := range []struct {
+		name, tool string
+		args       []string
+		terminal   bool
+		headless   bool
+	}{
+		{"Claude TUI with prompt", "claude", []string{"explain code"}, true, false},
+		{"Claude print", "claude", []string{"-p", "explain code"}, true, true},
+		{"Claude long print", "claude", []string{"--print", "explain code"}, true, true},
+		{"Claude literal print after delimiter", "claude", []string{"--", "--print"}, true, false},
+		{"Codex execution", "codex", []string{"exec", "explain code"}, true, true},
+		{"Codex alias", "codex", []string{"e", "explain code"}, true, true},
+		{"Codex TUI prompt", "codex", []string{"explain code"}, true, false},
+		{"Gemini headless", "gemini", []string{"--prompt=explain code"}, true, true},
+		{"Gemini interactive prompt", "gemini", []string{"-i", "explain code"}, true, false},
+		{"Gemini explicit interactive with redirected input", "gemini", []string{"-i", "explain code"}, false, false},
+		{"Cursor print", "cursor", []string{"--print", "explain code"}, true, true},
+		{"OpenCode run", "opencode", []string{"run", "explain code"}, true, true},
+		{"redirected process", "grok", []string{"prompt"}, false, true},
+		{"native interactive default", "grok", nil, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.headless, runUsesHeadless(tc.tool, tc.args, tc.terminal))
+		})
+	}
 }

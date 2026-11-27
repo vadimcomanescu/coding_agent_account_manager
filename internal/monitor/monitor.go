@@ -87,7 +87,7 @@ func WithAuthPool(pool *authpool.AuthPool) MonitorOption {
 func NewMonitor(opts ...MonitorOption) *Monitor {
 	m := &Monitor{
 		interval:  30 * time.Second,
-		providers: []string{"claude", "codex", "gemini", "opencode", "cursor"},
+		providers: []string{"claude", "codex", "gemini", "grok", "opencode", "cursor"},
 		fetcher:   usage.NewMultiProfileFetcher(),
 		vault:     authfile.NewVault(authfile.DefaultVaultPath()),
 		health:    health.NewStorage(""),
@@ -98,6 +98,9 @@ func NewMonitor(opts ...MonitorOption) *Monitor {
 
 	for _, opt := range opts {
 		opt(m)
+	}
+	if m.vault != nil && m.health != nil {
+		m.health.SetVaultPath(m.vault.BasePath())
 	}
 
 	if m.state == nil {
@@ -173,19 +176,19 @@ func (m *Monitor) Refresh(ctx context.Context) error {
 			token, err := m.readAccessToken(provider, name)
 			if err != nil {
 				state.Profiles[profileKey(provider, name)] = m.buildProfileState(provider, name, &usage.UsageInfo{
-					Provider:  provider,
+					Provider:    provider,
 					ProfileName: name,
-					Error:     err.Error(),
-					FetchedAt: time.Now(),
+					Error:       err.Error(),
+					FetchedAt:   time.Now(),
 				}, cooldowns)
 				continue
 			}
 			if token == "" {
 				state.Profiles[profileKey(provider, name)] = m.buildProfileState(provider, name, &usage.UsageInfo{
-					Provider:  provider,
+					Provider:    provider,
 					ProfileName: name,
-					Error:     "missing access token",
-					FetchedAt: time.Now(),
+					Error:       "missing access token",
+					FetchedAt:   time.Now(),
 				}, cooldowns)
 				continue
 			}
@@ -212,10 +215,10 @@ func (m *Monitor) Refresh(ctx context.Context) error {
 			info := item.Usage
 			if info == nil {
 				info = &usage.UsageInfo{
-					Provider:  res.provider,
+					Provider:    res.provider,
 					ProfileName: item.ProfileName,
-					Error:     "usage fetch returned nil",
-					FetchedAt: time.Now(),
+					Error:       "usage fetch returned nil",
+					FetchedAt:   time.Now(),
 				}
 			}
 			if info.ProfileName == "" {
@@ -292,23 +295,16 @@ func (m *Monitor) readAccessToken(provider, name string) (string, error) {
 
 	switch provider {
 	case "claude":
-		profilePath := m.vault.ProfilePath(provider, name)
-		creds := filepath.Join(profilePath, ".credentials.json")
-		token, _, err := usage.ReadClaudeCredentials(creds)
-		if err != nil {
-			oldPath := filepath.Join(profilePath, ".claude.json")
-			token, _, err = usage.ReadClaudeCredentials(oldPath)
-			if err != nil {
-				authPath := filepath.Join(profilePath, "auth.json")
-				token, _, err = usage.ReadClaudeCredentials(authPath)
-			}
-		}
-		return token, err
+		selected, err := usage.ReadClaudeProfileCredentials(m.vault.ProfilePath(provider, name))
+		return selected.AccessToken, err
 	case "codex":
 		authPath := filepath.Join(m.vault.ProfilePath(provider, name), "auth.json")
 		token, _, err := usage.ReadCodexCredentials(authPath)
 		return token, err
-	case "opencode", "cursor":
+	case "grok", "cursor":
+		authPath := filepath.Join(m.vault.ProfilePath(provider, name), "auth.json")
+		return usage.NativeCredentialLocator(provider, authPath)
+	case "opencode":
 		return "", fmt.Errorf("usage fetch not yet supported for provider %s", provider)
 	default:
 		return "", fmt.Errorf("usage fetch unsupported for provider %s", provider)

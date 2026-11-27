@@ -110,12 +110,19 @@ func CalculateStatus(health *ProfileHealth) HealthStatus {
 // CalculateHealth performs detailed health scoring based on multiple factors.
 // Returns the status and the raw numerical score.
 func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float64) {
+	return calculateHealthAt(h, config, time.Now())
+}
+
+func calculateHealthAt(h *ProfileHealth, config HealthConfig, now time.Time) (HealthStatus, float64) {
 	if h == nil {
 		return StatusUnknown, 0
 	}
 
 	score := 0.0
-	now := time.Now()
+	warningTTL := time.Duration(config.TokenExpiryWarningMinutes) * time.Minute
+	if !h.CredentialRenewable() && h.ReloginWarningLead > warningTTL {
+		warningTTL = h.ReloginWarningLead
+	}
 
 	// Factor 1: Token expiry (primary)
 	if h.CredentialRenewable() {
@@ -126,12 +133,12 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		score += 1.0
 	} else if h.TokenExpiresAt.IsZero() {
 		// Unknown expiry - neutral
-	} else if h.TokenExpiresAt.Before(now) {
+	} else if !h.TokenExpiresAt.After(now) {
 		score -= 1.0 // Expired
 	} else {
 		ttl := h.TokenExpiresAt.Sub(now)
 		switch {
-		case ttl > time.Duration(config.TokenExpiryWarningMinutes)*time.Minute:
+		case ttl > warningTTL:
 			score += 1.0 // Healthy
 		case ttl > time.Duration(config.TokenExpiryCriticalMinutes)*time.Minute:
 			score += 0.5 // Warning zone
@@ -180,8 +187,8 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 	// months-old access-token expiry that the CLI renews on next use
 	// (issue #102).
 	if !h.TokenExpiresAt.IsZero() && !h.CredentialRenewable() {
-		if h.TokenExpiresAt.Before(now) {
-			if h.RateLimited(now) {
+		if !h.TokenExpiresAt.After(now) {
+			if h.RateLimited(now) && h.ReloginWarningLead <= 0 {
 				// An active rate-limit cooldown outranks the recorded expiry:
 				// the account recovers on the reset timer, not via re-login,
 				// and the expiry timestamp may come from a stale vault
@@ -196,11 +203,10 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 		} else {
 			ttl := h.TokenExpiresAt.Sub(now)
 			criticalTTL := time.Duration(config.TokenExpiryCriticalMinutes) * time.Minute
-			warningTTL := time.Duration(config.TokenExpiryWarningMinutes) * time.Minute
 			if criticalTTL > 0 && ttl <= criticalTTL {
 				status = StatusCritical
 			} else if warningTTL > 0 && ttl <= warningTTL {
-				// If within warning window (e.g. < 1h), ensure at least Warning
+				// Include the longer lead for logins that only a human can replace.
 				if status == StatusHealthy {
 					status = StatusWarning
 				}
@@ -216,6 +222,16 @@ func CalculateHealth(h *ProfileHealth, config HealthConfig) (HealthStatus, float
 
 	if h.ErrorCount1h >= config.ErrorCountCritical {
 		status = StatusCritical
+	}
+
+	// A provider rejection of this credential is definitive: the account
+	// cannot be used until someone logs in again, however healthy the file
+	// looks (issue #108).
+	if h.ProviderRejected() {
+		status = StatusCritical
+		if score > -1.0 {
+			score = -1.0
+		}
 	}
 
 	return status, score

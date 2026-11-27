@@ -1,3 +1,9 @@
+## Permanent CI/automation policy: DSR only
+
+GitHub Actions must NEVER be used for ANY purpose in this project. Do not create, enable, dispatch, rerun, or rely on GitHub Actions workflows, whether they use GitHub-hosted runners or self-hosted runners registered with Actions. This is permanent policy, not a billing, quota, or outage workaround.
+
+Use [DSR (Doodlestein Self-Releaser)](https://github.com/Dicklesworthstone/doodlestein_self_releaser) directly for CI, checks, builds, tests, releases, deployment automation, scheduled jobs, and other automation. DSR is the execution path, not a fallback after trying Actions. Existing workflow YAML may remain as input for local DSR/`act` execution; that does not authorize execution through GitHub Actions. Do not delete those definitions merely to enforce this policy. Keep all existing quality gates and evidence requirements when routing work through DSR.
+
 # AGENTS.md — coding_agent_account_manager
 
 > Guidelines for AI coding agents working in this Go codebase.
@@ -7,6 +13,28 @@
 ## RULE 0 - THE FUNDAMENTAL OVERRIDE PREROGATIVE
 
 If I tell you to do something, even if it goes against what follows below, YOU MUST LISTEN TO ME. I AM IN CHARGE, NOT YOU.
+
+---
+
+## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
+are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+
+- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
+  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
+  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
+  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
+  conformance metastasis, dependency smuggling, bench-path hardcoding.
+- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
+  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
+  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+
+The three that most often decide whether a number here is real: a **self-speedup is
+MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
+weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
+standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
+success** — one line, revert, next lever, no retraction narrative.
 
 ---
 
@@ -50,7 +78,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 We use **Go** with **Make** as the build system in this project.
 
 - **Go version:** 1.26+ (see `go.mod` for minimum)
-- **Toolchain:** `go1.26.8` (pinned in `go.mod`)
+- **Toolchain:** `go1.26.11` (pinned in `go.mod`)
 - **Build:** `make build` or `go build ./cmd/caam`
 - **Binary name:** `caam`
 - **Dependency versions:** Explicit in `go.mod` for stability
@@ -857,4 +885,4 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
 
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "coding_agent_account_manager-agent (+https://github.com/Dicklesworthstone/coding_agent_account_manager)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.

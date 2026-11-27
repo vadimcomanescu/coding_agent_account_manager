@@ -6,11 +6,13 @@ package authfile
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/testutil"
 )
@@ -83,10 +85,110 @@ func keychainState(email string) string {
 	return string(raw)
 }
 
+func TestHasAuthFilesReadOnlyKeychain(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		credential      string
+		mirror          string
+		denied          bool
+		disabled        bool
+		explicitConfig  bool
+		missingKeychain bool
+		want            bool
+	}{
+		{name: "keychain only", credential: keychainCreds("live"), want: true},
+		{name: "keychain supersedes stale mirror", credential: keychainCreds("live"), mirror: keychainCreds("old"), want: true},
+		{name: "keychain supersedes malformed mirror", credential: keychainCreds("live"), mirror: `{`, want: true},
+		{name: "missing item without mirror"},
+		{name: "missing item uses file", mirror: keychainCreds("file"), want: true},
+		{name: "missing keychain uses file", mirror: keychainCreds("file"), missingKeychain: true, want: true},
+		{name: "denial cannot use stale mirror", credential: keychainCreds("live"), mirror: keychainCreds("old"), denied: true},
+		{name: "malformed keychain cannot use stale mirror", credential: `{`, mirror: keychainCreds("old")},
+		{name: "null keychain grant", credential: `{"claudeAiOauth":null}`, mirror: keychainCreds("old")},
+		{name: "null access token", credential: `{"claudeAiOauth":{"accessToken":null}}`},
+		{name: "refresh token alone", credential: `{"claudeAiOauth":{"refreshToken":"refresh"}}`},
+		{name: "malformed refresh token", credential: `{"claudeAiOauth":{"accessToken":"access","refreshToken":3}}`},
+		{name: "malformed expiry", credential: `{"claudeAiOauth":{"accessToken":"access","expiresAt":"later"}}`},
+		{name: "disabled keychain uses file", credential: `{`, mirror: keychainCreds("file"), disabled: true, want: true},
+		{name: "explicit config ignores default keychain", credential: keychainCreds("other-account"), explicitConfig: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newKeychainFixture(t)
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "")
+			if tc.credential != "" {
+				f.storeToken(tc.credential)
+			}
+			if tc.mirror != "" {
+				writeFixtureFile(t, f.credPath, tc.mirror)
+			}
+			state := keychainState("unproven-label@example.com")
+			writeFixtureFile(t, f.statePath, state)
+			if tc.denied {
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+			}
+			if tc.disabled {
+				t.Setenv("CAAM_KEYCHAIN", "0")
+			}
+			if tc.explicitConfig {
+				t.Setenv("CLAUDE_CONFIG_DIR", filepath.Dir(f.credPath))
+			}
+			if tc.missingKeychain {
+				fakeMissingLoginKeychain(t)
+			}
+
+			// Repeated dashboard polling must keep using the authoritative
+			// source without publishing or memoizing a credential mirror.
+			for range 2 {
+				if got := HasAuthFilesReadOnly(f.fileSet); got != tc.want {
+					t.Fatalf("read-only presence = %v, want %v", got, tc.want)
+				}
+			}
+			if tc.mirror == "" {
+				if _, err := os.Lstat(f.credPath); !os.IsNotExist(err) {
+					t.Fatalf("read-only presence created a mirror: %v", err)
+				}
+			} else if got := readFixtureFile(t, f.credPath); got != tc.mirror {
+				t.Fatal("read-only presence changed the existing credential mirror")
+			}
+			if got := readFixtureFile(t, f.statePath); got != state {
+				t.Fatal("read-only presence changed native settings")
+			}
+			if got, present := f.storedToken(); present != (tc.credential != "") || got != tc.credential {
+				t.Fatal("read-only presence changed the keychain item")
+			}
+			if _, err := os.Lstat(f.vaultDir); !os.IsNotExist(err) {
+				t.Fatalf("read-only presence created a vault: %v", err)
+			}
+		})
+	}
+}
+
+func TestExplicitClaudeConfigDoesNotUseDefaultKeychain(t *testing.T) {
+	f := newKeychainFixture(t)
+	f.storeToken(keychainCreds("default-host-account"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Dir(f.credPath))
+	if path := claudeKeychainPath(ClaudeAuthFiles()); path != "" {
+		t.Fatalf("explicit configuration selected the default keychain bridge: %s", path)
+	}
+	if err := f.vault.Backup(ClaudeAuthFiles(), "explicit"); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("explicit configuration backed up the default host keychain: %v", err)
+	}
+	if _, err := os.Stat(f.credPath); !os.IsNotExist(err) {
+		t.Fatalf("default host keychain was mirrored into explicit configuration: %v", err)
+	}
+	if got, ok := f.storedToken(); !ok || got != keychainCreds("default-host-account") {
+		t.Fatal("explicit configuration changed the default host keychain")
+	}
+}
+
 // TestBackupCapturesKeychainToken is the headline of #98: with the token only
 // in the keychain, the vault profile must still get a .credentials.json.
 func TestBackupCapturesKeychainToken(t *testing.T) {
 	f := newKeychainFixture(t)
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		keychainCreds("at-live"): {AccountID: "account-alice", OrganizationID: "org-alice", Email: "alice@example.com"},
+	})
 	f.storeToken(keychainCreds("at-live"))
 	writeFixtureFile(t, f.statePath, keychainState("alice@example.com"))
 
@@ -133,10 +235,39 @@ func TestBackupFailsWhenKeychainRefuses(t *testing.T) {
 	}
 }
 
+func TestRestoreRejectsCredentiallessProfileBeforeKeychainMirror(t *testing.T) {
+	f := newKeychainFixture(t)
+	f.storeToken(keychainCreds("live-access"))
+	const target = "identity-only"
+	profileDir := f.vault.ProfilePath("claude", target)
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, filepath.Join(profileDir, ".claude.json"), keychainState("target@example.com"))
+	liveState := keychainState("live@example.com")
+	writeFixtureFile(t, f.statePath, liveState)
+	if err := f.vault.Restore(f.fileSet, target); !errors.Is(err, ErrNoCredentials) {
+		t.Fatalf("Restore() = %v, want ErrNoCredentials", err)
+	}
+	if _, err := os.Stat(f.credPath); !os.IsNotExist(err) {
+		t.Fatalf("failed activation mirrored the keychain into live credentials: %v", err)
+	}
+	if got := readFixtureFile(t, f.statePath); got != liveState {
+		t.Fatal("failed activation changed live account identity")
+	}
+	if got, ok := f.storedToken(); !ok || got != keychainCreds("live-access") {
+		t.Fatal("failed activation changed the login keychain")
+	}
+}
+
 // TestRestorePushesTokenToKeychain: activate only changes the account once the
 // snapshot is back in the keychain.
 func TestRestorePushesTokenToKeychain(t *testing.T) {
 	f := newKeychainFixture(t)
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		keychainCreds("at-alice"): {AccountID: "account-alice", OrganizationID: "org-alice", Email: "alice@example.com"},
+		keychainCreds("at-bob"):   {AccountID: "account-bob", OrganizationID: "org-bob", Email: "bob@example.com"},
+	})
 
 	// Two accounts backed up while each was live.
 	f.storeToken(keychainCreds("at-alice"))
@@ -173,6 +304,9 @@ func TestRestorePushesTokenToKeychain(t *testing.T) {
 // keychain still holds the previous account is exactly the bug.
 func TestRestoreFailsWhenKeychainRefuses(t *testing.T) {
 	f := newKeychainFixture(t)
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		keychainCreds("at-alice"): {AccountID: "account-alice", OrganizationID: "org-alice", Email: "alice@example.com"},
+	})
 	f.storeToken(keychainCreds("at-alice"))
 	writeFixtureFile(t, f.statePath, keychainState("alice@example.com"))
 	if err := f.vault.Backup(f.fileSet, "alice"); err != nil {
@@ -225,6 +359,9 @@ func TestClearAuthFilesRemovesKeychainItem(t *testing.T) {
 // login keychain, everything falls back to files exactly as before.
 func TestBridgeIsInertWhenDisabled(t *testing.T) {
 	f := newKeychainFixture(t)
+	setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+		keychainCreds("at-file"): {AccountID: "account-alice", OrganizationID: "org-alice", Email: "alice@example.com"},
+	})
 	f.storeToken(keychainCreds("at-keychain"))
 	t.Setenv("CAAM_KEYCHAIN", "0")
 
@@ -242,6 +379,211 @@ func TestBridgeIsInertWhenDisabled(t *testing.T) {
 	}
 	if stored, _ := f.storedToken(); stored != keychainCreds("at-keychain") {
 		t.Fatalf("disabled bridge wrote the keychain: %q", stored)
+	}
+}
+
+func fakeMissingLoginKeychain(t *testing.T) {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "security")
+	const script = `#!/bin/sh
+echo "security: A default keychain could not be found." >&2
+exit 44
+`
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAAM_KEYCHAIN_BIN", bin)
+	keychain.ForgetMirrors()
+}
+
+func TestClaudeActivationKeychainAvailability(t *testing.T) {
+	for _, operation := range []string{"Restore", "Switch"} {
+		for _, tc := range []struct {
+			name        string
+			wantReadErr error
+			wantErr     error
+		}{
+			{name: "no_login_keychain", wantReadErr: keychain.ErrNoKeychain},
+			{name: "missing_item", wantReadErr: keychain.ErrNotFound},
+			{name: "access_denied", wantReadErr: keychain.ErrDenied, wantErr: keychain.ErrDenied},
+		} {
+			t.Run(operation+"/"+tc.name, func(t *testing.T) {
+				f := newKeychainFixture(t)
+				t.Setenv("CLAUDE_CONFIG_DIR", "")
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "")
+				incoming := keychainCreds("incoming")
+				outgoing := keychainCreds("outgoing")
+				setClaudeFixtureIdentities(t, f.vault, map[string]identity.Identity{
+					incoming: {AccountID: "account-incoming", OrganizationID: "org-incoming", Email: "incoming@example.com"},
+					outgoing: {AccountID: "account-outgoing", OrganizationID: "org-outgoing", Email: "outgoing@example.com"},
+				})
+				writeFixtureFile(t, f.credPath, incoming)
+				writeFixtureFile(t, f.statePath, keychainState("incoming@example.com"))
+				if err := f.vault.Backup(f.fileSet, "incoming"); err != nil {
+					t.Fatalf("prepare incoming profile: %v", err)
+				}
+				const liveState = `{"numStartups":91,"theme":"native","oauthAccount":{"emailAddress":"outgoing@example.com","accountUuid":"acct-outgoing@example.com"}}`
+				writeFixtureFile(t, f.credPath, outgoing)
+				writeFixtureFile(t, f.statePath, liveState)
+				switch tc.name {
+				case "no_login_keychain":
+					fakeMissingLoginKeychain(t)
+				case "access_denied":
+					f.storeToken(outgoing)
+					t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+				}
+				if _, err := keychain.ReadClaude(); !errors.Is(err, tc.wantReadErr) {
+					t.Fatalf("fixture keychain error = %v, want %v", err, tc.wantReadErr)
+				}
+				var result *SwitchResult
+				var err error
+				if operation == "Restore" {
+					err = f.vault.Restore(f.fileSet, "incoming")
+				} else {
+					result, err = f.vault.Switch(f.fileSet, "incoming", SwitchOptions{BackupMode: "always"})
+				}
+				if tc.wantErr != nil {
+					if !errors.Is(err, tc.wantErr) {
+						t.Fatalf("%s error = %v, want %v", operation, err, tc.wantErr)
+					}
+					if result != nil && result.RestoreStarted {
+						t.Fatal("denied keychain reached credential restoration")
+					}
+					if readFixtureFile(t, f.credPath) != outgoing || readFixtureFile(t, f.statePath) != liveState {
+						t.Fatal("denied keychain changed live credentials or native settings")
+					}
+					if got, ok := f.storedToken(); !ok || got != outgoing {
+						t.Fatal("denied keychain changed the outgoing item")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("%s: %v", operation, err)
+				}
+				if got := readFixtureFile(t, f.credPath); got != incoming {
+					t.Fatalf("%s did not install the incoming file-backed credential", operation)
+				}
+				var state struct {
+					NumStartups  int    `json:"numStartups"`
+					Theme        string `json:"theme"`
+					OAuthAccount struct {
+						Email string `json:"emailAddress"`
+					} `json:"oauthAccount"`
+				}
+				if err := json.Unmarshal([]byte(readFixtureFile(t, f.statePath)), &state); err != nil {
+					t.Fatal(err)
+				}
+				// MergeLegacy shares allowlisted workflow fields such as theme.
+				// Unshared state such as numStartups comes from the target snapshot.
+				if state.NumStartups != 3 || state.Theme != "native" || state.OAuthAccount.Email != "incoming@example.com" {
+					t.Fatalf("activation did not preserve native policy and select incoming profile state: %+v", state)
+				}
+				stored, exists := f.storedToken()
+				if tc.name == "missing_item" {
+					if !exists || stored != incoming {
+						t.Fatal("available keychain did not receive its missing Claude item")
+					}
+				} else if exists {
+					t.Fatal("file-backed activation unexpectedly created a keychain item")
+				}
+				if operation == "Switch" {
+					if result == nil || !result.RestoreStarted || result.AutoBackup == "" {
+						t.Fatalf("Switch did not preserve outgoing recovery: %+v", result)
+					}
+					recovery := filepath.Join(f.vault.ProfilePath("claude", result.AutoBackup), ".credentials.json")
+					if got := readFixtureFile(t, recovery); got != outgoing {
+						t.Fatal("Switch recovery does not contain the outgoing file-backed credential")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestClaudeKeychainPublicationRejectsLaterUnavailability(t *testing.T) {
+	f := newKeychainFixture(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	authority, err := prepareClaudeKeychainPublication(f.fileSet)
+	if err != nil || authority == nil {
+		t.Fatalf("prepare empty available authority: %v", err)
+	}
+	defer authority.cleanup()
+	fakeMissingLoginKeychain(t)
+	if err := authority.stage(); !errors.Is(err, keychain.ErrNoKeychain) {
+		t.Fatalf("captured authority accepted a disappearing keychain: %v", err)
+	}
+}
+
+func TestClaudeKeychainPublicationRetainsRecoveryAfterUnavailableReadback(t *testing.T) {
+	f := newKeychainFixture(t)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	outgoing := keychainCreds("outgoing")
+	incoming := keychainCreds("incoming")
+	f.storeToken(outgoing)
+	authority, err := prepareClaudeKeychainPublication(f.fileSet)
+	if err != nil || authority == nil {
+		t.Fatalf("prepare keychain authority: %v", err)
+	}
+	defer authority.cleanup()
+	authority.want = []byte(incoming)
+	if err := authority.stage(); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureFile(t, f.credPath, incoming)
+	write := authority.write
+	authority.write = func(data []byte) error {
+		if err := write(data); err != nil {
+			return err
+		}
+		fakeMissingLoginKeychain(t)
+		return nil
+	}
+	if err := authority.publish(); !errors.Is(err, keychain.ErrNoKeychain) {
+		t.Fatalf("unavailable readback error = %v, want ErrNoKeychain", err)
+	}
+	authority.cleanup()
+	if !authority.keepBackup || authority.backup == "" {
+		t.Fatal("uncertain publication did not retain its recovery copy")
+	}
+	if got := readFixtureFile(t, authority.backup); got != outgoing {
+		t.Fatal("uncertain publication lost the outgoing keychain credential")
+	}
+	if got, ok := f.storedToken(); !ok || got != incoming {
+		t.Fatal("unavailable readback replayed the outgoing keychain item")
+	}
+}
+
+func TestClaudeKeychainPostconditionDistinguishesUnavailableAndMissing(t *testing.T) {
+	for _, mode := range []string{"no_login_keychain", "missing_item", "access_denied"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newKeychainFixture(t)
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			incoming := keychainCreds("incoming")
+			writeFixtureFile(t, f.credPath, incoming)
+			switch mode {
+			case "no_login_keychain":
+				fakeMissingLoginKeychain(t)
+			case "access_denied":
+				t.Setenv("CAAM_FAKE_KEYCHAIN_LOCKED", "1")
+			}
+			err := pushClaudeKeychain(f.fileSet)
+			if mode == "no_login_keychain" {
+				if err != nil {
+					t.Fatalf("file-backed postcondition: %v", err)
+				}
+			} else if err == nil {
+				t.Fatal("missing or denied authoritative item passed the postcondition")
+			} else if mode == "access_denied" && !errors.Is(err, keychain.ErrDenied) {
+				t.Fatalf("denial error = %v, want ErrDenied", err)
+			}
+			if _, ok := f.storedToken(); ok {
+				t.Fatal("postcondition wrote an item to the keychain")
+			}
+			if got := readFixtureFile(t, f.credPath); got != incoming {
+				t.Fatal("postcondition changed the live credential")
+			}
+		})
 	}
 }
 

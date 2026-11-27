@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +27,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/exec"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/project"
@@ -133,12 +136,23 @@ Advanced: Profile isolation for simultaneous sessions:
 
 Run 'caam' without arguments to launch the interactive TUI.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// If called with no subcommand, launch TUI
+		// If called with no subcommand, launch the TUI, unless it is
+		// disabled or there is no terminal to draw it on. Then print the
+		// plain status table instead of starting a full-screen program
+		// that would hang a pipe or CI job.
+		if reason := tuiUnavailableReason(); reason != "" {
+			fmt.Fprintf(cmd.ErrOrStderr(), "caam: not starting the interactive TUI (%s); showing 'caam status'. Run 'caam --help' for all commands.\n", reason)
+			return runStatus(statusCmd, nil)
+		}
 		return tui.Run()
 	},
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if _, err := config.MigrateDataToCAAMHome(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: data migration skipped: %v\n", err)
+		// Environment exports are read-only, including when CAAM_HOME points
+		// at a new store that would otherwise trigger a legacy data migration.
+		if !isEnvironmentExport(cmd) {
+			if _, err := config.MigrateDataToCAAMHome(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: data migration skipped: %v\n", err)
+			}
 		}
 
 		// Initialize vault
@@ -170,6 +184,9 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 		var err error
 		cfg, err = config.Load()
 		if err != nil {
+			if isEnvironmentExport(cmd) {
+				emitEvalFailure(cmd)
+			}
 			return fmt.Errorf("load config: %w", err)
 		}
 
@@ -213,6 +230,9 @@ func ExitCode(err error) int {
 // - Already doing validation (validate, doctor)
 // - JSON output mode (warnings would corrupt output)
 func shouldShowWarnings(cmd *cobra.Command) bool {
+	if isEnvironmentExport(cmd) {
+		return false
+	}
 	// Skip for commands that don't benefit from warnings
 	skipCommands := map[string]bool{
 		"version":    true, // Quick info command
@@ -260,6 +280,20 @@ func showTokenWarnings(ctx context.Context) {
 	warnings.PrintToStderr(warns, false)
 }
 
+// tuiUnavailableReason says why bare 'caam' must not start the TUI, or
+// returns "" when it can. The TUI needs a terminal on stdin and stdout, and
+// can be turned off with NO_TUI/CAAM_NO_TUI or tui.no_tui in config.yaml.
+func tuiUnavailableReason() string {
+	cfg, err := config.LoadSPMConfig()
+	if err == nil && cfg.TUI.NoTUI {
+		return "disabled by NO_TUI/CAAM_NO_TUI or tui.no_tui in config.yaml"
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !isTerminal() {
+		return "stdin or stdout is not a terminal"
+	}
+	return ""
+}
+
 // isTerminal returns true if stdout is a terminal.
 func isTerminal() bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
@@ -280,6 +314,12 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 			ph = stored
 		}
 	}
+	if tool == "cursor" {
+		// Expiry belongs to the credential currently on disk. If a Cursor
+		// login changes to an opaque token or malformed file, stored health
+		// must not invent a deadline from its previous credential.
+		applyExpiryInfo(ph, &health.ExpiryInfo{})
+	}
 
 	// Get auth files from vault profile
 	vaultPath := vault.ProfilePath(tool, profileName)
@@ -296,14 +336,14 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 		authPath := filepath.Join(vaultPath, "auth.json")
 		expInfo, err = health.ParseCodexExpiry(authPath)
 	case "gemini":
-		// Migrate legacy vault filename before reading.
-		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		expInfo, err = health.ParseGeminiExpiry(vaultPath)
 	case "grok":
 		// Grok's auth.json is keyed by a dynamic "<issuer>::<client-id>" key,
 		// which the Codex parser cannot read; without its own case every Grok
 		// profile scored as unknown-expiry and stuck at warning (issue #101).
 		expInfo, err = health.ParseGrokExpiry(filepath.Join(vaultPath, "auth.json"))
+	case "cursor":
+		expInfo, err = health.ParseCursorExpiry(filepath.Join(vaultPath, "auth.json"))
 	}
 
 	// Prefer the profile's own live credential over the vault snapshot.
@@ -314,10 +354,12 @@ func buildProfileHealth(tool, profileName string) *health.ProfileHealth {
 	// reads the real, current token; it also keeps TokenExpiresAt from
 	// staying zero, which capped the verdict at 🟡 Warning forever (issue
 	// #60).
-	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil && !liveExp.ExpiresAt.IsZero() {
+	if liveExp := parseLiveProfileExpiry(tool, profileName); liveExp != nil {
 		applyExpiryInfo(ph, liveExp)
-	} else if err == nil && expInfo != nil && !expInfo.ExpiresAt.IsZero() {
+	} else if err == nil && expInfo != nil {
 		// Fallback: the vault snapshot is the best information we have.
+		// API keys can have no expiry; still copy their credential semantics
+		// and clear any deadline left by a previous session login.
 		applyExpiryInfo(ph, expInfo)
 	}
 
@@ -333,6 +375,8 @@ func applyExpiryInfo(ph *health.ProfileHealth, info *health.ExpiryInfo) {
 	ph.TokenExpiresAt = info.ExpiresAt
 	ph.SelfRefreshing = info.SelfRefreshing
 	ph.TokenRenewable = info.Renewable
+	ph.ReloginWarningLead = info.ReloginWarningLead
+	ph.CredentialFingerprint = info.Fingerprint
 }
 
 // liveAuthExpiry parses token expiry from the tool's live (in-use) auth
@@ -345,11 +389,28 @@ func liveAuthExpiry(tool string) *health.ExpiryInfo {
 	)
 	switch tool {
 	case "claude":
-		info, err = health.ParseClaudeExpiry("")
+		if configDir := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR")); configDir != "" {
+			// An explicit native config directory owns this login. Missing or
+			// opaque credentials there must not borrow another account's TTL.
+			info, err = health.ParseClaudeExpiry(configDir)
+			if err != nil {
+				return &health.ExpiryInfo{Source: configDir}
+			}
+		} else {
+			info, err = health.ParseClaudeExpiry("")
+		}
 	case "codex":
 		info, err = health.ParseCodexExpiry("")
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{}
+		}
 	case "gemini":
 		info, err = health.ParseGeminiExpiry("")
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{}
+		}
+	case "cursor":
+		info, err = health.ParseCursorExpiry("")
 	case "grok":
 		home, homeErr := os.UserHomeDir()
 		if homeErr != nil {
@@ -372,7 +433,10 @@ func applyLiveExpiry(tool string, ph *health.ProfileHealth) {
 	if ph == nil {
 		return
 	}
-	if info := liveAuthExpiry(tool); info != nil && !info.ExpiresAt.IsZero() {
+	if tool == "cursor" {
+		applyExpiryInfo(ph, &health.ExpiryInfo{})
+	}
+	if info := liveAuthExpiry(tool); info != nil {
 		applyExpiryInfo(ph, info)
 	}
 }
@@ -395,8 +459,9 @@ func applyActiveCooldown(tool, profileName string, ph *health.ProfileHealth) {
 }
 
 // parseLiveProfileExpiry reads the token expiry from a profile's own auth
-// directory (following adoption symlinks). Best-effort; returns nil on any
-// failure.
+// directory (following adoption symlinks). Present but unreadable credentials
+// return unknown expiry, so an older vault login cannot
+// supply a false deadline. Missing credentials allow a vault fallback.
 func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	if profileStore == nil {
 		return nil
@@ -409,12 +474,47 @@ func parseLiveProfileExpiry(tool, profileName string) *health.ExpiryInfo {
 	switch tool {
 	case "codex":
 		info, err = health.ParseCodexExpiry(filepath.Join(prof.CodexHomePath(), "auth.json"))
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{}
+		}
 	case "claude":
-		info, err = health.ParseClaudeExpiry(filepath.Join(prof.HomePath(), ".claude"))
+		p := claude.New()
+		env, envErr := p.Env(context.Background(), prof)
+		if envErr != nil {
+			return &health.ExpiryInfo{}
+		}
+		configDir := env["CLAUDE_CONFIG_DIR"]
+		info, err = health.ParseClaudeExpiry(configDir)
+		if errors.Is(err, health.ErrNoAuthFile) && configDir == filepath.Join(prof.HomePath(), ".claude") {
+			// Old legacy-only profiles keep their session state beside .claude
+			// until the required native preflight places it in the selected dir.
+			info, err = health.ParseClaudeExpiry(prof.HomePath())
+		}
+		if err != nil {
+			if !errors.Is(err, health.ErrNoAuthFile) {
+				return &health.ExpiryInfo{Source: configDir}
+			}
+			status, statusErr := p.Status(context.Background(), prof)
+			if statusErr != nil || (status != nil && (status.LoggedIn || status.Error != "")) {
+				return &health.ExpiryInfo{Source: configDir}
+			}
+		}
 	case "gemini":
 		info, err = health.ParseGeminiExpiry(filepath.Join(prof.HomePath(), ".gemini"))
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{}
+		}
 	case "grok":
 		info, err = health.ParseGrokExpiry(filepath.Join(prof.HomePath(), ".grok", "auth.json"))
+	case "cursor":
+		// The provider pins Cursor's environment to the defaults under its
+		// isolated HOME. Do not inherit the caller's XDG or APPDATA paths,
+		// or use the separate profile XDG tree which Cursor does not use.
+		paths := authfile.ResolveCursorPaths(prof.HomePath(), runtime.GOOS, func(string) string { return "" })
+		info, err = health.ParseCursorExpiry(paths.AuthFile)
+		if err != nil && !errors.Is(err, health.ErrNoAuthFile) {
+			return &health.ExpiryInfo{Source: paths.AuthFile}
+		}
 	default:
 		return nil
 	}
@@ -454,11 +554,10 @@ func getVaultIdentity(tool, profileName string) *identity.Identity {
 		normalizeIdentityPlan(id)
 		return id
 	case "gemini":
-		// Migrate legacy vault filename before reading.
-		_ = authfile.MigrateGeminiVaultDir(vaultPath)
 		candidates := []string{
 			filepath.Join(vaultPath, "settings.json"),
 			filepath.Join(vaultPath, "oauth_creds.json"),
+			filepath.Join(vaultPath, "oauth_credentials.json"),
 		}
 		for _, path := range candidates {
 			id, err := identity.ExtractFromGeminiConfig(path)
@@ -574,6 +673,31 @@ func formatIdentityDisplay(id *identity.Identity) (string, string) {
 		}
 	}
 	return email, plan
+}
+
+// formatOrganizationDisplay includes Claude's stable organization ID because
+// one account can belong to multiple organizations, including organizations
+// that share a display name. Neither the email nor the name identifies a grant.
+func formatOrganizationDisplay(id *identity.Identity) string {
+	if id == nil {
+		return "unknown"
+	}
+	name := strings.TrimSpace(id.Organization)
+	orgID := strings.TrimSpace(id.OrganizationID)
+	verification := ""
+	if !id.Verified {
+		verification = " [unverified]"
+	}
+	if name != "" && orgID != "" {
+		return fmt.Sprintf("%s (%s)%s", name, orgID, verification)
+	}
+	if orgID != "" {
+		return orgID + verification
+	}
+	if name != "" {
+		return name + " (ID unknown)" + verification
+	}
+	return "unknown"
 }
 
 // getCooldownString returns a formatted string showing cooldown remaining time.
@@ -750,11 +874,32 @@ var versionCmd = &cobra.Command{
 
 // backupOutput is the JSON output structure for backup command.
 type backupOutput struct {
-	Success bool   `json:"success"`
-	Tool    string `json:"tool"`
-	Profile string `json:"profile"`
-	Path    string `json:"path"`
-	Error   string `json:"error,omitempty"`
+	Success  bool     `json:"success"`
+	Tool     string   `json:"tool"`
+	Profile  string   `json:"profile"`
+	Path     string   `json:"path"`
+	Warnings []string `json:"warnings,omitempty"`
+	Error    string   `json:"error,omitempty"`
+}
+
+const claudeBackupIdentityWarning = "Claude account and organization could not be verified; unverified account labels were omitted."
+
+// Reporting a backup never initiates verification. An opaque OAuth grant can
+// be preserved offline, but its unverified labels must not look authoritative.
+func claudeBackupIdentityWarnings(profileDir string) []string {
+	path := filepath.Join(profileDir, ".credentials.json")
+	credential, err := os.ReadFile(path)
+	if err != nil {
+		return nil // API-key/helper profiles need no OAuth identity endpoint.
+	}
+	if _, err := identity.ClaudeCredentialFingerprint(credential); err != nil {
+		return nil
+	}
+	binding, err := identity.ReadClaudeIdentityBindingForCredentials(path, credential)
+	if err == nil && binding != nil {
+		return nil
+	}
+	return []string{claudeBackupIdentityWarning}
 }
 
 // backupCmd saves current auth files to the vault.
@@ -830,6 +975,9 @@ func runBackup(cmd *cobra.Command, args []string) error {
 
 	output.Success = true
 	output.Path = vault.ProfilePath(tool, profileName)
+	if tool == "claude" {
+		output.Warnings = claudeBackupIdentityWarnings(output.Path)
+	}
 
 	if jsonOutput {
 		enc := json.NewEncoder(cmd.OutOrStdout())
@@ -839,6 +987,9 @@ func runBackup(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("Backed up %s auth to profile '%s'\n", tool, profileName)
 	fmt.Printf("  Vault: %s\n", output.Path)
+	for _, warning := range output.Warnings {
+		fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", warning)
+	}
 	return nil
 }
 
@@ -871,6 +1022,28 @@ type statusHealth struct {
 
 	// The three-signal credential contract (issue #102); see lsHealth.
 	health.Signals
+
+	// Provider verification (issue #108); see lsHealth.
+	health.VerificationInfo
+}
+
+func buildStatusHealth(ph *health.ProfileHealth) *statusHealth {
+	if ph == nil {
+		return nil
+	}
+	result := &statusHealth{
+		Status:           health.CalculateStatus(ph).String(),
+		ErrorCount:       ph.ErrorCount1h,
+		Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
+		VerificationInfo: health.VerificationFor(ph),
+	}
+	if !ph.TokenExpiresAt.IsZero() {
+		result.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
+	}
+	if reasons := health.StatusReasons(ph); len(reasons) > 0 {
+		result.Reason = strings.Join(reasons, ", ")
+	}
+	return result
 }
 
 // statusCmd shows which profile is currently active.
@@ -899,7 +1072,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
 
-	toolsToCheck := []string{"codex", "claude", "gemini"}
+	toolsToCheck := []string{"codex", "claude", "gemini", "cursor"}
 	if len(args) > 0 {
 		tool := strings.ToLower(args[0])
 		if _, ok := tools[tool]; !ok {
@@ -919,7 +1092,11 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, tool := range toolsToCheck {
-		fileSet := tools[tool]()
+		getFileSet := tools[tool]
+		if getFileSet == nil {
+			continue
+		}
+		fileSet := getFileSet()
 		hasAuth := authfile.HasAuthFiles(fileSet)
 
 		if !hasAuth {
@@ -955,11 +1132,26 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			// `ls` lists saved profiles for the tool is confusing (issue #20).
 			savedProfiles, _ := vault.List(tool)
 			savedCount := len(savedProfiles)
+			var liveHealth *health.ProfileHealth
+			if tool == "cursor" {
+				// A live browser session can expire even before it has a saved
+				// profile. Report its own deadline without borrowing a vault name.
+				liveHealth = &health.ProfileHealth{}
+				applyLiveExpiry(tool, liveHealth)
+				liveStatus := health.CalculateStatus(liveHealth)
+				if liveStatus == health.StatusWarning || liveStatus == health.StatusCritical {
+					warnings = append(warnings, "cursor (live): "+health.FormatStatusWithReason(liveStatus, liveHealth, health.FormatOptions{NoColor: true}))
+				}
+				if rec := health.FormatRecommendation(tool, "", liveHealth); rec != "" {
+					recommendations = append(recommendations, rec)
+				}
+			}
 			if jsonOutput {
 				output.Tools = append(output.Tools, statusTool{
 					Tool:          tool,
 					LoggedIn:      true,
 					SavedProfiles: savedCount,
+					Health:        buildStatusHealth(liveHealth),
 				})
 			} else {
 				if savedCount > 0 {
@@ -970,6 +1162,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 					fmt.Printf("%-10s  (logged in; live auth matches no saved profile — %d saved %s available, see `caam ls %s`)\n", tool, savedCount, noun, tool)
 				} else {
 					fmt.Printf("%-10s  (logged in, no matching profile; none saved — save one with `caam add %s <name>`)\n", tool, tool)
+				}
+				if liveHealth != nil {
+					fmt.Printf("  Live login: %s\n", health.FormatStatusWithReason(health.CalculateStatus(liveHealth), liveHealth, formatOpts))
 				}
 			}
 			continue
@@ -987,17 +1182,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				LoggedIn:      true,
 				ActiveProfile: activeProfile,
 				Identity:      id,
-				Health: &statusHealth{
-					Status:     status.String(),
-					ErrorCount: ph.ErrorCount1h,
-					Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
-				},
-			}
-			if !ph.TokenExpiresAt.IsZero() {
-				st.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
-			}
-			if reasons := health.StatusReasons(ph); len(reasons) > 0 {
-				st.Health.Reason = strings.Join(reasons, ", ")
+				Health:        buildStatusHealth(ph),
 			}
 			// Get cooldown info
 			cooldownStr := getCooldownString(tool, activeProfile, health.FormatOptions{NoColor: true})
@@ -1075,15 +1260,64 @@ func runStatus(cmd *cobra.Command, args []string) error {
 type lsOutput struct {
 	Profiles []lsProfile `json:"profiles"`
 	Count    int         `json:"count"`
+	Warnings []string    `json:"warnings,omitempty"`
+
+	// IsolatedOnly lists isolated profiles (caam profile add) that have no
+	// vault profile of the same name, so they are not rows above. They run
+	// with caam exec, not caam activate (issue #110).
+	IsolatedOnly []lsIsolatedProfile `json:"isolated_only,omitempty"`
 }
 
+// Profile types. A vault profile is a saved set of auth files that caam
+// activate swaps into place; an isolated profile is a separate home directory
+// that caam exec runs a tool inside. One name can be both.
+const (
+	profileTypeVault    = "vault"
+	profileTypeIsolated = "isolated"
+)
+
 type lsProfile struct {
-	Tool     string             `json:"tool"`
-	Name     string             `json:"name"`
+	Tool string `json:"tool"`
+	Name string `json:"name"`
+	// Type is always "vault": every row is a vault profile.
+	Type string `json:"type"`
+	// Isolated reports that an isolated profile with the same name also
+	// exists, so caam exec <tool> <name> works too.
+	Isolated bool               `json:"isolated"`
 	Active   bool               `json:"active"`
 	System   bool               `json:"system"`
 	Health   lsHealth           `json:"health"`
 	Identity *identity.Identity `json:"identity,omitempty"`
+	// Description and Tags are the user's labels for the profile.
+	Description string   `json:"description,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+}
+
+// lsLabels returns a profile's description and tags (empty when unlabeled).
+func lsLabels(tool, name string) (string, []string) {
+	labels, err := loadProfileLabels(tool, name)
+	if err != nil {
+		return "", nil
+	}
+	return labels.Description, labels.Tags
+}
+
+// lsLabelLine renders the labels shown under a profile row ("" when none).
+func lsLabelLine(description string, tags []string) string {
+	var parts []string
+	if description != "" {
+		parts = append(parts, truncateDescription(description, 60))
+	}
+	if len(tags) > 0 {
+		parts = append(parts, "["+strings.Join(tags, ", ")+"]")
+	}
+	return strings.Join(parts, "  ")
+}
+
+type lsIsolatedProfile struct {
+	Tool string `json:"tool"`
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 type lsHealth struct {
@@ -1096,6 +1330,11 @@ type lsHealth struct {
 	// launch_usable and schedulers on refresh_due. A null field means caam
 	// found no evidence either way and is not guessing.
 	health.Signals
+
+	// Provider verification (issue #108): whether the provider itself has
+	// answered for the credential now on disk, when it last accepted it, and
+	// any outstanding rejection. Expiry alone is not a liveness claim.
+	health.VerificationInfo
 }
 
 // lsCmd lists all stored profiles.
@@ -1104,6 +1343,17 @@ var lsCmd = &cobra.Command{
 	Aliases: []string{"list"},
 	Short:   "List saved profiles",
 	Long: `Lists all profiles stored in the vault with health status.
+
+The TYPE column says how a profile can be used. "vault" profiles are switched
+in place with 'caam activate'. "vault+iso" means an isolated profile of the
+same name also exists, so 'caam exec' works for it too. Isolated profiles with
+no vault counterpart are listed after the table; 'caam profile ls' shows them
+in detail.
+
+Claude profiles also show the organization name and stable organization ID,
+so personal and Team subscriptions sharing an email remain distinguishable.
+An [unverified] label comes from local metadata that has not been checked
+against the saved credential; listing profiles does not contact the provider.
 
 Examples:
   caam ls              # List all profiles
@@ -1127,10 +1377,16 @@ func runLs(cmd *cobra.Command, args []string) error {
 	tagFilter, _ := cmd.Flags().GetString("tag")
 	formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
 
-	// Helper to check if a profile has the specified tag
+	// Helper to check if a profile has the specified tag. Vault profiles keep
+	// tags in the vault; isolated profiles in the profile store.
 	hasTag := func(tool, profileName string) bool {
 		if tagFilter == "" {
 			return true // No filter, include all
+		}
+		for _, t := range vaultProfileTags(tool, profileName) {
+			if profile.NormalizeTag(t) == profile.NormalizeTag(tagFilter) {
+				return true
+			}
 		}
 		if profileStore == nil {
 			return false // No profile store, can't check tags
@@ -1144,6 +1400,26 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 	// Collect profiles for JSON output
 	var output lsOutput
+	recordSelectionError := func(tool string, err error) {
+		if tool != "claude" || err == nil {
+			return
+		}
+		// Do not echo keychain/transport diagnostics. Listing remains useful
+		// when native authentication changes, but it must explain why no
+		// active marker can be assigned safely.
+		warning := "Claude credentials or identity changed or could not be read consistently; no profile was marked active. Retry after Claude finishes updating its authentication files."
+		if errors.Is(err, authfile.ErrInvalidCredentials) {
+			warning = "Claude credentials have conflicting or invalid verified identity bindings; no profile was marked active. Run caam verify identity claude <profile> --online for the affected profiles."
+		}
+		output.Warnings = append(output.Warnings, warning)
+		if !jsonOutput {
+			fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", warning)
+		}
+	}
+
+	// Every row is a vault profile; note which also exist as isolated
+	// profiles, and collect the isolated ones with no vault row (issue #110).
+	isolated := isolatedProfileNames()
 
 	if len(args) > 0 {
 		tool := strings.ToLower(args[0])
@@ -1155,6 +1431,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+		output.IsolatedOnly = isolatedOnlyProfiles(isolated, map[string][]string{tool: profiles}, tool, hasTag)
 
 		// Filter by tag if specified
 		if tagFilter != "" {
@@ -1174,33 +1451,48 @@ func runLs(cmd *cobra.Command, args []string) error {
 				return encodeLsJSON(cmd, output)
 			}
 			fmt.Printf("No profiles saved for %s\n", tool)
+			printIsolatedOnly(output.IsolatedOnly)
 			return nil
 		}
 
 		if !jsonOutput {
-			fmt.Printf("%-22s  %-24s  %-10s  %s\n", "PROFILE", "EMAIL", "PLAN", "STATUS")
+			organizationColumn := ""
+			if tool == "claude" {
+				organizationColumn = fmt.Sprintf("  %-30s", "ORGANIZATION")
+			}
+			fmt.Printf("%-22s  %-9s  %-24s%s  %-10s  %s\n", "PROFILE", "TYPE", "EMAIL", organizationColumn, "PLAN", "STATUS")
 		}
 
 		// Check which is active
 		fileSet := tools[tool]()
-		activeProfile, _ := vault.ActiveProfile(fileSet)
+		activeProfile, selectionErr := vault.ActiveProfile(fileSet)
+		recordSelectionError(tool, selectionErr)
 
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
+			if p == activeProfile {
+				applyLiveExpiry(tool, ph)
+			}
 			status := health.CalculateStatus(ph)
+			description, tags := lsLabels(tool, p)
 
 			if jsonOutput {
 				lp := lsProfile{
-					Tool:   tool,
-					Name:   p,
-					Active: p == activeProfile,
-					System: authfile.IsSystemProfile(p),
+					Tool:     tool,
+					Name:     p,
+					Type:     profileTypeVault,
+					Isolated: isolated[tool][p],
+					Active:   p == activeProfile,
+					System:   authfile.IsSystemProfile(p),
 					Health: lsHealth{
-						Status:     status.String(),
-						ErrorCount: ph.ErrorCount1h,
-						Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
+						Status:           status.String(),
+						ErrorCount:       ph.ErrorCount1h,
+						Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
+						VerificationInfo: health.VerificationFor(ph),
 					},
-					Identity: id,
+					Identity:    id,
+					Description: description,
+					Tags:        tags,
 				}
 				if !ph.TokenExpiresAt.IsZero() {
 					lp.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
@@ -1219,7 +1511,14 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 				email, plan := formatIdentityDisplay(id)
 				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
-				fmt.Printf("%s%-20s  %-24s  %-10s  %s\n", marker, displayName, email, plan, healthStr)
+				organizationColumn := ""
+				if tool == "claude" {
+					organizationColumn = fmt.Sprintf("  %-30s", formatOrganizationDisplay(id))
+				}
+				fmt.Printf("%s%-20s  %-9s  %-24s%s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, organizationColumn, plan, healthStr)
+				if line := lsLabelLine(description, tags); line != "" {
+					fmt.Printf("    %s\n", line)
+				}
 			}
 		}
 
@@ -1227,6 +1526,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 			output.Count = len(output.Profiles)
 			return encodeLsJSON(cmd, output)
 		}
+		printIsolatedOnly(output.IsolatedOnly)
 		return nil
 	}
 
@@ -1235,6 +1535,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	output.IsolatedOnly = isolatedOnlyProfiles(isolated, allProfiles, "", hasTag)
 
 	// Filter by tag if specified
 	if tagFilter != "" {
@@ -1267,34 +1568,49 @@ func runLs(cmd *cobra.Command, args []string) error {
 			fmt.Println("  1. Login using the tool's command (codex login, /login in claude)")
 			fmt.Println("  2. Run: caam backup <tool> <profile-name>")
 		}
+		printIsolatedOnly(output.IsolatedOnly)
 		return nil
 	}
 
 	for tool, profiles := range allProfiles {
 		fileSet := tools[tool]()
-		activeProfile, _ := vault.ActiveProfile(fileSet)
+		activeProfile, selectionErr := vault.ActiveProfile(fileSet)
+		recordSelectionError(tool, selectionErr)
 
 		if !jsonOutput {
 			fmt.Printf("%s:\n", tool)
-			fmt.Printf("  %-20s  %-24s  %-10s  %s\n", "PROFILE", "EMAIL", "PLAN", "STATUS")
+			organizationColumn := ""
+			if tool == "claude" {
+				organizationColumn = fmt.Sprintf("  %-30s", "ORGANIZATION")
+			}
+			fmt.Printf("  %-22s  %-9s  %-24s%s  %-10s  %s\n", "PROFILE", "TYPE", "EMAIL", organizationColumn, "PLAN", "STATUS")
 		}
 
 		for _, p := range profiles {
 			ph, id := getProfileHealthWithIdentity(tool, p)
+			if p == activeProfile {
+				applyLiveExpiry(tool, ph)
+			}
 			status := health.CalculateStatus(ph)
+			description, tags := lsLabels(tool, p)
 
 			if jsonOutput {
 				lp := lsProfile{
-					Tool:   tool,
-					Name:   p,
-					Active: p == activeProfile,
-					System: authfile.IsSystemProfile(p),
+					Tool:     tool,
+					Name:     p,
+					Type:     profileTypeVault,
+					Isolated: isolated[tool][p],
+					Active:   p == activeProfile,
+					System:   authfile.IsSystemProfile(p),
 					Health: lsHealth{
-						Status:     status.String(),
-						ErrorCount: ph.ErrorCount1h,
-						Signals:    health.CredentialSignals(ph, health.DefaultHealthConfig()),
+						Status:           status.String(),
+						ErrorCount:       ph.ErrorCount1h,
+						Signals:          health.CredentialSignals(ph, health.DefaultHealthConfig()),
+						VerificationInfo: health.VerificationFor(ph),
 					},
-					Identity: id,
+					Identity:    id,
+					Description: description,
+					Tags:        tags,
 				}
 				if !ph.TokenExpiresAt.IsZero() {
 					lp.Health.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
@@ -1313,7 +1629,14 @@ func runLs(cmd *cobra.Command, args []string) error {
 
 				email, plan := formatIdentityDisplay(id)
 				healthStr := health.FormatHealthStatus(status, ph, formatOpts)
-				fmt.Printf("  %s%-20s  %-24s  %-10s  %s\n", marker, displayName, email, plan, healthStr)
+				organizationColumn := ""
+				if tool == "claude" {
+					organizationColumn = fmt.Sprintf("  %-30s", formatOrganizationDisplay(id))
+				}
+				fmt.Printf("  %s%-20s  %-9s  %-24s%s  %-10s  %s\n", marker, displayName, lsTypeLabel(isolated[tool][p]), email, organizationColumn, plan, healthStr)
+				if line := lsLabelLine(description, tags); line != "" {
+					fmt.Printf("      %s\n", line)
+				}
 			}
 		}
 	}
@@ -1323,7 +1646,84 @@ func runLs(cmd *cobra.Command, args []string) error {
 		return encodeLsJSON(cmd, output)
 	}
 
+	printIsolatedOnly(output.IsolatedOnly)
 	return nil
+}
+
+// isolatedProfileNames returns the isolated profiles in the profile store,
+// keyed by tool then name. Nil when there is no profile store.
+func isolatedProfileNames() map[string]map[string]bool {
+	if profileStore == nil {
+		return nil
+	}
+	all, err := profileStore.ListAll()
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]map[string]bool, len(all))
+	for tool, profs := range all {
+		for _, p := range profs {
+			if p == nil || p.Name == "" {
+				continue
+			}
+			if out[tool] == nil {
+				out[tool] = make(map[string]bool)
+			}
+			out[tool][p.Name] = true
+		}
+	}
+	return out
+}
+
+// isolatedOnlyProfiles returns the isolated profiles that have no vault
+// profile of the same name, sorted by tool then name. vaultProfiles is the
+// unfiltered vault listing. onlyTool, when set, restricts the result to that
+// tool; keep applies the --tag filter.
+func isolatedOnlyProfiles(isolated map[string]map[string]bool, vaultProfiles map[string][]string, onlyTool string, keep func(tool, name string) bool) []lsIsolatedProfile {
+	var out []lsIsolatedProfile
+	for tool, names := range isolated {
+		if onlyTool != "" && tool != onlyTool {
+			continue
+		}
+		inVault := make(map[string]bool, len(vaultProfiles[tool]))
+		for _, p := range vaultProfiles[tool] {
+			inVault[p] = true
+		}
+		for name := range names {
+			if inVault[name] || !keep(tool, name) {
+				continue
+			}
+			out = append(out, lsIsolatedProfile{Tool: tool, Name: name, Type: profileTypeIsolated})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Tool != out[j].Tool {
+			return out[i].Tool < out[j].Tool
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// lsTypeLabel is the TYPE column of caam ls.
+func lsTypeLabel(alsoIsolated bool) string {
+	if alsoIsolated {
+		return "vault+iso"
+	}
+	return profileTypeVault
+}
+
+// printIsolatedOnly prints the isolated profiles that are not vault rows, so
+// caam ls shows every profile and which command runs it.
+func printIsolatedOnly(profiles []lsIsolatedProfile) {
+	if len(profiles) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("Isolated profiles (run with 'caam exec <tool> <profile>'; details: caam profile ls):")
+	for _, p := range profiles {
+		fmt.Printf("  %s/%s\n", p.Tool, p.Name)
+	}
 }
 
 func encodeLsJSON(cmd *cobra.Command, output lsOutput) error {
@@ -1463,11 +1863,50 @@ Examples:
 				fmt.Printf("  [%s] %s%s\n", exists, spec.Path, required)
 				fmt.Printf("         %s\n", spec.Description)
 			}
+			if status, label, desc := toolKeychainPathStatus(tool); status != "" {
+				fmt.Printf("  [%s] %s\n", status, label)
+				fmt.Printf("         %s\n", desc)
+			}
 			fmt.Println()
 		}
 
 		return nil
 	},
+}
+
+func toolKeychainPathStatus(tool string) (status, label, desc string) {
+	if !keychain.Enabled() {
+		return "", "", ""
+	}
+	switch tool {
+	case "claude":
+		if os.Getenv("CLAUDE_CONFIG_DIR") != "" {
+			return "", "", ""
+		}
+		_, err := keychain.ReadClaude()
+		switch {
+		case err == nil:
+			return "exists", fmt.Sprintf("macOS login keychain (service %q)", keychain.ClaudeService),
+				"Claude Code OAuth token (authoritative on macOS; mirrored to ~/.claude/.credentials.json)"
+		case errors.Is(err, keychain.ErrDenied):
+			return "denied", fmt.Sprintf("macOS login keychain (service %q)", keychain.ClaudeService),
+				"Keychain access denied; unlock login keychain or set CAAM_KEYCHAIN=0"
+		}
+	case "agy":
+		if os.Getenv("GEMINI_HOME") != "" {
+			return "", "", ""
+		}
+		_, err := keychain.ReadAgy()
+		switch {
+		case err == nil:
+			return "exists", fmt.Sprintf("macOS login keychain (service %q, account %q)", keychain.AgyService, keychain.AgyAccount),
+				"Antigravity CLI OAuth token (authoritative on macOS desktop; mirrored to antigravity-oauth-token)"
+		case errors.Is(err, keychain.ErrDenied):
+			return "denied", fmt.Sprintf("macOS login keychain (service %q, account %q)", keychain.AgyService, keychain.AgyAccount),
+				"Keychain access denied; unlock login keychain or set CAAM_KEYCHAIN=0"
+		}
+	}
+	return "", "", ""
 }
 
 // clearCmd removes auth files (logout).
@@ -1764,6 +2203,17 @@ var profileStatusCmd = &cobra.Command{
 		fmt.Printf("  Auth mode: %s\n", prof.AuthMode)
 		fmt.Printf("  Logged in: %v\n", status.LoggedIn)
 		fmt.Printf("  Locked: %v\n", status.HasLockFile)
+		if status.ExpiresAt != "" {
+			fmt.Printf("  Expires: %s\n", status.ExpiresAt)
+			if tool == "cursor" && status.LoggedIn {
+				if expiry, err := time.Parse(time.RFC3339, status.ExpiresAt); err == nil && time.Until(expiry) <= health.CursorReloginLead {
+					fmt.Printf("  Action: Log in again with 'caam login cursor %s' before this session expires.\n", name)
+				}
+			}
+		}
+		if status.Error != "" {
+			fmt.Printf("  Auth: %s\n", status.Error)
+		}
 		if prof.AccountLabel != "" {
 			fmt.Printf("  Account: %s\n", prof.AccountLabel)
 		}
@@ -1869,10 +2319,11 @@ func init() {
 var profileDescribeCmd = &cobra.Command{
 	Use:   "describe <tool> <name> [description]",
 	Short: "Set or show profile description",
-	Long: `Set or show the description for an isolated profile.
+	Long: `Set or show the description for a vault or isolated profile.
 
 If description is provided, sets it. Otherwise, shows the current description.
-Use --clear to remove the description.
+Use --clear to remove the description. 'caam ls' shows descriptions under
+each profile.
 
 Examples:
   caam profile describe claude work                    # Show description
@@ -1883,7 +2334,7 @@ Examples:
 		tool := strings.ToLower(args[0])
 		name := args[1]
 
-		prof, err := profileStore.Load(tool, name)
+		labels, err := loadProfileLabels(tool, name)
 		if err != nil {
 			return err
 		}
@@ -1891,28 +2342,28 @@ Examples:
 		clearFlag, _ := cmd.Flags().GetBool("clear")
 
 		if clearFlag {
-			prof.Description = ""
-			if err := prof.Save(); err != nil {
-				return fmt.Errorf("save profile: %w", err)
+			labels.Description = ""
+			if err := labels.Save(); err != nil {
+				return err
 			}
 			fmt.Printf("Cleared description for %s/%s\n", tool, name)
 			return nil
 		}
 
 		if len(args) == 3 {
-			prof.Description = args[2]
-			if err := prof.Save(); err != nil {
-				return fmt.Errorf("save profile: %w", err)
+			labels.Description = strings.TrimSpace(args[2])
+			if err := labels.Save(); err != nil {
+				return err
 			}
-			fmt.Printf("Set description for %s/%s: %s\n", tool, name, prof.Description)
+			fmt.Printf("Set description for %s/%s: %s\n", tool, name, labels.Description)
 			return nil
 		}
 
 		// Show current description
-		if prof.Description == "" {
+		if labels.Description == "" {
 			fmt.Printf("%s/%s has no description\n", tool, name)
 		} else {
-			fmt.Printf("%s/%s: %s\n", tool, name, prof.Description)
+			fmt.Printf("%s/%s: %s\n", tool, name, labels.Description)
 		}
 		return nil
 	},
@@ -2049,7 +2500,10 @@ Examples:
 
 		prof, err := profileStore.Load(tool, name)
 		if err != nil {
-			return err
+			// A missing profile is not a syntax error; the usage block
+			// would bury the explanation.
+			cmd.SilenceUsage = true
+			return isolatedProfileLoadError(tool, name, err)
 		}
 
 		// Repair a profile registered without its provider home before handing
@@ -2136,7 +2590,10 @@ Examples:
 
 		prof, err := profileStore.Load(tool, name)
 		if err != nil {
-			return err
+			// A missing profile is not a syntax error; the usage block
+			// would bury the explanation.
+			cmd.SilenceUsage = true
+			return isolatedProfileLoadError(tool, name, err)
 		}
 
 		ctx := context.Background()
@@ -2174,6 +2631,31 @@ Examples:
 		}
 		return runErr
 	},
+}
+
+// isolatedProfileLoadError explains a failed isolated-profile lookup for
+// commands that only run isolated profiles (exec, login). The common case is
+// a name that exists only in the vault: caam ls lists it, so "not found" reads
+// as a bug (issue #110). Other load errors pass through unchanged.
+func isolatedProfileLoadError(tool, name string, err error) error {
+	if !errors.Is(err, profile.ErrNotFound) {
+		return err
+	}
+	if vault != nil {
+		if names, listErr := vault.List(tool); listErr == nil && slices.Contains(names, name) {
+			// Claude Code's login cannot be driven by caam login; its
+			// isolated profiles log in with /login inside caam exec.
+			loginStep := fmt.Sprintf("caam login %s %s", tool, name)
+			if tool == "claude" {
+				loginStep = fmt.Sprintf("caam exec %s %s, then /login in the session", tool, name)
+			}
+			return fmt.Errorf("%s/%s is a vault profile, not an isolated profile; caam exec and caam login only use isolated profiles.\n"+
+				"  To use it, switch to it and run %s as usual:  caam activate %s %s\n"+
+				"  To run it in parallel, create an isolated profile and log in:  caam profile add %s %s, then %s",
+				tool, name, tool, tool, name, tool, name, loginStep)
+		}
+	}
+	return fmt.Errorf("%w; run 'caam profile ls %s' to see isolated profiles", err, tool)
 }
 
 // nonInteractiveExecExample returns an example `caam exec` invocation that runs

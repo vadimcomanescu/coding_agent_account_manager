@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
 // Codex API constants.
@@ -51,6 +54,14 @@ type codexWindow struct {
 	LimitWindowSeconds int `json:"limit_window_seconds"` // Window size in seconds
 }
 
+func (w *codexWindow) UnmarshalJSON(data []byte) error {
+	if err := requireUsagePercent(data, "used_percent"); err != nil {
+		return err
+	}
+	type plain codexWindow
+	return json.Unmarshal(data, (*plain)(w))
+}
+
 type codexCreditInfo struct {
 	HasCredits bool         `json:"has_credits"`
 	Unlimited  bool         `json:"unlimited"`
@@ -84,6 +95,9 @@ func (b *codexBalance) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return fmt.Errorf("parse balance string %q: %w", s, err)
 		}
+		if math.IsNaN(val) || math.IsInf(val, 0) {
+			return fmt.Errorf("credit balance must be finite")
+		}
 		b.Value = &val
 		return nil
 	}
@@ -93,9 +107,16 @@ func (b *codexBalance) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &val); err != nil {
 		return fmt.Errorf("parse balance number: %w", err)
 	}
+	if math.IsNaN(val) || math.IsInf(val, 0) {
+		return fmt.Errorf("credit balance must be finite")
+	}
 	b.Value = &val
 	return nil
 }
+
+// ErrorUnauthorized is the UsageInfo.Error a usage fetch reports when the
+// provider answered 401 or 403 for the access token.
+const ErrorUnauthorized = "unauthorized: token expired or invalid"
 
 // CodexFetchOptions provides optional parameters for fetching.
 type CodexFetchOptions struct {
@@ -124,14 +145,16 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	req.Header.Set("User-Agent", CodexUserAgent)
 	req.Header.Set("Accept", "application/json")
 
-	if opts != nil && opts.AccountID != "" {
-		req.Header.Set("ChatGPT-Account-Id", opts.AccountID)
+	accountID := codexAccountID(accessToken, opts)
+	if accountID != "" {
+		req.Header.Set("ChatGPT-Account-Id", accountID)
 	}
 
 	resp, err := f.client.Do(req)
 	if err != nil {
 		return &UsageInfo{
 			Provider:  "codex",
+			AccountID: accountID,
 			FetchedAt: time.Now(),
 			Error:     fmt.Sprintf("request failed: %v", err),
 		}, err
@@ -140,6 +163,7 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 
 	info := &UsageInfo{
 		Provider:  "codex",
+		AccountID: accountID,
 		Source:    SourceAPI,
 		FetchedAt: time.Now(),
 	}
@@ -148,16 +172,19 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	case http.StatusOK:
 		// Success - parse response
 	case http.StatusUnauthorized, http.StatusForbidden:
-		info.Error = "unauthorized: token expired or invalid"
+		info.HTTPStatus = resp.StatusCode
+		info.Error = ErrorUnauthorized
 		return info, fmt.Errorf("unauthorized: status %d", resp.StatusCode)
 	default:
+		info.HTTPStatus = resp.StatusCode
 		info.Error = fmt.Sprintf("API error: status %d", resp.StatusCode)
 		return info, fmt.Errorf("API error: status %d", resp.StatusCode)
 	}
 
 	var usage codexUsageResponse
-	if err := json.NewDecoder(resp.Body).Decode(&usage); err != nil {
-		info.Error = fmt.Sprintf("decode error: %v", err)
+	if err := decodeUsageResponse(resp.Body, &usage); err != nil {
+		info.QuotaStatus = QuotaUnavailable
+		info.Error, info.QuotaNote = err.Error(), err.Error()
 		return info, fmt.Errorf("decode response: %w", err)
 	}
 
@@ -196,7 +223,38 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 		}
 	}
 
+	if info.PrimaryWindow == nil && info.SecondaryWindow == nil {
+		info.QuotaStatus = QuotaDegraded
+		info.Error = "Codex response did not include a measured general quota"
+		info.QuotaNote = info.Error
+		return info, fmt.Errorf("%s", info.Error)
+	}
 	return info, nil
+}
+
+// codexAccountID picks the ChatGPT account a usage read is scoped to. The
+// Codex CLI always sends ChatGPT-Account-Id with its rate-limit request; when
+// the header is missing, /wham/usage can answer for a different scope than
+// the one Codex shows (GH #111). An explicit id wins; otherwise the id comes
+// from the access token's chatgpt_account_id claim, which is where Codex
+// itself derives tokens.account_id at login. An opaque token with no explicit
+// id sends no header.
+func codexAccountID(accessToken string, opts *CodexFetchOptions) string {
+	id := ""
+	if opts != nil {
+		id = strings.TrimSpace(opts.AccountID)
+	}
+	if id == "" {
+		id = identity.ChatGPTAccountID(accessToken)
+	}
+	// A header value with control characters would make the request itself
+	// fail; an unusable id is the same as no id.
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+	return id
 }
 
 // resolveUsageURL determines the correct usage API URL.

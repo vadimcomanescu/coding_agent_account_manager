@@ -1,12 +1,14 @@
 package rotation
 
 import (
+	"encoding/json"
 	"math/rand"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
@@ -76,6 +78,206 @@ func TestNewSelector(t *testing.T) {
 	}
 	if s.algorithm != AlgorithmSmart {
 		t.Errorf("expected algorithm %q, got %q", AlgorithmSmart, s.algorithm)
+	}
+}
+
+// Quota-aware selection must reject unsafe candidates before ranking. A lone
+// candidate, a random choice, or a forced rotation cannot turn an unsuccessful
+// read or a spent weekly/model allowance into a usable backup.
+func TestQuotaEligibilityPrecedesEveryAlgorithmAndPolicy(t *testing.T) {
+	now := time.Now()
+	soon, later := now.Add(time.Minute), now.Add(time.Hour)
+	data := map[string]*UsageInfo{
+		"nil-row":          nil,
+		"failed":           {Error: "synthetic private quota diagnostic", AvailScore: 100, ResetsAt: &soon},
+		"primary-spent":    {PrimaryPercent: 100, AvailScore: 100, ResetsAt: &soon},
+		"weekly-spent":     {SecondaryPercent: 100, AvailScore: 100, ResetsAt: &soon},
+		"scoped-spent":     {ScopedPercent: 100, ScopedLabel: "Fable", AvailScore: 100, ResetsAt: &soon},
+		"negative-primary": {PrimaryPercent: -1},
+		"negative-weekly":  {SecondaryPercent: -1},
+		"negative-scoped":  {ScopedPercent: -1},
+		"excess-primary":   {PrimaryPercent: 101},
+		"excess-weekly":    {SecondaryPercent: 101},
+		"excess-scoped":    {ScopedPercent: 101},
+		"invalid-score":    {AvailScore: 101},
+		"weekly-only":      {SecondaryPercent: 42, AvailScore: 89, ResetsAt: &later},
+	}
+	blockedNames := []string{"missing", "nil-row", "failed", "primary-spent", "weekly-spent", "scoped-spent",
+		"negative-primary", "negative-weekly", "negative-scoped", "excess-primary", "excess-weekly", "excess-scoped", "invalid-score"}
+	profiles := append(append([]string(nil), blockedNames...), "weekly-only")
+	before, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, provider := range []string{"claude", "codex", "grok", "cursor"} {
+		for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+			for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+				t.Run(provider+"/"+string(algorithm)+"/"+string(policy), func(t *testing.T) {
+					s := NewSelector(algorithm, nil, nil)
+					s.SetPolicy(policy)
+					s.SetIgnoreCooldown(true)
+					s.SetRNG(rand.New(rand.NewSource(42)))
+					s.SetUsageData(data)
+					// Strong credential/plan bonuses and the earliest reset must
+					// never promote a quota-blocked seat over a measured account.
+					healthData := map[string]*health.ProfileHealth{}
+					for _, name := range blockedNames {
+						healthData[name] = &health.ProfileHealth{TokenExpiresAt: now.Add(24 * time.Hour), PlanType: "enterprise"}
+					}
+					s.SetProfileHealth(healthData)
+					result, err := s.Select(provider, profiles, "weekly-only")
+					if err != nil || result == nil || result.Selected != "weekly-only" {
+						t.Fatalf("unsafe quota won selection: %+v, %v", result, err)
+					}
+					if len(result.Alternatives) != len(profiles) {
+						t.Fatalf("blocked profiles disappeared from diagnostics: %+v", result.Alternatives)
+					}
+					formatted := FormatResult(result)
+					if !strings.Contains(formatted, "Unavailable:") || strings.Contains(formatted, "In cooldown:") ||
+						strings.Contains(formatted, "Primary limit 0%") {
+						t.Fatalf("selection fabricated a cooldown or absent session measurement: %s", formatted)
+					}
+					for _, alt := range result.Alternatives {
+						if alt.Name == "weekly-only" {
+							continue
+						}
+						if alt.Score > -9000 || len(alt.Reasons) != 1 || alt.Reasons[0].Positive || alt.Reasons[0].Text == "" {
+							t.Fatalf("blocked account advertised as a ready backup: %+v", alt)
+						}
+						if strings.Contains(alt.Reasons[0].Text, "synthetic private quota diagnostic") {
+							t.Fatal("selection repeated provider-controlled failure text")
+						}
+						if alt.Name == "scoped-spent" && !strings.Contains(alt.Reasons[0].Text, "Fable limit 100% used") {
+							t.Fatalf("exhausted model quota lost its explanation: %+v", alt)
+						}
+					}
+					for _, name := range blockedNames {
+						if result, err := s.Select(provider, []string{name}, ""); err == nil || result != nil {
+							t.Fatalf("sole blocked profile %s was selected: %+v, %v", name, result, err)
+						}
+					}
+					if result, err := s.Select(provider, blockedNames, ""); err == nil || result != nil {
+						t.Fatalf("all-blocked pool supplied a fallback: %+v, %v", result, err)
+					}
+				})
+			}
+		}
+	}
+	after, err := json.Marshal(data)
+	if err != nil || string(before) != string(after) || profiles[0] != "missing" || profiles[len(profiles)-1] != "weekly-only" {
+		t.Fatal("quota eligibility changed caller measurements or candidate ordering")
+	}
+}
+
+func TestQuotaSelectionDistinguishesRequestedReadFromOptOut(t *testing.T) {
+	for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+		for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+			s := NewSelector(algorithm, nil, nil)
+			s.SetPolicy(policy)
+			s.SetUsageData(map[string]*UsageInfo{})
+			if result, err := s.Select("claude", []string{"only"}, ""); err == nil || result != nil {
+				t.Fatalf("%s/%s treated an empty requested read as capacity: %+v, %v", algorithm, policy, result, err)
+			}
+			s.SetUsageData(map[string]*UsageInfo{"only": {AvailScore: 100}})
+			if result, err := s.Select("claude", []string{"only"}, ""); err != nil || result == nil || result.Selected != "only" {
+				t.Fatalf("%s/%s rejected measured zero: %+v, %v", algorithm, policy, result, err)
+			}
+			s.SetUsageData(nil)
+			if result, err := s.Select("claude", []string{"offline"}, ""); err != nil || result == nil || result.Selected != "offline" {
+				t.Fatalf("%s/%s changed explicit no-quota selection: %+v, %v", algorithm, policy, result, err)
+			}
+		}
+	}
+}
+
+func TestCredentialEligibilityPrecedesEveryAlgorithmAndPolicy(t *testing.T) {
+	now := time.Now()
+	for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+		for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+			t.Run(string(algorithm)+"/"+string(policy), func(t *testing.T) {
+				s := NewSelector(algorithm, nil, nil)
+				s.SetPolicy(policy)
+				s.SetIgnoreCooldown(true)
+				s.SetProfileHealth(map[string]*health.ProfileHealth{
+					"expired": {TokenExpiresAt: now.Add(-time.Second)},
+					"rejected": {TokenExpiresAt: now.Add(time.Hour), SelfRefreshing: true,
+						ProviderRejectedAt: now, RejectedFingerprint: "rejected", CredentialFingerprint: "rejected"},
+					"usable": {TokenExpiresAt: now.Add(time.Hour)},
+				})
+				soon, later := now.Add(time.Minute), now.Add(time.Hour)
+				s.SetUsageData(map[string]*UsageInfo{
+					"expired":  {AvailScore: 100, ResetsAt: &soon},
+					"rejected": {AvailScore: 100, ResetsAt: &soon},
+					"usable":   {AvailScore: 1, ResetsAt: &later},
+				})
+				result, err := s.Select("cursor", []string{"expired", "rejected", "usable"}, "usable")
+				if err != nil || result.Selected != "usable" {
+					t.Fatalf("unusable credential won selection: %+v, %v", result, err)
+				}
+				blocked := 0
+				for _, alt := range result.Alternatives {
+					if alt.Name == "expired" || alt.Name == "rejected" {
+						blocked++
+						if alt.Score > -9000 || len(alt.Reasons) != 1 || !strings.Contains(alt.Reasons[0].Text, "Login required") {
+							t.Fatalf("blocked account advertised as a ready backup: %+v", alt)
+						}
+					}
+				}
+				if blocked != 2 {
+					t.Fatalf("selection omitted blocked-account explanations: %+v", result)
+				}
+				for _, name := range []string{"expired", "rejected"} {
+					if result, err := s.Select("cursor", []string{name}, ""); err == nil || !strings.Contains(err.Error(), "login required") || !strings.Contains(err.Error(), name) {
+						t.Fatalf("sole unusable account accepted: %+v, %v", result, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCredentialEligibilityRetainsRenewableAndUnknown(t *testing.T) {
+	now := time.Now()
+	for name, h := range map[string]*health.ProfileHealth{
+		"unknown":           nil,
+		"opaque":            {},
+		"renewable_expired": {TokenExpiresAt: now.Add(-time.Hour), TokenRenewable: true},
+		"native_renewal":    {TokenExpiresAt: now.Add(-time.Hour), SelfRefreshing: true},
+		"api_key_only":      {SelfRefreshing: true, TokenRenewable: true},
+	} {
+		for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+			for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+				t.Run(name+"/"+string(algorithm)+"/"+string(policy), func(t *testing.T) {
+					s := NewSelector(algorithm, nil, nil)
+					s.SetPolicy(policy)
+					s.SetProfileHealth(map[string]*health.ProfileHealth{name: h})
+					result, err := s.Select("cursor", []string{name}, "")
+					if err != nil || result.Selected != name {
+						t.Fatalf("renewable/unknown credential became login-required: %+v, %v", result, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestProfileHealthSnapshotsDoNotBorrowAnotherStore(t *testing.T) {
+	store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	if err := store.SetTokenExpiry("cursor", "same-name", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	s := NewSelector(AlgorithmSmart, store, nil)
+	// An explicit empty snapshot describes an unknown isolated account.
+	// Its name does not authorize the selector to borrow a vault deadline.
+	s.SetProfileHealth(map[string]*health.ProfileHealth{})
+	if result, err := s.Select("cursor", []string{"same-name"}, ""); err != nil || result.Selected != "same-name" {
+		t.Fatalf("isolated account inherited vault health: %+v, %v", result, err)
+	}
+	h := &health.ProfileHealth{TokenExpiresAt: time.Now().Add(-time.Hour)}
+	s.SetProfileHealth(map[string]*health.ProfileHealth{"same-name": h})
+	h.TokenExpiresAt = time.Now().Add(time.Hour)
+	if _, err := s.Select("cursor", []string{"same-name"}, ""); err == nil {
+		t.Fatal("caller mutation changed a selector's copied health snapshot")
 	}
 }
 
@@ -242,6 +444,9 @@ func TestSelectFiltersSystemProfiles(t *testing.T) {
 
 func TestSelectSingleProfile(t *testing.T) {
 	s := NewSelector(AlgorithmSmart, nil, nil)
+	s.SetUsageData(map[string]*UsageInfo{
+		"only-one": {PrimaryPercent: 87, AvailScore: 13},
+	})
 
 	profiles := []string{"only-one"}
 	result, err := s.Select("claude", profiles, "")
@@ -253,12 +458,13 @@ func TestSelectSingleProfile(t *testing.T) {
 		t.Errorf("expected 'only-one', got %q", result.Selected)
 	}
 
-	// Should have a reason indicating it's the only profile
+	// A lone candidate must receive real scoring, including its quota, rather
+	// than being presented as unconditionally healthy with a fabricated score.
 	found := false
 	for _, alt := range result.Alternatives {
 		if alt.Name == "only-one" {
 			for _, r := range alt.Reasons {
-				if strings.Contains(r.Text, "Only available") {
+				if strings.Contains(r.Text, "Primary limit 87% used") {
 					found = true
 					break
 				}
@@ -266,7 +472,84 @@ func TestSelectSingleProfile(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Error("expected 'only available profile' reason")
+		t.Error("single-profile selection omitted its quota assessment")
+	}
+}
+
+func TestSelectSoleUserEligibility(t *testing.T) {
+	db, err := caamdb.OpenAt(filepath.Join(t.TempDir(), "caam.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.SetCooldown("codex", "cooling", time.Now().UTC(), time.Hour, "synthetic limit"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, algorithm := range []Algorithm{AlgorithmSmart, AlgorithmRoundRobin, AlgorithmRandom} {
+		for _, policy := range []Policy{PolicyAvailability, PolicyDrain} {
+			for _, tc := range []struct {
+				name     string
+				profiles []string
+				force    bool
+				want     string
+				wantErr  string
+			}{
+				{name: "cooling", profiles: []string{"cooling"}, wantErr: "cooldown"},
+				{name: "cooling with backup", profiles: []string{"_backup_20261006", "cooling"}, wantErr: "cooldown"},
+				{name: "system only", profiles: []string{"_original"}, wantErr: "no user profiles"},
+				{name: "system only forced", profiles: []string{"_original"}, force: true, wantErr: "no user profiles"},
+				{name: "healthy", profiles: []string{"healthy"}, want: "healthy"},
+				{name: "healthy with backup", profiles: []string{"_original", "healthy"}, want: "healthy"},
+				{name: "cooling forced", profiles: []string{"_original", "cooling"}, force: true, want: "cooling"},
+			} {
+				t.Run(string(algorithm)+"/"+string(policy)+"/"+tc.name, func(t *testing.T) {
+					s := NewSelector(algorithm, nil, db)
+					s.SetPolicy(policy)
+					s.SetIgnoreCooldown(tc.force)
+					result, err := s.Select("codex", tc.profiles, "")
+					if tc.wantErr != "" {
+						if err == nil || !strings.Contains(err.Error(), tc.wantErr) || result != nil {
+							t.Fatalf("Select() = %+v, %v; want refusal containing %q", result, err, tc.wantErr)
+						}
+						return
+					}
+					if err != nil || result == nil || result.Selected != tc.want {
+						t.Fatalf("Select() = %+v, %v; want %s", result, err, tc.want)
+					}
+					if len(result.Alternatives) != 1 || result.Alternatives[0].Name != tc.want {
+						t.Fatalf("system snapshot entered candidate results: %+v", result.Alternatives)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestSelectSingleProfileDrainPolicy(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	for _, tc := range []struct {
+		name string
+		used int
+		want string
+	}{
+		{name: "usable quota", used: 90, want: "90% used"},
+		{name: "above ceiling", used: 96, want: "no drain-eligible profile"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewSelector(AlgorithmSmart, nil, nil)
+			s.SetPolicy(PolicyDrain)
+			s.SetUsageData(map[string]*UsageInfo{
+				"only": {PrimaryPercent: tc.used, AvailScore: 100 - tc.used, ResetsAt: &reset},
+			})
+			result, err := s.Select("codex", []string{"only"}, "only")
+			if err != nil || result == nil || result.Selected != "only" {
+				t.Fatalf("Select() = %+v, %v", result, err)
+			}
+			if !strings.Contains(result.Explanation, tc.want) {
+				t.Fatalf("single candidate bypassed drain policy: explanation %q, want %q", result.Explanation, tc.want)
+			}
+		})
 	}
 }
 
@@ -374,8 +657,8 @@ func TestFormatResult(t *testing.T) {
 		}
 
 		output := FormatResult(result)
-		if !strings.Contains(output, "In cooldown:") {
-			t.Errorf("output missing cooldown section: %q", output)
+		if !strings.Contains(output, "Unavailable:") || !strings.Contains(output, "In cooldown (2h remaining)") {
+			t.Errorf("output missing unavailable section or actual cooldown reason: %q", output)
 		}
 		if !strings.Contains(output, "blocked") {
 			t.Errorf("output missing cooldown profile: %q", output)

@@ -5,14 +5,185 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// All exchanges use synthetic credentials and loopback servers. Exercise the
+// actual entry points so adding a guard without wiring a caller cannot pass.
+func callTokenEndpointForTest(t *testing.T, ctx context.Context, operation, endpoint string) error {
+	t.Helper()
+	switch operation {
+	case "codex":
+		old := CodexTokenURL
+		CodexTokenURL = endpoint
+		t.Cleanup(func() { CodexTokenURL = old })
+		result, err := RefreshCodexToken(ctx, "synthetic-renewal")
+		if err != nil && result != nil {
+			t.Fatal("failed exchange returned a usable token response")
+		}
+		return err
+	case "gemini":
+		old := GeminiTokenURL
+		GeminiTokenURL = endpoint
+		t.Cleanup(func() { GeminiTokenURL = old })
+		result, err := RefreshGeminiToken(ctx, "synthetic-client", "synthetic-secret", "synthetic-renewal")
+		if err != nil && result != nil {
+			t.Fatal("failed exchange returned a usable token response")
+		}
+		return err
+	case "claude-helper":
+		// The orchestration path remains disabled for Claude. Test its existing
+		// low-level helper without enabling refresh or contacting a provider.
+		old := ClaudeTokenURL
+		ClaudeTokenURL = endpoint
+		t.Cleanup(func() { ClaudeTokenURL = old })
+		result, err := RefreshClaudeToken(ctx, "synthetic-renewal")
+		if err != nil && result != nil {
+			t.Fatal("failed exchange returned a usable token response")
+		}
+		return err
+	case "codex-probe":
+		old := CodexVerifyURL
+		CodexVerifyURL = endpoint
+		t.Cleanup(func() { CodexVerifyURL = old })
+		return VerifyCodexToken(ctx, "synthetic-access")
+	default:
+		t.Fatalf("unknown test operation %q", operation)
+		return nil
+	}
+}
+
+func TestTokenEndpointsDoNotFollowRedirects(t *testing.T) {
+	for _, operation := range []string{"codex", "gemini", "claude-helper", "codex-probe"} {
+		for _, status := range []int{301, 302, 303, 307, 308} {
+			for _, target := range []string{"same-origin", "other-origin", "other-host", "malformed"} {
+				t.Run(fmt.Sprintf("%s/%d/%s", operation, status, target), func(t *testing.T) {
+					var requests, redirected, disclosed atomic.Int64
+					const marker = "redirect-location-must-not-be-logged"
+					sink := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						redirected.Add(1)
+						data, _ := io.ReadAll(r.Body)
+						if strings.Contains(string(data), "synthetic-renewal") || r.Header.Get("Authorization") != "" {
+							disclosed.Add(1)
+						}
+						_, _ = io.WriteString(w, `{"access_token":"unselected-response","expires_in":3600}`)
+					})
+					receiver := httptest.NewServer(sink)
+					defer receiver.Close()
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if r.URL.Path != "/token" {
+							sink.ServeHTTP(w, r)
+							return
+						}
+						requests.Add(1)
+						if operation == "codex-probe" {
+							if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer synthetic-access" {
+								t.Error("probe did not exercise the selected access credential")
+							}
+						} else {
+							data, err := io.ReadAll(r.Body)
+							if err != nil || r.Method != http.MethodPost || !strings.Contains(string(data), "synthetic-renewal") {
+								t.Error("exchange did not exercise the selected refresh credential")
+							}
+							if operation == "gemini" && !strings.Contains(string(data), "synthetic-secret") {
+								t.Error("Gemini request omitted its test client secret")
+							}
+						}
+						location := "/unselected?echo=" + marker
+						if target == "other-origin" {
+							location = receiver.URL + location
+						} else if target == "other-host" {
+							location = strings.Replace(receiver.URL, "127.0.0.1", "localhost", 1) + location
+						} else if target == "malformed" {
+							location = "://" + marker + "%zz"
+						}
+						w.Header().Set("Location", location)
+						w.WriteHeader(status)
+						_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+					}))
+					defer server.Close()
+					err := callTokenEndpointForTest(t, context.Background(), operation, server.URL+"/token")
+					if requests.Load() != 1 || redirected.Load() != 0 || disclosed.Load() != 0 {
+						t.Errorf("redirect crossed credential boundary: initial=%d redirected=%d sensitive=%d", requests.Load(), redirected.Load(), disclosed.Load())
+					}
+					if err == nil {
+						t.Fatal("redirected endpoint was accepted as the selected token endpoint")
+					}
+					for _, secret := range []string{marker, "synthetic-renewal", "synthetic-secret", "synthetic-access"} {
+						if strings.Contains(err.Error(), secret) {
+							t.Error("redirect diagnostic disclosed response or credential data")
+						}
+					}
+					if !strings.Contains(err.Error(), fmt.Sprint(status)) {
+						t.Errorf("original redirect status lost: %v", err)
+					}
+					var rejection *RefreshRejectedError
+					if errors.As(err, &rejection) || errors.Is(err, ErrRefreshTokenReused) {
+						t.Error("redirect was classified as credential rejection")
+					}
+					if operation == "codex-probe" {
+						var probe *TokenVerifyError
+						if !errors.As(err, &probe) || probe.StatusCode != status || probe.Attempts != 1 || probe.Rejected() || probe.Transient() {
+							t.Errorf("redirect was not an inconclusive, non-retried probe: %v", err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestTokenEndpointsStillAcceptDirectResponses(t *testing.T) {
+	for _, operation := range []string{"codex", "gemini", "claude-helper", "codex-probe"} {
+		t.Run(operation, func(t *testing.T) {
+			var requests atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				_, _ = io.WriteString(w, `{"access_token":"direct-response","expires_in":3600}`)
+			}))
+			defer server.Close()
+			if err := callTokenEndpointForTest(t, context.Background(), operation, server.URL); err != nil || requests.Load() != 1 {
+				t.Fatalf("direct response failed: requests=%d error=%v", requests.Load(), err)
+			}
+		})
+	}
+}
+
+func TestTokenEndpointsRefuseHTTPSDowngrade(t *testing.T) {
+	for _, operation := range []string{"codex", "gemini", "claude-helper", "codex-probe"} {
+		t.Run(operation, func(t *testing.T) {
+			var redirected atomic.Int64
+			receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				redirected.Add(1)
+				_, _ = io.WriteString(w, `{"access_token":"unselected-response"}`)
+			}))
+			defer receiver.Close()
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Location", receiver.URL)
+				w.WriteHeader(http.StatusTemporaryRedirect)
+			}))
+			defer server.Close()
+			// Trust only the local test server's certificate. Production TLS
+			// validation and the caller's selected transport are unchanged.
+			old := http.DefaultTransport
+			http.DefaultTransport = server.Client().Transport
+			t.Cleanup(func() { http.DefaultTransport = old })
+			err := callTokenEndpointForTest(t, context.Background(), operation, server.URL)
+			if err == nil || redirected.Load() != 0 || !strings.Contains(err.Error(), "307") {
+				t.Fatalf("HTTPS token request followed downgrade: redirected=%d error=%v", redirected.Load(), err)
+			}
+		})
+	}
+}
 
 func TestRefreshCodexToken(t *testing.T) {
 	// Mock server
@@ -234,7 +405,8 @@ func TestVerifyCodexToken(t *testing.T) {
 		{name: "200 accepted", statuses: []int{200}, wantAttempts: 1},
 		{name: "204 accepted", statuses: []int{204}, wantAttempts: 1},
 		{name: "401 rejected without retry", statuses: []int{401}, wantErr: true, wantStatus: 401, wantAttempts: 1, wantRejected: true},
-		{name: "403 rejected without retry", statuses: []int{403}, wantErr: true, wantStatus: 403, wantAttempts: 1, wantRejected: true},
+		{name: "403 is inconclusive without retry", statuses: []int{403}, wantErr: true, wantStatus: 403, wantAttempts: 1},
+		{name: "429 then 403 remains inconclusive", statuses: []int{429, 403}, wantErr: true, wantStatus: 403, wantAttempts: 2},
 		{name: "429 then 200 recovers", statuses: []int{429, 200}, wantAttempts: 2},
 		{name: "503 then 200 recovers", statuses: []int{503, 200}, wantAttempts: 2},
 		{name: "500 twice is transient", statuses: []int{500, 500}, wantErr: true, wantStatus: 500, wantAttempts: 2, wantTransit: true},
@@ -251,6 +423,9 @@ func TestVerifyCodexToken(t *testing.T) {
 				}
 				if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 					t.Errorf("unexpected auth header: %q", got)
+				}
+				if got := r.Header.Get("Accept"); got != "application/json" {
+					t.Errorf("Accept = %q, want application/json", got)
 				}
 				idx := calls
 				if idx >= len(tt.statuses) {
@@ -293,6 +468,46 @@ func TestVerifyCodexToken(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), fmt.Sprintf("status %d", tt.wantStatus)) {
 				t.Errorf("error text should name the status: %q", err.Error())
+			}
+		})
+	}
+}
+
+// Issue #127: a denied probe request is not proof that the same credential
+// cannot run Codex. Keep the status, but never promote an edge HTML response,
+// a permission error, or an arbitrary error message into a token verdict.
+func TestVerifyCodexTokenForbiddenIsNotARejectedCredential(t *testing.T) {
+	for _, body := range []string{
+		"",
+		"<html>Access denied: response-must-not-be-logged</html>",
+		`{"error":{"code":"permission_denied","message":"response-must-not-be-logged"}}`,
+		`{"error":{"message":"invalid token: response-must-not-be-logged"}}`,
+	} {
+		t.Run(fmt.Sprintf("body-length=%d", len(body)), func(t *testing.T) {
+			var calls int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				w.Header().Set("Retry-After", "1")
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+			oldURL := CodexVerifyURL
+			CodexVerifyURL = server.URL
+			defer func() { CodexVerifyURL = oldURL }()
+
+			err := VerifyCodexToken(context.Background(), "synthetic-probe-credential")
+			var denied *TokenVerifyError
+			if !errors.As(err, &denied) || denied.StatusCode != http.StatusForbidden || denied.Attempts != 1 {
+				t.Fatalf("lost denied-probe status: %v", err)
+			}
+			if denied.Rejected() || denied.Transient() || calls != 1 {
+				t.Fatalf("403 became a credential verdict or retry: rejected=%v transient=%v calls=%d", denied.Rejected(), denied.Transient(), calls)
+			}
+			for _, secret := range []string{"synthetic-probe-credential", "response-must-not-be-logged"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatal("probe error disclosed a credential or response body")
+				}
 			}
 		})
 	}
@@ -357,6 +572,28 @@ func TestVerifyCodexToken_RefusesNonAllowlistedHost(t *testing.T) {
 	err := VerifyCodexToken(context.Background(), "test-token")
 	if err == nil || !strings.Contains(err.Error(), "not allowlisted") {
 		t.Fatalf("expected allowlist refusal, got %v", err)
+	}
+}
+
+// Issue #127: the probe has to ask the service that accepts the access token
+// of a Codex ChatGPT login. The API platform's /v1/me refuses every such
+// token with 403 at its edge, so probing it could never confirm a working
+// login (and, while 403 counted as a rejection, it told users to log in
+// again). The default is the ChatGPT backend's read-only usage endpoint, it
+// must pass the probe's own allowlist, and the old endpoint must not.
+func TestCodexVerifyURLTargetsChatGPTBackend(t *testing.T) {
+	u, err := url.Parse(CodexVerifyURL)
+	if err != nil {
+		t.Fatalf("parse CodexVerifyURL: %v", err)
+	}
+	if u.Scheme != "https" || u.Hostname() != "chatgpt.com" || u.Path != "/backend-api/wham/usage" || u.RawQuery != "" {
+		t.Fatalf("CodexVerifyURL = %q, want https://chatgpt.com/backend-api/wham/usage", CodexVerifyURL)
+	}
+	if err := validateTokenEndpoint(CodexVerifyURL, codexVerifyHosts); err != nil {
+		t.Fatalf("default verify endpoint refused by its own allowlist: %v", err)
+	}
+	if err := validateTokenEndpoint("https://api.openai.com/v1/me", codexVerifyHosts); err == nil {
+		t.Fatal("the API platform endpoint, which refuses ChatGPT-login tokens, is still allowlisted for the probe")
 	}
 }
 
@@ -489,8 +726,7 @@ func TestUpdateCodexAuth_NoExpiresIn(t *testing.T) {
 	var updatedAuth map[string]interface{}
 	json.Unmarshal(updatedData, &updatedAuth)
 
-	// expires_at should remain unchanged since ExpiresIn is 0
-	if val, ok := updatedAuth["expires_at"].(float64); ok && val != 1500000000 {
-		t.Errorf("expires_at should remain unchanged when ExpiresIn is 0")
+	if _, ok := updatedAuth["expires_at"]; ok {
+		t.Error("new opaque token inherited the previous token's expiry")
 	}
 }

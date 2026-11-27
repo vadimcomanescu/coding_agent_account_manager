@@ -6,24 +6,31 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/deploy"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/keychain"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/cursor"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/gemini"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
 // CheckResult represents the result of a single diagnostic check.
@@ -50,6 +57,7 @@ type DoctorReport struct {
 	Locks           []CheckResult `json:"locks"`
 	AuthFiles       []CheckResult `json:"auth_files"`
 	TokenValidation []CheckResult `json:"token_validation,omitempty"`
+	Distributed     []CheckResult `json:"distributed,omitempty"`
 }
 
 // DependencySpec defines an optional external dependency with install hints.
@@ -166,6 +174,9 @@ func runDoctorChecks(fix bool, validate bool, autoInstall bool, skipConfirm bool
 	// Check auth files
 	report.AuthFiles = checkAuthFiles()
 
+	// Check distributed auth recovery (only when this machine runs the agent)
+	report.Distributed = checkDistributed(context.Background(), agent.DefaultConfigPath())
+
 	// Check token validation (if requested)
 	if validate {
 		report.TokenValidation = checkTokenValidation()
@@ -179,6 +190,7 @@ func runDoctorChecks(fix bool, validate bool, autoInstall bool, skipConfirm bool
 	allChecks = append(allChecks, report.Locks...)
 	allChecks = append(allChecks, report.AuthFiles...)
 	allChecks = append(allChecks, report.TokenValidation...)
+	allChecks = append(allChecks, report.Distributed...)
 
 	for _, check := range allChecks {
 		switch check.Status {
@@ -919,14 +931,18 @@ func checkAuthFiles() []CheckResult {
 	if result := checkClaudeKeychain(); result != nil {
 		results = append(results, *result)
 	}
+	if result := checkAgyKeychain(); result != nil {
+		results = append(results, *result)
+	}
 
 	for tool, getFileSet := range tools {
 		fileSet := getFileSet()
 		hasAuth := authfile.HasAuthFiles(fileSet)
+		activeProfile := ""
 
 		if hasAuth {
 			// Check which profile is active
-			activeProfile, _ := vault.ActiveProfile(fileSet)
+			activeProfile, _ = vault.ActiveProfile(fileSet)
 			msg := "logged in"
 			if activeProfile != "" {
 				msg = fmt.Sprintf("logged in (profile: %s)", activeProfile)
@@ -944,6 +960,19 @@ func checkAuthFiles() []CheckResult {
 				Details: "Login with the tool first, then use 'caam backup' to save",
 			})
 		}
+		if tool == "cursor" && hasAuth && activeProfile == "" {
+			ph := &health.ProfileHealth{}
+			applyLiveExpiry(tool, ph)
+			if result := checkProfileTokenExpiry(tool, "", ph); result != nil {
+				result.Name = "cursor live token"
+				results = append(results, *result)
+			} else {
+				results = append(results, CheckResult{
+					Name: "cursor live token", Status: "warn", Message: "login expiry unknown",
+					Details: "No readable Cursor JWT expiry found in the live credential file",
+				})
+			}
+		}
 
 		// Check vault profile token expiry for all non-system profiles.
 		// This catches profiles that have drifted into expired/unusable state
@@ -955,7 +984,13 @@ func checkAuthFiles() []CheckResult {
 					continue
 				}
 				ph := buildProfileHealth(tool, profileName)
-				name := fmt.Sprintf("%s/%s token", tool, profileName)
+				if profileName == activeProfile {
+					applyLiveExpiry(tool, ph)
+				}
+				if result := checkProfileTokenExpiry(tool, profileName, ph); result != nil {
+					results = append(results, *result)
+					continue
+				}
 				if ph == nil || ph.TokenExpiresAt.IsZero() {
 					// Cannot determine expiry: probe the token with a live API
 					// call to detect broken/reused tokens that look valid on disk.
@@ -964,29 +999,13 @@ func checkAuthFiles() []CheckResult {
 					}
 					continue
 				}
-				if ph.TokenExpiresAt.Before(time.Now()) {
-					results = append(results, CheckResult{
-						Name:    name,
-						Status:  "fail",
-						Message: "token expired",
-						Details: fmt.Sprintf("Expired at %s; re-login with 'caam login %s %s'", ph.TokenExpiresAt.Format(time.RFC3339), tool, profileName),
-					})
-				} else if time.Until(ph.TokenExpiresAt) < 15*time.Minute {
-					results = append(results, CheckResult{
-						Name:    name,
-						Status:  "warn",
-						Message: fmt.Sprintf("token expiring soon (%s remaining)", formatExpiryDuration(ph.TokenExpiresAt)),
-						Details: fmt.Sprintf("Consider refreshing: 'caam refresh %s %s'", tool, profileName),
-					})
-				} else {
-					// Token not expired and not expiring soon -- still probe Codex
-					// tokens with a live API call to catch refresh_token_reused state
-					// where the access token appears valid by expiry but the refresh
-					// token has been consumed, making the profile a ticking time bomb.
-					if tool == "codex" {
-						if result := probeVaultToken(tool, profileName); result != nil {
-							results = append(results, *result)
-						}
+				// Token not expired and not expiring soon -- still probe Codex
+				// tokens with a live API call to catch refresh_token_reused state
+				// where the access token appears valid by expiry but the refresh
+				// token has been consumed, making the profile a ticking time bomb.
+				if tool == "codex" {
+					if result := probeVaultToken(tool, profileName); result != nil {
+						results = append(results, *result)
 					}
 				}
 			}
@@ -1000,6 +1019,62 @@ func checkAuthFiles() []CheckResult {
 	}
 
 	return results
+}
+
+// checkProfileTokenExpiry distinguishes a hard session deadline from a
+// renewable cached access token. Cursor session logins need several days of
+// warning, and its API-key-backed credentials renew through Cursor itself.
+func checkProfileTokenExpiry(tool, profileName string, ph *health.ProfileHealth) *CheckResult {
+	if ph == nil {
+		return nil
+	}
+	name := fmt.Sprintf("%s/%s token", tool, profileName)
+	if tool == "cursor" && ph.CredentialRenewable() {
+		return &CheckResult{
+			Name: name, Status: "pass", Message: "API-key-backed credentials can renew",
+			Details: "Cursor renews the access token using the saved API key",
+		}
+	}
+	if ph.TokenExpiresAt.IsZero() || ph.SelfRefreshing {
+		return nil
+	}
+	remaining := time.Until(ph.TokenExpiresAt)
+	if remaining > max(15*time.Minute, ph.ReloginWarningLead) {
+		if tool == "cursor" {
+			return &CheckResult{
+				Name: name, Status: "pass", Message: fmt.Sprintf("session login valid, expires %s", formatExpiryDuration(ph.TokenExpiresAt)),
+				Details: fmt.Sprintf("Expires at %s; session cannot renew", ph.TokenExpiresAt.Format(time.RFC3339)),
+			}
+		}
+		return nil
+	}
+	result := &CheckResult{
+		Name:    name,
+		Status:  "warn",
+		Message: fmt.Sprintf("token expiring soon (%s remaining)", formatExpiryDuration(ph.TokenExpiresAt)),
+	}
+	if ph.CredentialRenewable() {
+		if remaining <= 0 {
+			result.Message = "access token needs renewal"
+		}
+		result.Details = fmt.Sprintf("Renew with 'caam refresh %s %s'", tool, profileName)
+		return result
+	}
+	loginInstructions := fmt.Sprintf("Log in again with 'caam login %s %s'", tool, profileName)
+	if tool == "cursor" {
+		loginInstructions = health.CursorReloginInstructions(profileName)
+	}
+	result.Details = fmt.Sprintf("Expires at %s. %s", ph.TokenExpiresAt.Format(time.RFC3339), loginInstructions)
+	if ph.ReloginWarningLead > 0 {
+		result.Message = fmt.Sprintf("session expiring soon (%s remaining)", formatExpiryDuration(ph.TokenExpiresAt))
+		result.Details += "; this session cannot be refreshed"
+	}
+	if remaining <= 0 {
+		result.Status = "fail"
+		result.Message = "token expired"
+		result.Details = fmt.Sprintf("Expired at %s. %s", ph.TokenExpiresAt.Format(time.RFC3339), loginInstructions)
+	}
+	return result
 }
 
 // normalizeIdentity extracts the primary identifier from an identity string
@@ -1031,6 +1106,42 @@ func checkClaudeKeychain() *CheckResult {
 		check.Status = "fail"
 		check.Message = "the login keychain refused access"
 		check.Details = "Unlock the login keychain and allow access when prompted, or set CAAM_KEYCHAIN=0 to fall back to ~/.claude/.credentials.json"
+	default:
+		check.Status = "fail"
+		check.Message = err.Error()
+	}
+	return check
+}
+
+// checkAgyKeychain reports on the macOS login-keychain bridge for Antigravity
+// CLI (agy). On macOS desktop sessions agy stores its OAuth token under
+// service "gemini" / account "antigravity" rather than on disk (issue #140).
+func checkAgyKeychain() *CheckResult {
+	if !keychain.Enabled() || os.Getenv("GEMINI_HOME") != "" {
+		return nil
+	}
+	check := &CheckResult{Name: "agy keychain"}
+	switch _, err := keychain.ReadAgy(); {
+	case err == nil:
+		check.Status = "pass"
+		check.Message = fmt.Sprintf("%q/%q readable in the login keychain", keychain.AgyService, keychain.AgyAccount)
+	case errors.Is(err, keychain.ErrNoKeychain):
+		return nil
+	case errors.Is(err, keychain.ErrNotFound):
+		// Stay quiet unless agy is actually installed and has no on-disk token.
+		if _, lookErr := osexec.LookPath("agy"); lookErr != nil {
+			return nil
+		}
+		if _, statErr := os.Stat(filepath.Join(os.Getenv("HOME"), ".gemini", "antigravity-cli", "antigravity-oauth-token")); statErr == nil {
+			return nil
+		}
+		check.Status = "warn"
+		check.Message = "no Antigravity item in the login keychain"
+		check.Details = "agy stores its OAuth token in the login keychain on macOS; log in with 'agy' before 'caam backup agy <profile>'"
+	case errors.Is(err, keychain.ErrDenied):
+		check.Status = "fail"
+		check.Message = "the login keychain refused access"
+		check.Details = "Unlock the login keychain and allow access when prompted, or set CAAM_KEYCHAIN=0 to fall back to ~/.gemini/antigravity-cli/antigravity-oauth-token"
 	default:
 		check.Status = "fail"
 		check.Message = err.Error()
@@ -1134,7 +1245,7 @@ func checkDuplicateIdentities(tool string) []CheckResult {
 // where doctor reports "OK" based on JWT expiry alone, but the token is actually
 // unusable because the refresh token has been consumed (refresh_token_reused).
 //
-// Currently only supports Codex profiles (GET /v1/me).
+// Currently only supports Codex ChatGPT logins (GET refresh.CodexVerifyURL).
 // Returns nil if the probe succeeds or the tool is not supported for probing.
 func probeVaultToken(tool, profileName string) *CheckResult {
 	if tool != "codex" {
@@ -1147,6 +1258,11 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 	data, err := os.ReadFile(authPath)
 	if err != nil {
 		return nil // Can't read auth file; other checks will catch this
+	}
+	if selected, err := health.CodexUsesAPIKey(data); err != nil || selected {
+		// This probe only verifies OAuth. A stored API key selects a
+		// different credential, even when an old access token remains.
+		return nil
 	}
 
 	var auth map[string]interface{}
@@ -1173,17 +1289,97 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	fingerprint := health.CodexCredentialFingerprint(data)
 	if err := refresh.VerifyCodexToken(ctx, accessToken); err != nil {
+		// Only a definitive refusal (401) is recorded (issue #108). Rate
+		// limiting, 5xx and transport failures say nothing about the
+		// credential, and a 403 can come from an edge proxy. A 401 counts
+		// only while the access token is unexpired by its own claim: a
+		// vault copy routinely holds a lapsed access token beside a
+		// working refresh token, and that 401 says nothing about the
+		// account.
+		var verifyErr *refresh.TokenVerifyError
+		if errors.As(err, &verifyErr) && verifyErr.StatusCode == http.StatusUnauthorized {
+			if codexAccessTokenLive(authPath) {
+				recordProbeVerdict(tool, profileName, false, fmt.Sprintf("access_token_rejected_http_%d", verifyErr.StatusCode), fingerprint)
+			} else if expiresAt, lapsed := codexAccessTokenLapsed(authPath); lapsed {
+				// The same rule decides the check: this 401 is the expected
+				// answer for a lapsed token, not a rejected login. It is
+				// typically the active profile's snapshot, which goes stale
+				// while Codex rotates the live login in place; doctor judged
+				// that profile's expiry from the live file (issue #127).
+				return lapsedCodexSnapshotResult(tool, profileName, expiresAt)
+			}
+		}
 		return classifyCodexProbeError(tool, profileName, err)
 	}
 
+	recordProbeVerdict(tool, profileName, true, "", fingerprint)
 	return nil // Token is valid
+}
+
+// codexAccessTokenLive reports whether the Codex credential at authPath has
+// an access token that is comfortably unexpired, so a 401 for it is evidence
+// against the account (issue #108).
+func codexAccessTokenLive(authPath string) bool {
+	info, err := health.ParseCodexExpiry(authPath)
+	if err != nil || info == nil {
+		return false
+	}
+	return health.AccessTokenRejectionIsEvidence(info.ExpiresAt, time.Now())
+}
+
+// codexAccessTokenLapsed reports whether the Codex credential at authPath
+// claims an access token expiry that has passed or falls within the rejection
+// skew, and returns that expiry. An unknown expiry is not lapsed: a 401 for
+// such a token keeps its usual meaning.
+func codexAccessTokenLapsed(authPath string) (time.Time, bool) {
+	info, err := health.ParseCodexExpiry(authPath)
+	if err != nil || info == nil || info.ExpiresAt.IsZero() {
+		return time.Time{}, false
+	}
+	return info.ExpiresAt, !health.AccessTokenRejectionIsEvidence(info.ExpiresAt, time.Now())
+}
+
+// lapsedCodexSnapshotResult reports a probe that could not judge the login
+// because the saved access token had already lapsed by its own claim.
+func lapsedCodexSnapshotResult(tool, profileName string, expiresAt time.Time) *CheckResult {
+	return &CheckResult{
+		Name:    fmt.Sprintf("%s/%s token", tool, profileName),
+		Status:  "warn",
+		Message: "could not verify token (saved access token has lapsed)",
+		Details: fmt.Sprintf(
+			"The saved copy of %s/%s holds an access token whose own expiry (%s) has passed\n"+
+				"or is minutes away, so the provider's HTTP 401 for it says nothing about the login.\n"+
+				"While a profile is in use, its CLI keeps the newer login in the live auth file;\n"+
+				"caam saves a newer live login of the same account back to the profile when\n"+
+				"you switch away from it.",
+			tool, profileName, expiresAt.UTC().Format(time.RFC3339)),
+	}
+}
+
+// recordProbeVerdict stores a live probe's answer in health metadata so
+// ls/status reflect it (issue #108). The probe only exercises the access
+// token, so its acceptance cannot clear a refresh-token rejection.
+// Best-effort.
+func recordProbeVerdict(tool, profileName string, accepted bool, reason, fingerprint string) {
+	store := healthStore
+	if store == nil {
+		store = health.NewStorage("")
+	}
+	_ = store.RecordProviderVerification(tool, profileName, health.ProviderVerification{
+		Accepted:        accepted,
+		Reason:          reason,
+		Fingerprint:     fingerprint,
+		AccessTokenOnly: accepted,
+	})
 }
 
 // classifyCodexProbeError maps a VerifyCodexToken failure onto a doctor check.
 //
-// Only a definitive rejection by the provider (HTTP 401/403) is a failure.
-// Rate limiting, server-side errors, and transport problems say nothing about
+// Only a definitive rejection by the provider (HTTP 401) is a failure. A 403
+// (a permission, policy or edge-proxy refusal of the request, issue #127),
+// rate limiting, server-side errors, and transport problems say nothing about
 // the stored credential, so they are reported as warnings that keep the HTTP
 // status for diagnosis instead of being misread as a consumed refresh token
 // (issue #78). Refresh-token reuse is never diagnosed here because the probe
@@ -1264,6 +1460,7 @@ func checkTokenValidation() []CheckResult {
 	reg := provider.NewRegistry()
 	reg.Register(claude.New())
 	reg.Register(codex.New())
+	reg.Register(cursor.New())
 	reg.Register(gemini.New())
 
 	// Get all profiles and validate tokens
@@ -1309,6 +1506,14 @@ func checkTokenValidation() []CheckResult {
 			}
 
 			if result.Valid {
+				if providerID == "cursor" && !result.ExpiresAt.IsZero() && time.Until(result.ExpiresAt) <= health.CursorReloginLead {
+					results = append(results, CheckResult{
+						Name: name, Status: "warn",
+						Message: fmt.Sprintf("session expires %s; cannot auto-refresh", formatExpiryDuration(result.ExpiresAt)),
+						Details: fmt.Sprintf("Log in again with 'caam login cursor %s' before this isolated session expires.", prof.Name),
+					})
+					continue
+				}
 				msg := "valid"
 				if !result.ExpiresAt.IsZero() {
 					msg = fmt.Sprintf("valid (expires %s)", formatExpiryDuration(result.ExpiresAt))
@@ -1405,6 +1610,15 @@ func printDoctorReport(report *DoctorReport, validate bool) {
 	}
 	fmt.Println()
 
+	// Distributed auth recovery (only when this machine runs the agent)
+	if len(report.Distributed) > 0 {
+		fmt.Println("Checking distributed auth recovery...")
+		for _, check := range report.Distributed {
+			printCheck(check)
+		}
+		fmt.Println()
+	}
+
 	// Token Validation (only if --validate was used)
 	if validate && len(report.TokenValidation) > 0 {
 		fmt.Println("Validating tokens...")
@@ -1451,4 +1665,157 @@ func printCheck(check CheckResult) {
 	if check.Details != "" && check.Status != "pass" {
 		fmt.Printf("      %s\n", check.Details)
 	}
+}
+
+// distributedProbeTimeout bounds each coordinator check (an SSH dial can
+// take its whole timeout on an unreachable host).
+const distributedProbeTimeout = 20 * time.Second
+
+// checkDistributed checks the distributed auth recovery setup from this
+// machine (the auth agent side): config, Chrome, the agent profile's
+// sign-ins, the login service, and every coordinator. It returns nothing
+// when there is no agent config, so machines that do not use distributed
+// recovery see no section.
+func checkDistributed(ctx context.Context, configPath string) []CheckResult {
+	fc, err := agent.LoadFileConfig(configPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return []CheckResult{{Name: "Agent config", Status: "fail", Message: err.Error(), Details: configPath}}
+	}
+	useMulti, single, multi, err := loadAgentConfig(configPath)
+	if err != nil {
+		return []CheckResult{{Name: "Agent config", Status: "fail", Message: err.Error(), Details: configPath}}
+	}
+	endpoints := multi.Coordinators
+	if !useMulti {
+		endpoints = []*agent.CoordinatorEndpoint{{Name: "coordinator", URL: single.CoordinatorURL, Token: single.CoordinatorToken}}
+	}
+	results := []CheckResult{{
+		Name:    "Agent config",
+		Status:  "pass",
+		Message: fmt.Sprintf("%d coordinator(s) in %s", len(endpoints), shortenPath(configPath)),
+	}}
+	// Without accounts the agent cannot rotate: every recovery logs in with
+	// whichever account Claude or Google offers first, usually the one that
+	// just hit its limit.
+	if len(fc.Accounts) == 0 {
+		results = append(results, CheckResult{Name: "Account rotation", Status: "warn",
+			Message: "no accounts configured; recoveries reuse whichever account is offered first",
+			Details: "add the Google accounts to rotate through: caam auth-agent accounts add <email>..."})
+	} else {
+		results = append(results, CheckResult{Name: "Account rotation", Status: "pass",
+			Message: fmt.Sprintf("%d account(s), strategy %s", len(fc.Accounts), firstNonEmpty(fc.Strategy, "lru"))})
+		if r, ok := heldAccountsCheck(fc.Accounts, agent.UsagePath(), time.Now()); ok {
+			results = append(results, r)
+		}
+	}
+
+	if chrome := agent.GetChromePath(); chrome != "" {
+		results = append(results, CheckResult{Name: "Chrome", Status: "pass", Message: chrome})
+	} else {
+		results = append(results, CheckResult{Name: "Chrome", Status: "fail",
+			Message: "Chrome/Chromium not found; the agent cannot complete logins",
+			Details: "install Google Chrome or Chromium"})
+	}
+
+	profileDir := agent.ResolveChromeUserDataDir(fc.ChromeUserDataDir())
+	google, claude, err := agent.ProfileSessions(profileDir)
+	switch {
+	case err != nil:
+		results = append(results, CheckResult{Name: "Agent sign-ins", Status: "warn",
+			Message: "could not read the agent's Chrome profile: " + err.Error(), Details: profileDir})
+	case !google:
+		results = append(results, CheckResult{Name: "Agent sign-ins", Status: "warn",
+			Message: "no Google account is signed in to the agent's Chrome profile",
+			Details: "run: caam auth-agent signin"})
+	default:
+		msg := "Google signed in"
+		if claude {
+			msg += "; Claude signed in"
+		}
+		results = append(results, CheckResult{Name: "Agent sign-ins", Status: "pass", Message: msg})
+	}
+
+	if svc, err := deploy.NewAgentService(configPath); err == nil {
+		if st, err := svc.Status(ctx); err == nil {
+			switch {
+			case st.Installed && st.Running:
+				results = append(results, CheckResult{Name: "Agent service", Status: "pass", Message: "installed and running"})
+			case st.Installed:
+				results = append(results, CheckResult{Name: "Agent service", Status: "warn",
+					Message: "installed but not running", Details: "logs: " + st.LogPath})
+			default:
+				results = append(results, CheckResult{Name: "Agent service", Status: "warn",
+					Message: "not installed; nothing completes logins unless 'caam auth-agent' runs",
+					Details: "run: caam auth-agent service install"})
+			}
+		}
+	}
+
+	checks := make([]CheckResult, len(endpoints))
+	var wg sync.WaitGroup
+	for i, ep := range endpoints {
+		wg.Add(1)
+		go func(i int, ep *agent.CoordinatorEndpoint) {
+			defer wg.Done()
+			defer ep.Close()
+			pctx, cancel := context.WithTimeout(ctx, distributedProbeTimeout)
+			defer cancel()
+			checks[i] = coordinatorCheck(ep, ep.Probe(pctx), version.Short())
+		}(i, ep)
+	}
+	wg.Wait()
+	return append(results, checks...)
+}
+
+// coordinatorCheck turns one coordinator probe into a check result.
+// heldAccountsCheck reports the configured accounts the agent is passing
+// over because they are at their usage limit. ok is false when none are.
+func heldAccountsCheck(accounts []string, usagePath string, now time.Time) (CheckResult, bool) {
+	held, err := agent.HeldAccounts(usagePath, now)
+	if err != nil {
+		return CheckResult{Name: "Accounts at limit", Status: "warn", Message: err.Error()}, true
+	}
+	var names []string
+	var first time.Time
+	for _, acc := range accounts {
+		for email, until := range held {
+			if strings.EqualFold(email, acc) {
+				names = append(names, fmt.Sprintf("%s until %s", acc, until.Local().Format("Jan 2 15:04")))
+				if first.IsZero() || until.Before(first) {
+					first = until
+				}
+			}
+		}
+	}
+	if len(names) == 0 {
+		return CheckResult{}, false
+	}
+	if len(names) == len(accounts) {
+		return CheckResult{Name: "Accounts at limit", Status: "warn",
+			Message: fmt.Sprintf("all %d accounts are at their usage limit; recoveries wait until %s", len(accounts), first.Local().Format("Jan 2 15:04")),
+			Details: strings.Join(names, "; ")}, true
+	}
+	return CheckResult{Name: "Accounts at limit", Status: "pass",
+		Message: fmt.Sprintf("%d of %d passed over: %s", len(names), len(accounts), strings.Join(names, "; "))}, true
+}
+
+func coordinatorCheck(ep *agent.CoordinatorEndpoint, p agent.CoordinatorProbe, localVersion string) CheckResult {
+	name := "Coordinator " + ep.Name
+	via := ep.Transport()
+	if ep.SSH != nil {
+		via = "ssh " + ep.SSH.Host
+	}
+	if !p.Healthy {
+		return CheckResult{Name: name, Status: "fail", Message: "unreachable via " + via, Details: p.Error}
+	}
+	msg := fmt.Sprintf("reachable via %s; %s; %d pane(s), %d pending", via, p.Backend, p.PaneCount, p.PendingAuths)
+	if p.Version != "" && p.Version != localVersion {
+		return CheckResult{Name: name, Status: "warn",
+			Message: fmt.Sprintf("%s; runs caam %s, this machine %s", msg, p.Version, localVersion),
+			Details: "run: caam update --remotes"}
+	}
+	return CheckResult{Name: name, Status: "pass", Message: msg}
 }

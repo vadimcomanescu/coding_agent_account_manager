@@ -166,6 +166,21 @@ This creates unnecessary friction in the critical first-use experience.
 
 **Dependency:** Auth Detection (needs detection to know what to import)
 
+**Implemented import publication safeguards:** source credentials are captured
+and validated before changing the registered profile. A forced replacement is
+prepared in a private staging directory, including provider setup and local
+credential checks, then published with recovery of the previous profile if
+publication fails. Locked profiles cannot be replaced. Successful replacement
+retains the complete previous profile outside the routable profile layout and
+reports its backup path; imported credentials and helper paths belong to the
+selected account.
+
+Claude detection reads the selected native authority without materializing a
+keychain mirror. An explicit config directory remains isolated from the default
+keychain. Both import entrypoints can capture a keychain-only login directly
+into the unpublished profile, preserving native files and surfacing denied
+keychain reads instead of importing a stale account.
+
 #### 2.3 Init Wizard Enhancement
 
 **What:** Integrate auth detection and import into the init wizard.
@@ -377,6 +392,190 @@ And doctor would report "pass" because files exist.
 - Mock API responses for validation tests
 - Test expiry checking logic
 - Test error handling for network failures
+
+#### 5.2 Native keepalive for idle live grants
+
+**Implemented for issue #119:** `caam keepalive` invokes Claude and Grok in
+the homes that own their native OAuth credentials. It closes the idle
+expiry cycle in which failed quota queries prevent an account from receiving
+the work that would otherwise cause its CLI to renew.
+
+- Discover host and isolated logins plus Claude shallow homes without
+  migrating files or reading a vault snapshot as an executable grant.
+- Resolve competing owners before selection; prefer a known Claude shallow
+  owner over its matching host copy and fail closed on ambiguous identities.
+- Apply a two-hour TTL threshold and a 25-minute minimum interval, with
+  expired credentials bypassing the interval.
+- Use bounded, minimal native calls with credential overrides scrubbed,
+  then verify the same live account has an unexpired credential.
+- Copy strictly newer credentials only to matching existing user snapshots
+  under the native credential lock, preserving settings and system backups.
+- Provide JSON outcomes, read-only dry runs, and generated systemd user
+  units using a persistent half-hour calendar timer.
+
+Focused tests use synthetic credentials and fake CLIs, including exit-zero
+credential deletion, competing owners, concurrent runs, cancellation,
+same-account vault synchronization, and read-only command paths. Claude
+keychain-only logins and Cursor session renewal remain outside this native
+file-based keepalive path.
+
+#### 5.3 Credential ownership across refresh and execution
+
+CAAM-managed Codex and Gemini refreshes now bind requests, provider verdicts,
+and publication to a captured credential generation. Same-source refreshes
+serialize across processes; replaced sources produce a skipped result. Live
+and isolated destinations receive a renewed grant only when their captured
+credentials match and their files remain unchanged. Partial delivery is
+reported without discarding a successful vault renewal or poisoning pool
+eligibility. The default daemon can recover expired renewable access tokens.
+
+Switch ownership, discovery and Codex restore also honor the selected native
+authentication method. API-key profiles use the selected key as their identity;
+unused OAuth tokens and timestamps cannot skip activation or authorize an
+overwrite of that saved key. Health and mutation paths share the same selectors.
+
+Profile runners, native login commands, shallow launches and shell exports
+use a shared provider environment policy. Conflicting ambient credentials
+are removed for file-backed logins, known credential directories are pinned,
+and explicit API-key modes keep their supported key inputs. Rate-limit
+handoff records the current account's cooldown before selecting a different
+eligible account, including when the usage database is unavailable.
+
+Shallow `--print-env` exports the complete policy as quoted unset/export
+commands or a JSON set/unset object. Export validates existing Claude settings
+and state without repairing or refreshing them, and skips startup migration
+and token-health checks. Invalid exports fail before emitting environment
+changes; shell-mode failures propagate through eval with a failing command.
+
+Profile onboarding also uses the same artifact limits as credential discovery:
+Claude settings and legacy state may be up to 256 MiB, while token files,
+executable helpers, and other providers retain their 16 MiB limit. Source and
+staged checks agree, and rejected imports never publish partial profiles.
+
+Synthetic regressions exercise in-flight source replacement, changed
+destinations, cancellation and cross-process refresh exclusion, invalid token
+responses, real child environments, Windows environment aliases, and every
+rotation algorithm and policy used for rate-limit handoff.
+
+**Claude account and organization ownership (issue #132):** OAuth ownership is
+the pair of account UUID and organization UUID. Email, organization name and
+an independently mutable `.claude.json` do not prove which grant is active.
+Provider identity results are bound to the complete access/refresh token pair,
+persisted with vault metadata or a private native cache, and reused offline
+only while the credential pair matches. Initial or rotated credentials may
+need a bounded `/api/oauth/profile` lookup at a mutation boundary; profile
+listing stays offline.
+
+Backup and activation use verified ownership to correct stale account labels.
+An unavailable endpoint or expired access token leaves an unverified grant
+preservable, with unverified labels omitted and a warning. A changed token in
+an already bound profile must be verified for the same account and organization
+before activation. Exact credential matches remain available without online
+identity lookup; matching different generations, updating a named outgoing
+profile, and keepalive synchronization require verified ownership. `caam ls`
+shows organization names and UUIDs, with unverified legacy labels marked.
+The first-use `_original` and automatic recovery snapshots retain captured
+credential bytes while correcting or omitting unsupported account metadata.
+
+Coordinator reports carry stable account and organization IDs only when the
+identity is proven for the grant held by that specific running pane. Current
+host files, pane titles, working directories and unqualified process IDs cannot
+establish that relationship. Built-in backends leave ownership unknown; an
+explicit pane resolver can supply verified evidence, captured once per episode
+and retained through its retries. A new episode clears evidence that is no
+longer available. Authentication-pool reconciliation also checks saved Claude
+proof offline: mismatched or malformed ownership is unavailable for selection,
+including after restart; exact-bound expired grants and unverified legacy
+profiles retain their existing native-renewal behavior.
+The browser agent declines organization-specific requests because its email
+configuration cannot select the intended organization. Participating CAAM
+processes serialize managed vault mutations with a private per-vault process
+lock; native Claude clients do not acquire it. Captured source and destination
+changes stop unsafe publication, but a file switch does not change
+credentials already held in a running Claude process. The existing publication
+path provides recovery for returned errors; this is not a claim of crash-atomic
+transactions across files and the native keychain.
+
+Synthetic regressions cover shared-email Personal and Team organizations,
+stale metadata, concurrent source replacement, substituted access tokens,
+automatic backups, activation, offline/expired verification, restart persistence,
+keepalive synchronization, and organization-aware browser refusal. Cached
+ownership is distinct from token liveness and does not independently verify
+the opaque refresh token.
+
+Vault ZIP bundles carry and validate this token-bound proof offline. Smart
+import requires the same verified account and organization, or the exact
+credential pair, before considering freshness from the selected primary file.
+Unknown or conflicting ownership is reported and preserved. Profile generation
+checks and the managed vault lock cover export and import; replacement retains
+the complete previous snapshot in a private, non-routable recovery directory.
+Tests cover modern/legacy source precedence, shared-email organization conflicts,
+stale bindings, expired cached proof, concurrent copy/publication changes,
+recovery retention, and read-only previews.
+
+The shared `vaulttransfer` module supplies captured profile inspection,
+normalization and guarded publication to the ZIP bundle path. It streams
+captured files, checks native size bounds before decoding, rejects ambiguous
+native filename casing and pins parent-directory identities. Publication
+retains the complete previous profile; rollback and temporary-stage cleanup
+preserve independently replaced directories. These checks remain offline and
+do not turn expired credentials into evidence of a different owner.
+Credential-bearing settings precede secondary legacy OAuth state; unsupported
+helper/key ownership stays unknown. ZIP import prepares every actionable
+profile before publication or preview success, while continuing to check the
+original extracted sources through publication.
+
+The separate tar commands, `caam export` and `caam import`, now use the same
+captured inspection and publication boundary. Import checks the complete archive
+and privately prepares all incoming profiles before publication; destination
+conflicts are checked together after waiting for the managed vault lock.
+`--as provider/name` renames a single-profile archive within its original provider.
+`--force` explicitly replaces existing profiles while retaining and reporting
+each complete previous snapshot. Export assembles the archive privately;
+`--output` requires an existing parent directory outside the vault and publishes
+through a private temporary file and final rename. An existing output survives
+returned preparation or write errors. Publication and recovery remain per
+profile: a later failure can leave earlier profiles imported, with the completed
+count and recovery paths reported. There is no archive-wide transaction or
+crash-recovery promise.
+
+SSH Claude transfers and all metadata-only seeds require guarded sync protocol 1
+on both hosts and stop with an update error if the peer is unavailable or too old;
+there is no unguarded file-copy fallback. Claude replication compares exact token
+pairs or verified account and organization UUIDs before comparing selected-token
+expiry. Unknown or conflicting ownership preserves existing profiles, and all
+identity checks stay offline. Complete profile exchanges hold both managed vault
+locks and recheck source and destination generations through publication.
+Replacing a profile retains its full predecessor, while recovery preserves an
+independently changed login.
+
+Host-local policy creates only missing logical profiles from provider/name,
+operator descriptions and tags. Metadata seeds carry no credentials, account or
+organization IDs, cached proof or arbitrary metadata, and never replace an
+existing profile. Text and JSON sync results report profile and machine errors
+and any retained recovery location: remote for push, local for pull. Errors
+produce a failing exit status. `caam sync add --remote-path` names the remote data
+root; discovery and transfer both use its `vault` subdirectory. These operations
+provide per-profile returned-error recovery, not a transaction across machines
+or a guarantee after a crash.
+
+#### 5.4 Explicit setup tokens for a single shallow launch
+
+For issue #131, `shallow-spawn --claude-oauth-token-fd N` reads a deliberately
+supplied Claude setup token from a dedicated inherited Unix descriptor. The
+CLI requires both a Claude profile and a direct Claude executable, rejects
+environment export, bounds input size and pipe read time, and closes the
+descriptor before replacing the process. The existing explicit environment
+merge supplies the token only to that launch; no token is written to a
+profile, settings, or the vault. Native Windows is refused rather than
+interpreting descriptor numbers as handles.
+
+Ambient OAuth tokens remain rejected. All shallow providers now remove an
+outer Claude launch's OAuth token and descriptor variable, so the exception
+cannot silently flow into a nested Codex or agy session. Synthetic tests
+exercise actual process replacement, exact token delivery, stdin and exit
+status preservation, subsequent-launch isolation, unchanged stored profiles,
+invalid inputs, cancellation, descriptor lifetime, and secret-free errors.
 
 ---
 

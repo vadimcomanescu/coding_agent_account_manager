@@ -1,8 +1,8 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
@@ -18,15 +19,19 @@ import (
 
 // VerifyProfileResult represents the verification result for a single profile.
 type VerifyProfileResult struct {
-	Provider    string     `json:"provider"`
-	Profile     string     `json:"profile"`
-	Status      string     `json:"status"` // "healthy", "warning", "critical", "unknown"
-	TokenExpiry *time.Time `json:"token_expiry,omitempty"`
-	ExpiresIn   string     `json:"expires_in,omitempty"`
-	ErrorCount  int        `json:"error_count,omitempty"`
-	Penalty     float64    `json:"penalty,omitempty"`
-	Issues      []string   `json:"issues,omitempty"`
-	Score       float64    `json:"score"`
+	Provider           string        `json:"provider"`
+	Profile            string        `json:"profile"`
+	Status             string        `json:"status"` // "healthy", "warning", "critical", "unknown"
+	TokenExpiry        *time.Time    `json:"token_expiry,omitempty"`
+	ExpiresIn          string        `json:"expires_in,omitempty"`
+	ErrorCount         int           `json:"error_count,omitempty"`
+	Penalty            float64       `json:"penalty,omitempty"`
+	Issues             []string      `json:"issues,omitempty"`
+	Score              float64       `json:"score"`
+	Recommendation     string        `json:"recommendation,omitempty"`
+	IdentityState      string        `json:"identity_state,omitempty"`
+	ReloginWarningLead time.Duration `json:"relogin_warning_lead,omitempty"`
+	health.Signals
 }
 
 // VerifyOutput represents the complete verification output.
@@ -68,7 +73,8 @@ Examples:
   caam verify              # Verify all profiles
   caam verify claude       # Verify only Claude profiles
   caam verify --json       # Machine-readable output
-  caam verify --fix        # Auto-refresh expiring tokens`,
+  caam verify --fix        # Auto-refresh expiring tokens
+  caam verify identity claude work --repair # Verify and repair saved identity`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runVerify,
 }
@@ -77,6 +83,83 @@ func init() {
 	rootCmd.AddCommand(verifyCmd)
 	verifyCmd.Flags().Bool("json", false, "output as JSON")
 	verifyCmd.Flags().Bool("fix", false, "auto-refresh expiring/expired tokens for refreshable profiles")
+	verifyCmd.AddCommand(newVerifyIdentityCommand())
+}
+
+func newVerifyIdentityCommand() *cobra.Command {
+	command := &cobra.Command{
+		Use:   "identity <tool> <profile>",
+		Short: "Check or repair a saved Claude profile's account and organization",
+		Long: `Inspect a saved vault profile's token-bound account and organization.
+
+The default check is offline. --online requests fresh provider verification.
+--repair persists a matching cached proof, or verifies with the provider when
+needed, and corrects the saved account labels. Credentials are never activated
+or replaced. A different recorded account or organization cannot be rebound.
+
+--copy-to creates a new user profile from the verified saved OAuth credential.
+It can recover protected snapshots without changing their original evidence.
+Existing destinations are never replaced. Profile names are labels, not proof
+of account ownership; inspect the reported account and organization UUIDs.
+The copy includes the exact modern OAuth credential and its verified identity;
+historical settings and other credentials remain in the source snapshot.
+
+Examples:
+  caam verify identity claude work
+  caam verify identity claude work --online --json
+  caam verify identity claude work --repair
+  caam verify identity claude _backup_20261103 --online --copy-to recovered-work`,
+		Args: cobra.ExactArgs(2),
+		RunE: runVerifyIdentity,
+	}
+	command.Flags().Bool("online", false, "verify the saved access token with the provider")
+	command.Flags().Bool("repair", false, "repair saved identity metadata using cached or provider verification")
+	command.Flags().String("copy-to", "", "create a verified copy under a new user profile label; preserve the source")
+	command.Flags().Bool("json", false, "output as JSON")
+	command.MarkFlagsMutuallyExclusive("repair", "copy-to")
+	return command
+}
+
+func runVerifyIdentity(cmd *cobra.Command, args []string) error {
+	if strings.ToLower(args[0]) != "claude" {
+		return fmt.Errorf("saved account-and-organization verification is supported for claude")
+	}
+	if vault == nil {
+		vault = authfile.NewVault(authfile.DefaultVaultPath())
+	}
+	online, _ := cmd.Flags().GetBool("online")
+	repair, _ := cmd.Flags().GetBool("repair")
+	copyTo, _ := cmd.Flags().GetString("copy-to")
+	if cmd.Flags().Changed("copy-to") && strings.TrimSpace(copyTo) == "" {
+		return fmt.Errorf("--copy-to requires a new user profile label")
+	}
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	result, verificationErr := vault.ClaudeProfileIdentity(cmd.Context(), args[1], authfile.ClaudeProfileIdentityOptions{Online: online, Repair: repair, CopyTo: copyTo})
+	if jsonOutput {
+		if err := json.NewEncoder(cmd.OutOrStdout()).Encode(result); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintf(cmd.OutOrStdout(), "%s/%s: %s (source: %s)\n", result.Provider, result.Profile, result.State, result.Source)
+		if result.Identity != nil {
+			fmt.Fprintf(cmd.OutOrStdout(), "Account: %s\nOrganization: %s [%s]\nEmail: %s\n",
+				result.Identity.AccountID, result.Identity.Organization, result.Identity.OrganizationID, result.Identity.Email)
+		}
+		if result.State == "conflict" && result.RecordedIdentity != nil {
+			fmt.Fprintf(cmd.OutOrStdout(), "Recorded account: %s\nRecorded organization: %s [%s]\n",
+				result.RecordedIdentity.AccountID, result.RecordedIdentity.Organization, result.RecordedIdentity.OrganizationID)
+		}
+		if result.Repaired {
+			fmt.Fprintln(cmd.OutOrStdout(), "Saved identity metadata repaired.")
+		}
+		if result.CopiedTo != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "Verified copy saved as claude/%s; original snapshot preserved.\n", result.CopiedTo)
+		}
+		if result.Detail != "" {
+			fmt.Fprintln(cmd.OutOrStdout(), result.Detail)
+		}
+	}
+	return verificationErr
 }
 
 func runVerify(cmd *cobra.Command, args []string) error {
@@ -194,23 +277,25 @@ func runVerifyFix(cmd *cobra.Command, toolFilter string) []VerifyFixResult {
 				continue
 			}
 
-			if err := refresh.RefreshProfile(ctx, provider, profileName, vault, healthStore); err != nil {
-				if errors.Is(err, refresh.ErrUnsupported) {
+			refreshErr := refresh.RefreshProfile(ctx, provider, profileName, vault, healthStore, refresh.WithProfileStore(profileStore))
+			if refreshErr != nil && !refresh.IsDeliveryIncomplete(refreshErr) {
+				if refresh.IsSkipped(refreshErr) {
 					results = append(results, VerifyFixResult{
 						Provider: provider, Profile: profileName,
-						Action: "skipped", Detail: err.Error(),
+						Action: "skipped", Detail: refreshErr.Error(),
 					})
 					continue
 				}
 				results = append(results, VerifyFixResult{
 					Provider: provider, Profile: profileName,
-					Action: "failed", Detail: err.Error(),
+					Action: "failed", Detail: refreshErr.Error(),
 				})
 				continue
 			}
 
-			// Keep the isolated profile in sync to avoid token drift.
-			syncVaultToIsolated(provider, profileName)
+			if refreshErr != nil {
+				reason += "; " + refreshErr.Error()
+			}
 			results = append(results, VerifyFixResult{
 				Provider: provider, Profile: profileName,
 				Action: "refreshed", Detail: reason,
@@ -228,6 +313,17 @@ func verifyProfile(provider, profileName string) VerifyProfileResult {
 		Status:   "unknown",
 		Issues:   []string{},
 	}
+	if provider == "claude" {
+		inspection, err := vault.ClaudeProfileIdentity(context.Background(), profileName, authfile.ClaudeProfileIdentityOptions{})
+		result.IdentityState = inspection.State
+		if err != nil {
+			result.Status = "critical"
+			result.Issues = append(result.Issues, inspection.Detail)
+			result.Signals = claudeIdentitySignals(inspection.State)
+			result.Recommendation = claudeIdentityRecommendation(profileName, inspection.State)
+			return result
+		}
+	}
 
 	// Get profile health using the existing getProfileHealth function
 	ph := getProfileHealth(provider, profileName)
@@ -235,6 +331,14 @@ func verifyProfile(provider, profileName string) VerifyProfileResult {
 		result.Issues = append(result.Issues, "Could not retrieve health data")
 		return result
 	}
+	if fileSet, ok := tools[provider]; ok {
+		if active, err := vault.ActiveProfile(fileSet()); err == nil && active == profileName {
+			applyLiveExpiry(provider, ph)
+		}
+	}
+	result.Signals = health.CredentialSignals(ph, health.DefaultHealthConfig())
+	result.Recommendation = health.FormatRecommendation(provider, profileName, ph)
+	result.ReloginWarningLead = ph.ReloginWarningLead
 
 	// Calculate health status
 	status, score := health.CalculateHealth(ph, health.DefaultHealthConfig())
@@ -260,9 +364,11 @@ func verifyProfile(provider, profileName string) VerifyProfileResult {
 			result.ExpiresIn = formatTimeRemaining(remaining)
 		} else {
 			result.ExpiresIn = "expired"
-			result.Issues = append(result.Issues, fmt.Sprintf("Token expired %s ago", formatTimeRemaining(-remaining)))
+			if !ph.CredentialRenewable() {
+				result.Issues = append(result.Issues, fmt.Sprintf("Token expired %s ago", formatTimeRemaining(-remaining)))
+			}
 		}
-	} else {
+	} else if !ph.CredentialRenewable() {
 		result.Issues = append(result.Issues, "No token expiry information found")
 	}
 
@@ -279,10 +385,14 @@ func verifyProfile(provider, profileName string) VerifyProfileResult {
 	}
 
 	// Warning for expiring soon
-	if !ph.TokenExpiresAt.IsZero() {
+	if !ph.TokenExpiresAt.IsZero() && !ph.CredentialRenewable() {
 		remaining := time.Until(ph.TokenExpiresAt)
-		if remaining > 0 && remaining < time.Hour {
-			result.Issues = append(result.Issues, "Token expiring soon (within 1 hour)")
+		if remaining > 0 && remaining <= max(time.Hour, ph.ReloginWarningLead) {
+			if ph.ReloginWarningLead > 0 {
+				result.Issues = append(result.Issues, "Session expiring soon; log in again before expiry")
+			} else {
+				result.Issues = append(result.Issues, "Token expiring soon (within 1 hour)")
+			}
 		}
 	}
 
@@ -314,29 +424,18 @@ func formatTimeRemaining(d time.Duration) string {
 func generateRecommendations(output *VerifyOutput) []string {
 	var recs []string
 
-	// Group by provider for recommendations
-	expiredByProvider := make(map[string][]string)
-	expiringSoonByProvider := make(map[string][]string)
-
+	// Recommendations use the same report-time credential semantics as
+	// status/ls. A session needs a login; an API-key-backed credential must
+	// not get refresh/login advice merely because its cached JWT has lapsed.
 	for _, p := range output.Profiles {
-		if p.ExpiresIn == "expired" {
-			expiredByProvider[p.Provider] = append(expiredByProvider[p.Provider], p.Profile)
-		} else if p.TokenExpiry != nil && time.Until(*p.TokenExpiry) < time.Hour {
-			expiringSoonByProvider[p.Provider] = append(expiringSoonByProvider[p.Provider], p.Profile)
-		}
-	}
-
-	// Expiring soon recommendations
-	for provider, profiles := range expiringSoonByProvider {
-		for _, profile := range profiles {
-			recs = append(recs, fmt.Sprintf("Run 'caam refresh %s %s' to refresh expiring token", provider, profile))
-		}
-	}
-
-	// Expired recommendations
-	for provider, profiles := range expiredByProvider {
-		for _, profile := range profiles {
-			recs = append(recs, fmt.Sprintf("Re-login to '%s/%s' - token has expired", provider, profile))
+		if p.Recommendation != "" {
+			recs = append(recs, p.Recommendation)
+		} else if p.ReloginWarningLead > 0 && p.TokenExpiry != nil && time.Until(*p.TokenExpiry) <= p.ReloginWarningLead {
+			if p.Provider == "cursor" {
+				recs = append(recs, health.CursorReloginInstructions(p.Profile))
+			} else {
+				recs = append(recs, fmt.Sprintf("Run 'caam login %s %s' to log in again; session cannot renew", p.Provider, p.Profile))
+			}
 		}
 	}
 
@@ -395,7 +494,11 @@ func printVerifyOutput(w io.Writer, output *VerifyOutput) {
 			expiryInfo := ""
 			if p.ExpiresIn != "" {
 				if p.ExpiresIn == "expired" {
-					expiryInfo = "(expired)"
+					if p.LoginRequired != nil && !*p.LoginRequired {
+						expiryInfo = "(cached access token expired; renewable)"
+					} else {
+						expiryInfo = "(expired)"
+					}
 				} else {
 					expiryInfo = fmt.Sprintf("(expires in %s)", p.ExpiresIn)
 				}

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/coordinator"
 	"github.com/spf13/cobra"
 )
 
@@ -43,9 +44,16 @@ func TestMatchWeztermPaneOverride(t *testing.T) {
 }
 
 func TestMatchWeztermPaneRateLimit(t *testing.T) {
-	match := matchWeztermPane("claude", "You've hit your limit · resets 2pm", nil)
-	if !match.Matched || match.Reason != "rate_limit" {
-		t.Fatalf("expected rate limit match, got: %+v", match)
+	for _, text := range []string{
+		"You've hit your limit · resets 2pm",
+		"  ⎿  You've hit your session limit · resets 3pm (America/New_York)",
+		"You've hit your weekly limit · resets Oct 9, 3pm",
+		"You're out of usage credits · resets 6pm",
+	} {
+		match := matchWeztermPane("claude", text, nil)
+		if !match.Matched || match.Reason != "rate_limit" {
+			t.Errorf("matchWeztermPane(%q) = %+v, want a rate limit match", text, match)
+		}
 	}
 }
 
@@ -146,6 +154,9 @@ func TestRunWeztermLoginAllNonInteractiveRequiresYes(t *testing.T) {
 }
 
 func TestRunWeztermLoginAllSendSummary(t *testing.T) {
+	savedSettle, savedGap := loginMenuSettle, weztermKeyGap
+	loginMenuSettle, weztermKeyGap = 0, 0
+	defer func() { loginMenuSettle, weztermKeyGap = savedSettle, savedGap }()
 	savedLookup := weztermLookupFunc
 	savedList := weztermListPanesFunc
 	savedGet := weztermGetTextFunc
@@ -164,7 +175,13 @@ func TestRunWeztermLoginAllSendSummary(t *testing.T) {
 	weztermListPanesFunc = func() ([]weztermPane, error) {
 		return []weztermPane{{ID: 1, Title: "one"}, {ID: 2, Title: "two"}}, nil
 	}
-	weztermGetTextFunc = func(int) (string, error) { return "You've hit your limit", nil }
+	weztermGetTextFunc = func(paneID int) (string, error) {
+		if paneID == 1 {
+			// Claude Code's usage-limit menu, with paid extra usage highlighted.
+			return "  ⎿  You've hit your limit · resets 3pm\n\n   What do you want to do?\n\n   ❯ 1. Switch to usage credits\n     2. Stop and wait for limit to reset\n\n   Esc to cancel\n", nil
+		}
+		return "You've hit your limit", nil
+	}
 	weztermSendTextFunc = func(paneID int, payload string) error {
 		sentPayloads = append(sentPayloads, payload)
 		if paneID == 2 {
@@ -188,11 +205,15 @@ func TestRunWeztermLoginAllSendSummary(t *testing.T) {
 		t.Fatalf("runWeztermLoginAll error: %v", err)
 	}
 
-	if len(sentPayloads) != 2 {
-		t.Fatalf("expected 2 payloads, got %d", len(sentPayloads))
+	// Pane 1's usage-limit menu is closed with Esc (its Enter would buy extra
+	// usage), the prompt line emptied, /login submitted, and the menu choice
+	// sent on its own as the digit alone; pane 2 fails on its first send.
+	want := []string{
+		coordinator.KeyEscape, coordinator.KeyEndOfLine, coordinator.KeyKillLine, "/login\n", "1",
+		coordinator.KeyEndOfLine,
 	}
-	if sentPayloads[0] != "/login\n1\n" {
-		t.Fatalf("expected subscription payload, got %q", sentPayloads[0])
+	if strings.Join(sentPayloads, "|") != strings.Join(want, "|") {
+		t.Fatalf("sent %q, want %q", sentPayloads, want)
 	}
 
 	out := buf.String()
@@ -324,5 +345,123 @@ func TestWeztermOAuthReportRedactsLogs(t *testing.T) {
 	}
 	if strings.Contains(logs, claudeOAuthBase) {
 		t.Fatalf("expected logs to redact urls, got: %s", logs)
+	}
+}
+
+func TestDetectRecoverStateUsesMostRecentMessage(t *testing.T) {
+	tests := []struct {
+		text       string
+		wantState  RecoverState
+		wantReason string
+		wantURL    string
+	}{
+		{"Logged in as a@example.com\n...\nYou’ve hit your limit · resets 3pm", RecoverRateLimited, "rate_limit", ""},
+		{"\x1b[31mYou've hit your limit\x1b[0m · resets 2pm\n> /login\n│ Select login method: │", RecoverAwaitingSelect, "select_method", ""},
+		{"https://claude.ai/oauth/authorize?code=old\nLogin failed\nhttps://claude.ai/oauth/authorize?code=new\nPaste code here if prompted >", RecoverAwaitingURL, "oauth_url", "https://claude.ai/oauth/authorize?code=new"},
+		{"Paste code here if prompted >", RecoverAwaitingURL, "paste_prompt", ""},
+		{"Paste code here if prompted > CODE\nInvalid code", RecoverFailed, "login_failed", ""},
+		{"Paste code here if prompted > CODE\nLogged in as b@example.com", RecoverResuming, "login_success", ""},
+		{"just a shell", RecoverIdle, "", ""},
+		// Claude Code 2.1 names the limit; the banner starts its line.
+		{"⏺ Working on it\n  ⎿  You've hit your session limit · resets 3pm (America/New_York)\n", RecoverRateLimited, "rate_limit", ""},
+		// A working session that printed a banner is not at a limit.
+		{"  + You've hit your weekly limit · resets Oct 9\n✻ Thinking… (4s · esc to interrupt)\n", RecoverIdle, "", ""},
+	}
+	for _, tt := range tests {
+		state, reason, url := detectRecoverState(tt.text)
+		if state != tt.wantState || reason != tt.wantReason || url != tt.wantURL {
+			t.Errorf("detectRecoverState(%q) = %v, %q, %q; want %v, %q, %q", tt.text, state, reason, url, tt.wantState, tt.wantReason, tt.wantURL)
+		}
+	}
+}
+
+func TestAutoRecoverClosesUsageLimitMenuBeforeLogin(t *testing.T) {
+	savedList, savedGet, savedSend, savedGap := weztermListPanesFunc, weztermGetTextFunc, weztermSendTextFunc, weztermKeyGap
+	defer func() {
+		weztermListPanesFunc, weztermGetTextFunc, weztermSendTextFunc, weztermKeyGap = savedList, savedGet, savedSend, savedGap
+	}()
+	weztermKeyGap = 0
+
+	weztermListPanesFunc = func() ([]weztermPane, error) {
+		return []weztermPane{{ID: 1, Title: "claude"}, {ID: 2, Title: "claude"}}, nil
+	}
+	weztermGetTextFunc = func(paneID int) (string, error) {
+		if paneID == 1 {
+			return "  ⎿  You've hit your limit · resets 3pm (America/New_York)\n\n" +
+				"   What do you want to do?\n\n   ❯ 1. Switch to usage credits\n     2. Stop and wait for limit to reset\n\n   Esc to cancel\n", nil
+		}
+		return "  ⎿  You've hit your limit · resets 3pm (America/New_York)\n\n❯ continue\n", nil
+	}
+	sent := map[int][]string{}
+	weztermSendTextFunc = func(paneID int, text string) error {
+		sent[paneID] = append(sent[paneID], text)
+		return nil
+	}
+
+	states, err := scanRecoverStates(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	if err := runAutoRecover(cmd, states, true, "proceed\n", nil); err != nil {
+		t.Fatalf("runAutoRecover: %v\n%s", err, buf.String())
+	}
+
+	login := []string{coordinator.KeyEndOfLine, coordinator.KeyKillLine, "/login\n"}
+	if got, want := sent[1], append([]string{coordinator.KeyEscape}, login...); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("pane showing the usage-limit menu got %q, want %q", got, want)
+	}
+	if got := sent[2]; strings.Join(got, "|") != strings.Join(login, "|") {
+		t.Errorf("pane at its prompt got %q, want %q", got, login)
+	}
+}
+
+func TestAutoRecoverDismissesPostLoginScreenBeforeResumePrompt(t *testing.T) {
+	savedList, savedGet, savedSend, savedSettle := weztermListPanesFunc, weztermGetTextFunc, weztermSendTextFunc, recoverContinueSettle
+	defer func() {
+		weztermListPanesFunc, weztermGetTextFunc, weztermSendTextFunc, recoverContinueSettle = savedList, savedGet, savedSend, savedSettle
+	}()
+	recoverContinueSettle = 0
+	savedGap := weztermKeyGap
+	weztermKeyGap = 0
+	defer func() { weztermKeyGap = savedGap }()
+
+	weztermListPanesFunc = func() ([]weztermPane, error) {
+		return []weztermPane{{ID: 1, Title: "claude"}, {ID: 2, Title: "claude"}}, nil
+	}
+	weztermGetTextFunc = func(paneID int) (string, error) {
+		if paneID == 1 {
+			return "Login successful. Press Enter to continue…", nil
+		}
+		return "Logged in as b@example.com", nil
+	}
+	sent := map[int][]string{}
+	weztermSendTextFunc = func(paneID int, text string) error {
+		sent[paneID] = append(sent[paneID], text)
+		return nil
+	}
+
+	states, err := scanRecoverStates(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := &bytes.Buffer{}
+	cmd := &cobra.Command{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	if err := runAutoRecover(cmd, states, true, "proceed\n", nil); err != nil {
+		t.Fatalf("runAutoRecover: %v\n%s", err, buf.String())
+	}
+
+	// The prompt goes into an emptied prompt line.
+	prompt := coordinator.PromptKeys("proceed\n")
+	if got, want := sent[1], append([]string{"\n"}, prompt...); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("pane on the post-login screen got %q, want Enter then the prompt %q", got, want)
+	}
+	if got := sent[2]; strings.Join(got, "|") != strings.Join(prompt, "|") {
+		t.Errorf("pane at its prompt got %q, want just the prompt %q", got, prompt)
 	}
 }

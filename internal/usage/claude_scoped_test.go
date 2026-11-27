@@ -6,9 +6,12 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 // scopedUsageBody is the shape the OAuth usage endpoint returns: general
@@ -28,6 +31,15 @@ const scopedUsageBody = `{
 
 func fetchFixture(t *testing.T, body string) *UsageInfo {
 	t.Helper()
+	info, err := fetchClaudeFixtureResult(t, body)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	return info
+}
+
+func fetchClaudeFixtureResult(t *testing.T, body string) (*UsageInfo, error) {
+	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -40,11 +52,7 @@ func fetchFixture(t *testing.T, body string) *UsageInfo {
 	fetcher := NewClaudeFetcher()
 	fetcher.baseURL = server.URL
 
-	info, err := fetcher.Fetch(context.Background(), "test-token")
-	if err != nil {
-		t.Fatalf("Fetch: %v", err)
-	}
-	return info
+	return fetcher.Fetch(context.Background(), "test-token")
 }
 
 func TestClaudeFetchParsesScopedLimits(t *testing.T) {
@@ -198,5 +206,594 @@ func TestNormalizeModelKey(t *testing.T) {
 	}
 	if modelKeysMatch(NormalizeModelKey("claude-opus-4"), NormalizeModelKey("")) {
 		t.Error("an empty key matched")
+	}
+}
+
+// An exact model ID and its family label can both be present. They are
+// simultaneous constraints, not alternative representations where the exact
+// key is allowed to hide a spent family allowance (or vice versa).
+func TestOverlappingScopedLimitsCannotHideExhaustion(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"family exhausted", `{"five_hour":{"utilization":0},"seven_day":{"utilization":0},"limits":[
+			{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Opus"}}},
+			{"kind":"weekly_scoped","percent":10,"scope":{"model":{"id":"claude-opus-4-1"}}}]}`},
+		{"specific model exhausted", `{"five_hour":{"utilization":0},"seven_day":{"utilization":0},"limits":[
+			{"kind":"weekly_scoped","percent":0,"scope":{"model":{"display_name":"Opus"}}},
+			{"kind":"weekly_scoped","percent":100,"scope":{"model":{"id":"claude-opus-4-1"}}}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := fetchFixture(t, tc.body)
+			before, err := json.Marshal(info)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, model := range []string{"Opus", "claude-opus-4-1", "CLAUDE-OPUS-4-1-20250805"} {
+				// Repeated reads must not depend on Go's map iteration order.
+				for repeat := 0; repeat < 64; repeat++ {
+					if !info.IsNearLimitForModel(1, model) {
+						t.Fatalf("%s ignored an exhausted applicable allowance", model)
+					}
+					if w := info.WindowForModel(model); w == nil || w.UsedPercent != 100 {
+						t.Fatalf("%s displayed the less constrained model window: %+v", model, w)
+					}
+					if w := info.ScopedLimit(model); w == nil || w.UsedPercent != 100 {
+						t.Fatalf("%s selected the wrong scoped limit: %+v", model, w)
+					}
+					if score := info.AvailabilityScoreForModel(model); score != 85 {
+						t.Fatalf("%s scored %d instead of retaining the full scoped penalty", model, score)
+					}
+				}
+			}
+			if info.IsNearLimitForModel(0.8, "sonnet") || info.AvailabilityScoreForModel("sonnet") != 100 {
+				t.Fatal("an Opus-only limit constrained unrelated Sonnet work")
+			}
+			after, err := json.Marshal(info)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("model lookup rewrote the provider's measurements")
+			}
+		})
+	}
+}
+
+func TestScopedWindowSelectionUsesAllMatchingMeasurements(t *testing.T) {
+	exact := &UsageWindow{Label: "Opus", Utilization: 0.1, UsedPercent: 10}
+	family := &UsageWindow{Label: "Opus", UsedPercent: 95}
+	unknown := &UsageWindow{Label: "Opus", Unmeasured: true, Utilization: 1}
+	for _, tc := range []struct {
+		name    string
+		windows map[string]*UsageWindow
+		want    *UsageWindow
+	}{
+		{"exact plus family", map[string]*UsageWindow{"opus": exact, "claude-opus-4-1": family}, family},
+		{"label-only match", map[string]*UsageWindow{"opus": exact, "opaque-window-id": family}, family},
+		{"nil exact key", map[string]*UsageWindow{"opus": nil, "family": family}, family},
+		{"unmeasured exact key", map[string]*UsageWindow{"opus": unknown, "family": family}, family},
+		{"unmeasured family", map[string]*UsageWindow{"opus": family, "family": unknown}, family},
+		{"unknown only remains unknown", map[string]*UsageWindow{"family": unknown}, unknown},
+		{"all nil", map[string]*UsageWindow{"opus": nil, "family": nil}, nil},
+		{"no applicable scope", map[string]*UsageWindow{"sonnet": {Label: "Sonnet", UsedPercent: 100}}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			info := &UsageInfo{ModelWindows: tc.windows}
+			for repeat := 0; repeat < 64; repeat++ {
+				if got := info.scopedWindowForModel("opus"); got != tc.want {
+					t.Fatalf("wrong governing scope: got=%+v want=%+v", got, tc.want)
+				}
+			}
+			if tc.want == family && !info.IsNearLimitForModel(0.9, "opus") {
+				t.Fatal("a matched measured limit was hidden by unknown data")
+			}
+		})
+	}
+	// Equal percentages have a stable diagnostic winner, not a map-order tie.
+	first := &UsageWindow{Label: "Opus", Utilization: 0.505, UsedPercent: 50}
+	second := &UsageWindow{Label: "Opus", Utilization: 0.505, UsedPercent: 50}
+	info := &UsageInfo{ModelWindows: map[string]*UsageWindow{"z": second, "a": first}}
+	for repeat := 0; repeat < 64; repeat++ {
+		if info.scopedWindowForModel("opus") != first {
+			t.Fatal("equal scopes changed diagnostics with map order")
+		}
+	}
+	second.Utilization = 0.509
+	if info.scopedWindowForModel("opus") != second {
+		t.Fatal("fractional utilization was rounded before selecting the tightest cap")
+	}
+	if (*UsageInfo)(nil).scopedWindowForModel("opus") != nil || info.scopedWindowForModel("") != nil {
+		t.Fatal("empty model or nil usage invented a scoped window")
+	}
+}
+
+// Issue #133 has no captured verified-Ultra response. These are synthetic
+// compatibility documents, shared with the cache tests so both entry points
+// preserve the same restrictions without guessing an account's plan.
+const (
+	claudeCompatibilityWeekly      = `"seven_day":{"utilization":25,"resets_at":"2099-01-05T00:00:00Z"}`
+	claudeCompatibilityWeeklyLimit = `{"kind":"weekly_all","group":"weekly","percent":25,"resets_at":"2099-01-05T00:00:00Z"}`
+	claudeCompatibilityFableLimit  = `{"kind":"weekly_scoped","group":"weekly","percent":100,"resets_at":"2099-01-05T00:00:00Z","scope":{"model":{"id":null,"display_name":"Fable"}},"is_active":false}`
+)
+
+func claudeCompatibilityBody(fields string, limits ...string) string {
+	if fields != "" {
+		fields += ","
+	}
+	return "{" + fields + `"limits":[` + strings.Join(limits, ",") + "]}"
+}
+
+type claudeSessionCompatibilityCase struct {
+	name           string
+	body           string
+	wantPrimary    bool
+	primaryPercent float64
+}
+
+func claudeSessionCompatibilityCases() []claudeSessionCompatibilityCase {
+	return []claudeSessionCompatibilityCase{
+		{"session absent", claudeCompatibilityBody(claudeCompatibilityWeekly, claudeCompatibilityFableLimit), false, 0},
+		{"whole session null", claudeCompatibilityBody(`"five_hour":null,`+claudeCompatibilityWeekly, claudeCompatibilityFableLimit), false, 0},
+		{"session utilization null", claudeCompatibilityBody(`"five_hour":{"utilization":null,"resets_at":null},`+claudeCompatibilityWeekly, claudeCompatibilityFableLimit), false, 0},
+		{"limits session absent", claudeCompatibilityBody("", claudeCompatibilityWeeklyLimit, claudeCompatibilityFableLimit), false, 0},
+		{"limits session percent null", claudeCompatibilityBody("", `{"kind":"session","group":"session","percent":null,"resets_at":null,"is_active":true}`, claudeCompatibilityWeeklyLimit, claudeCompatibilityFableLimit), false, 0},
+		{"both session measurements null", claudeCompatibilityBody(`"five_hour":{"utilization":null,"resets_at":null}`, `{"kind":"session","percent":null}`, claudeCompatibilityWeeklyLimit, claudeCompatibilityFableLimit), false, 0},
+		{"numeric zero without reset", claudeCompatibilityBody(`"five_hour":{"utilization":0,"resets_at":null},`+claudeCompatibilityWeekly, claudeCompatibilityFableLimit), true, 0},
+		{"limits zero without reset", claudeCompatibilityBody(claudeCompatibilityWeekly, `{"kind":"session","percent":0,"resets_at":null}`, claudeCompatibilityFableLimit), true, 0},
+		{"conventional session window", claudeCompatibilityBody(`"five_hour":{"utilization":12.5,"resets_at":"2099-01-01T05:00:00Z"},`+claudeCompatibilityWeekly, claudeCompatibilityFableLimit), true, 12.5},
+		{"conventional limits session", claudeCompatibilityBody("", `{"kind":"session","group":"session","percent":12.5,"resets_at":"2099-01-01T05:00:00Z"}`, claudeCompatibilityWeeklyLimit, claudeCompatibilityFableLimit), true, 12.5},
+		{"null top session retains measured limit", claudeCompatibilityBody(`"five_hour":{"utilization":null},`+claudeCompatibilityWeekly, `{"kind":"session","percent":12.5}`, claudeCompatibilityFableLimit), true, 12.5},
+		{"null limit retains measured top session", claudeCompatibilityBody(`"five_hour":{"utilization":12.5},`+claudeCompatibilityWeekly, `{"kind":"session","percent":null}`, claudeCompatibilityFableLimit), true, 12.5},
+		{"null legacy weekly retains measured limit", claudeCompatibilityBody(`"five_hour":null,"seven_day":{"utilization":null}`, claudeCompatibilityWeeklyLimit, claudeCompatibilityFableLimit), false, 0},
+		{"unknown null limit is inapplicable", claudeCompatibilityBody(claudeCompatibilityWeekly, `{"kind":"future_all","group":"monthly","percent":null}`, claudeCompatibilityFableLimit), false, 0},
+		{"null model limit does not erase measured one", claudeCompatibilityBody(claudeCompatibilityWeekly, claudeCompatibilityFableLimit, `{"kind":"weekly_scoped","percent":null,"scope":{"model":{"display_name":"Fable"}}}`), false, 0},
+	}
+}
+
+func assertClaudeSessionCompatibility(t *testing.T, info *UsageInfo, tc claudeSessionCompatibilityCase) {
+	t.Helper()
+	if info == nil || info.Error != "" || !info.NumericQuotaKnown() {
+		t.Fatalf("valid remaining quota became unavailable: %+v", info)
+	}
+	if (info.PrimaryWindow != nil) != tc.wantPrimary {
+		t.Fatalf("primary window = %+v, want present=%v", info.PrimaryWindow, tc.wantPrimary)
+	}
+	if w := info.PrimaryWindow; w != nil {
+		if w.Utilization != tc.primaryPercent/100 || w.UsedPercent != int(tc.primaryPercent) || w.WindowDuration != 5*time.Hour || w.Unmeasured {
+			t.Fatalf("measured session changed: %+v", w)
+		}
+		if tc.primaryPercent == 0 && !w.ResetsAt.IsZero() {
+			t.Fatalf("zero measurement acquired a fabricated reset: %+v", w)
+		}
+	}
+	if w := info.SecondaryWindow; w == nil || w.Utilization != 0.25 || w.UsedPercent != 25 || w.WindowDuration != 7*24*time.Hour || w.Unmeasured {
+		t.Fatalf("weekly measurement lost or changed: %+v", w)
+	}
+	if w := info.WindowForModel("fable"); w == nil || w.Utilization != 1 || w.UsedPercent != 100 || w.WindowDuration != 7*24*time.Hour {
+		t.Fatalf("model restriction lost or changed: %+v", w)
+	}
+	if !info.IsNearLimitForModel(0.8, "fable") || !info.IsNearLimit(0.8) || info.IsNearLimitForModel(0.8, "sonnet") {
+		t.Fatal("optional session changed which model the remaining quota constrains")
+	}
+	for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
+		for _, model := range []string{"fable", "sonnet", ""} {
+			result := RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "optional-session", Usage: info}}, RankOptions{
+				Mode: mode, Model: model, Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+			})
+			if got, want := result.Selected != nil, model == "sonnet"; got != want {
+				t.Fatalf("%s rank for %q selected=%v, want %v: %+v", mode, model, got, want, result.Profiles)
+			}
+		}
+	}
+}
+
+func TestClaudeUsageCompatibilityOptionalSession(t *testing.T) {
+	for _, tc := range claudeSessionCompatibilityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info := fetchFixture(t, tc.body)
+			assertClaudeSessionCompatibility(t, info, tc)
+		})
+	}
+}
+
+type claudeWeeklyCompatibilityCase struct {
+	name, body  string
+	wantPercent int
+}
+
+func claudeWeeklyOnlyCompatibilityCases() []claudeWeeklyCompatibilityCase {
+	return []claudeWeeklyCompatibilityCase{
+		{"weekly top-level only", `{` + claudeCompatibilityWeekly + `}`, 25},
+		{"weekly limit only", claudeCompatibilityBody("", claudeCompatibilityWeeklyLimit), 25},
+		{"weekly group omitted", claudeCompatibilityBody("", `{"kind":"weekly_all","percent":25,"resets_at":"2099-01-05T00:00:00Z"}`), 25},
+		{"empty general scope", claudeCompatibilityBody("", `{"kind":"weekly_all","percent":25,"resets_at":"2099-01-05T00:00:00Z","scope":{}}`), 25},
+		{"null scope dimensions", claudeCompatibilityBody("", `{"kind":"weekly_all","percent":25,"resets_at":"2099-01-05T00:00:00Z","scope":{"model":null,"surface":null}}`), 25},
+		{"weekly cap exhausted", `{"five_hour":{"utilization":null},"seven_day":{"utilization":100,"resets_at":"2099-01-05T00:00:00Z"}}`, 100},
+	}
+}
+
+func assertClaudeWeeklyOnlyCompatibility(t *testing.T, info *UsageInfo, wantPercent int) {
+	t.Helper()
+	if info == nil || !info.NumericQuotaKnown() || info.PrimaryWindow != nil || info.SecondaryWindow == nil || info.TertiaryWindow != nil || len(info.ModelWindows) != 0 {
+		t.Fatalf("weekly-only document invented or lost a window: %+v", info)
+	}
+	if w := info.SecondaryWindow; w.WindowDuration != 7*24*time.Hour || w.UsedPercent != wantPercent || w.Utilization != float64(wantPercent)/100 {
+		t.Fatalf("weekly measurement = %+v, want %d%% over 7 days", w, wantPercent)
+	}
+	spent := wantPercent == 100
+	if info.IsNearLimitForModel(0.8, "sonnet") != spent || info.IsNearLimitForModel(0.8, "fable") != spent {
+		t.Fatal("weekly-only general cap did not constrain all models")
+	}
+	for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
+		result := RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "weekly-only", Usage: info}}, RankOptions{
+			Mode: mode, Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+		})
+		if (result.Selected != nil) == spent {
+			t.Fatalf("%s weekly-only eligibility did not follow the weekly cap: %+v", mode, result)
+		}
+		// Requiring a model window must still reject an account that did not
+		// report one, even though its general weekly capacity is measured.
+		result = RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "weekly-only", Usage: info}}, RankOptions{
+			Mode: mode, Model: "fable", RequireModelWindow: true, Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+		})
+		if result.Selected != nil {
+			t.Fatal("weekly-only response fabricated a required model allowance")
+		}
+	}
+}
+
+func TestClaudeUsageCompatibilityWeeklyOnly(t *testing.T) {
+	for _, tc := range claudeWeeklyOnlyCompatibilityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			assertClaudeWeeklyOnlyCompatibility(t, fetchFixture(t, tc.body), tc.wantPercent)
+		})
+	}
+}
+
+type claudeDocumentCase struct{ name, body string }
+
+func claudeMalformedCompatibilityCases() []claudeDocumentCase {
+	var cases []claudeDocumentCase
+	for _, measurement := range []struct{ name, value string }{
+		{"missing", ""}, {"string", `"0"`}, {"boolean", "false"},
+		{"object", "{}"}, {"array", "[]"}, {"negative", "-0.1"},
+		{"above cap", "100.1"}, {"overflow", "1e309"},
+	} {
+		window := `{}`
+		limit := `{"kind":"session"}`
+		if measurement.value != "" {
+			window = `{"utilization":` + measurement.value + `}`
+			limit = `{"kind":"session","percent":` + measurement.value + `}`
+		}
+		cases = append(cases,
+			claudeDocumentCase{"window " + measurement.name, claudeCompatibilityBody(`"five_hour":`+window+`,`+claudeCompatibilityWeekly, claudeCompatibilityFableLimit)},
+			claudeDocumentCase{"limit " + measurement.name, claudeCompatibilityBody(claudeCompatibilityWeekly, limit, claudeCompatibilityFableLimit)},
+		)
+	}
+	return append(cases,
+		claudeDocumentCase{"session is an array", claudeCompatibilityBody(`"five_hour":[],`+claudeCompatibilityWeekly, claudeCompatibilityFableLimit)},
+		claudeDocumentCase{"null array entry", claudeCompatibilityBody(claudeCompatibilityWeekly, `null`, claudeCompatibilityFableLimit)},
+		claudeDocumentCase{"nonobject array entry", claudeCompatibilityBody(claudeCompatibilityWeekly, `[]`, claudeCompatibilityFableLimit)},
+		claudeDocumentCase{"unknown kind missing measurement", claudeCompatibilityBody(claudeCompatibilityWeekly, `{"kind":"future_all"}`, claudeCompatibilityFableLimit)},
+		claudeDocumentCase{"unknown kind malformed measurement", claudeCompatibilityBody(claudeCompatibilityWeekly, `{"kind":"future_all","percent":"unknown"}`, claudeCompatibilityFableLimit)},
+		claudeDocumentCase{"model malformed measurement", claudeCompatibilityBody(claudeCompatibilityWeekly, `{"kind":"weekly_scoped","percent":false,"scope":{"model":{"display_name":"Fable"}}}`)},
+	)
+}
+
+func assertClaudeQuotaNotRoutable(t *testing.T, info *UsageInfo) {
+	t.Helper()
+	if info == nil || info.NumericQuotaKnown() || info.AvailabilityScore() != 0 {
+		t.Fatalf("incomplete quota became capacity: %+v", info)
+	}
+	for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
+		result := RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "incomplete", Usage: info}}, RankOptions{
+			Mode: mode, Model: "sonnet", Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+		})
+		if result.Selected != nil || len(result.Profiles) != 1 || result.Profiles[0].Eligible {
+			t.Fatalf("%s rank selected incomplete quota: %+v", mode, result)
+		}
+	}
+	if len(profilesBelowThreshold([]ProfileUsage{{Provider: "claude", ProfileName: "incomplete", Usage: info}}, 1)) != 0 {
+		t.Fatal("threshold routing selected incomplete quota")
+	}
+}
+
+func TestClaudeUsageCompatibilityRejectsMalformedMeasurements(t *testing.T) {
+	for _, tc := range claudeMalformedCompatibilityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := fetchClaudeFixtureResult(t, tc.body)
+			if err == nil || info == nil || info.QuotaStatus != QuotaUnavailable || info.Error == "" {
+				t.Fatalf("malformed document accepted: info=%+v err=%v", info, err)
+			}
+			assertClaudeQuotaNotRoutable(t, info)
+		})
+	}
+}
+
+type claudeDegradedCompatibilityCase struct {
+	name, body             string
+	wantWeekly, wantScoped bool
+}
+
+func claudeDegradedCompatibilityCases() []claudeDegradedCompatibilityCase {
+	cases := []claudeDegradedCompatibilityCase{
+		{"null window alone", `{"five_hour":{"utilization":null,"resets_at":null}}`, false, false},
+		{"null limit alone", `{"limits":[{"kind":"session","percent":null}]}`, false, false},
+		{"only model quota", claudeCompatibilityBody("", claudeCompatibilityFableLimit), false, true},
+		{"null general and measured model", claudeCompatibilityBody(`"five_hour":{"utilization":null},"seven_day":{"utilization":null}`, claudeCompatibilityFableLimit), false, true},
+	}
+	for _, limit := range []struct{ name, body string }{
+		{"unknown general kind", `{"kind":"future_all","group":"monthly","percent":0,"is_active":false}`},
+		{"unknown kind with familiar group", `{"kind":"future_all","group":"weekly","percent":100}`},
+		{"general session future group", `{"kind":"session","group":"future","percent":100}`},
+		{"general session contradictory group", `{"kind":"session","group":"weekly","percent":100}`},
+		{"general weekly contradictory group", `{"kind":"weekly_all","group":"session","percent":100}`},
+		{"unnamed scoped limit", `{"kind":"weekly_scoped","group":"weekly","percent":100,"scope":null}`},
+		{"empty model identity", `{"kind":"weekly_scoped","percent":100,"scope":{"model":{"id":null,"display_name":" "}}}`},
+		{"unnamed model on general kind", `{"kind":"weekly_all","percent":100,"scope":{"model":{}}}`},
+		{"surface-only limit", `{"kind":"session","percent":100,"scope":{"surface":{"display_name":"Claude Code"}}}`},
+		{"model and surface limit", `{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"},"surface":{"display_name":"Claude Code"}}}`},
+		{"future scope dimension", `{"kind":"weekly_all","percent":100,"scope":{"feature":{"display_name":"Extended thinking"}}}`},
+		{"model and future scope", `{"kind":"weekly_scoped","percent":100,"scope":{"model":{"display_name":"Fable"},"feature":{"display_name":"Extended thinking"}}}`},
+	} {
+		cases = append(cases, claudeDegradedCompatibilityCase{
+			limit.name, claudeCompatibilityBody(claudeCompatibilityWeekly, claudeCompatibilityFableLimit, limit.body), true, true,
+		})
+	}
+	return cases
+}
+
+func assertClaudeDegradedCompatibility(t *testing.T, info *UsageInfo, tc claudeDegradedCompatibilityCase) {
+	t.Helper()
+	if info == nil || info.QuotaStatus != QuotaDegraded || info.Error == "" || info.QuotaNote == "" {
+		t.Fatalf("missing general quota or unknown restriction was not degraded: %+v", info)
+	}
+	if tc.wantWeekly && (info.SecondaryWindow == nil || info.SecondaryWindow.UsedPercent != 25) {
+		t.Fatalf("known weekly quota lost from degraded document: %+v", info.SecondaryWindow)
+	}
+	if info.PrimaryWindow != nil || (!tc.wantWeekly && info.SecondaryWindow != nil) {
+		t.Fatalf("inapplicable or unknown restriction became a fabricated general window: %+v", info)
+	}
+	if tc.wantScoped {
+		if w := info.WindowForModel("fable"); w == nil || w.UsedPercent != 100 {
+			t.Fatalf("known model quota lost from degraded document: %+v", w)
+		}
+		if !info.IsNearLimitForModel(0.8, "fable") {
+			t.Fatal("known exhausted model constraint vanished with general quota")
+		}
+	}
+	assertClaudeQuotaNotRoutable(t, info)
+}
+
+func TestClaudeUsageCompatibilityKeepsUnknownRestrictionsConservative(t *testing.T) {
+	for _, tc := range claudeDegradedCompatibilityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := fetchClaudeFixtureResult(t, tc.body)
+			if err == nil {
+				t.Fatal("incomplete quota was reported as a complete response")
+			}
+			assertClaudeDegradedCompatibility(t, info, tc)
+		})
+	}
+}
+
+func TestClaudeUsageCompatibilityModelDurations(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, group string
+		wantDuration      time.Duration
+	}{
+		{"known session", "session", "session", 5 * time.Hour},
+		{"session group omitted", "session", "", 5 * time.Hour},
+		{"known weekly", "weekly_scoped", "weekly", 7 * 24 * time.Hour},
+		{"weekly group omitted", "weekly_scoped", "", 7 * 24 * time.Hour},
+		{"future scoped kind", "future_scoped", "future", 0},
+		{"future kind session group", "future_scoped", "session", 0},
+		{"future kind weekly group", "future_scoped", "weekly", 0},
+		{"session contradictory group", "session", "weekly", 0},
+		{"weekly contradictory group", "weekly_scoped", "session", 0},
+		{"known kind future group", "weekly_scoped", "future", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			group := ""
+			if tc.group != "" {
+				group = `,"group":"` + tc.group + `"`
+			}
+			body := claudeCompatibilityBody(claudeCompatibilityWeekly, `{"kind":"`+tc.kind+`"`+group+`,"percent":100,"resets_at":"2099-01-05T00:00:00Z","scope":{"model":{"display_name":"Fable"}}}`)
+			cached, err := ParseCachedClaudeUsage(cachedClaudeCompatibilityDocument(body), time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC))
+			if err != nil {
+				t.Fatalf("cached model quota failed: %v", err)
+			}
+			for _, result := range []struct {
+				name string
+				info *UsageInfo
+			}{{"live", fetchFixture(t, body)}, {"cached", cached}} {
+				t.Run(result.name, func(t *testing.T) {
+					w := result.info.WindowForModel("fable")
+					if w == nil || w.WindowDuration != tc.wantDuration || w.UsedPercent != 100 || w.Kind != tc.kind {
+						t.Fatalf("model quota or its duration changed: %+v, duration want %v", w, tc.wantDuration)
+					}
+					if !result.info.NumericQuotaKnown() || !result.info.IsNearLimitForModel(0.8, "fable") || result.info.IsNearLimitForModel(0.8, "sonnet") {
+						t.Fatal("model limit duration uncertainty changed quota eligibility")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestClaudeUsageCompatibilityNullLegacyPremiumAlias(t *testing.T) {
+	info := fetchFixture(t, claudeCompatibilityBody(`"opus":{"utilization":null},"seven_day_opus":{"utilization":100},`+claudeCompatibilityWeekly))
+	if info.TertiaryWindow == nil || info.TertiaryWindow.UsedPercent != 100 || !info.IsNearLimitForModel(0.8, "opus") {
+		t.Fatalf("null legacy alias hid the measured premium limit: %+v", info)
+	}
+}
+
+type claudeLegacyPremiumCase struct {
+	name, body   string
+	wantPercents []float64
+}
+
+// Coexisting legacy fields are synthetic compatibility cases, not a captured
+// provider document. Neither accepted measurement may erase the other.
+func claudeLegacyPremiumCases() []claudeLegacyPremiumCase {
+	var cases []claudeLegacyPremiumCase
+	for _, tc := range []struct {
+		name, fields string
+		percents     []float64
+	}{
+		{"second alias exhausted", `"opus":{"utilization":0},"seven_day_opus":{"utilization":100}`, []float64{0, 100}},
+		{"first alias exhausted", `"opus":{"utilization":100},"seven_day_opus":{"utilization":0}`, []float64{100, 0}},
+		{"both measured with fractional headroom", `"opus":{"utilization":12.5},"seven_day_opus":{"utilization":50.5}`, []float64{12.5, 50.5}},
+		{"null first alias", `"opus":{"utilization":null,"resets_at":"2020-01-01T00:00:00Z"},"seven_day_opus":{"utilization":100}`, []float64{100}},
+		{"null second alias", `"opus":{"utilization":100},"seven_day_opus":{"utilization":null,"resets_at":"2020-01-01T00:00:00Z"}`, []float64{100}},
+		{"only opus", `"opus":{"utilization":100}`, []float64{100}},
+		{"only seven day opus", `"seven_day_opus":{"utilization":100}`, []float64{100}},
+	} {
+		cases = append(cases, claudeLegacyPremiumCase{tc.name, claudeCompatibilityBody(tc.fields + "," + claudeCompatibilityWeekly), tc.percents})
+	}
+	return cases
+}
+
+func assertClaudeLegacyPremiumConstraints(t *testing.T, info *UsageInfo, tc claudeLegacyPremiumCase) {
+	t.Helper()
+	if info == nil || !info.NumericQuotaKnown() || info.Error != "" || info.PrimaryWindow != nil || info.SecondaryWindow == nil || info.SecondaryWindow.UsedPercent != 25 {
+		t.Fatalf("legacy model fields lost usable weekly quota: %+v", info)
+	}
+	if len(info.ScopedWindows) != len(tc.wantPercents) || info.TertiaryWindow != info.ScopedWindows[0] {
+		t.Fatalf("legacy constraints or first measured display slot lost: %+v", info)
+	}
+	worst := 0.0
+	for i, percent := range tc.wantPercents {
+		w := info.ScopedWindows[i]
+		if w == nil || w.Utilization != percent/100 || w.UsedPercent != int(percent) || w.Label != "Opus" || w.WindowDuration != 0 {
+			t.Fatalf("legacy constraint %d changed its measurement or acquired a duration: %+v", i, w)
+		}
+		worst = max(worst, percent)
+	}
+	if w := info.ScopedLimit("claude-opus-4-1"); w == nil || w.Utilization != worst/100 {
+		t.Fatalf("an applicable legacy model restriction disappeared: %+v", w)
+	}
+	for _, model := range []string{"opus", "claude-opus-4-1", "", "sonnet"} {
+		spent := model != "sonnet" && worst >= 80
+		if info.IsNearLimitForModel(0.8, model) != spent {
+			t.Fatalf("legacy fields changed quota applicability for %q", model)
+		}
+		for _, mode := range []string{RankAvailability, RankEarliestResetHeadroom} {
+			result := RankProfiles([]ProfileUsage{{Provider: "claude", ProfileName: "legacy-premium", Usage: info}}, RankOptions{
+				Mode: mode, Model: model, Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+			})
+			if (result.Selected == nil) != spent {
+				t.Fatalf("%s rank for %q ignored legacy model constraints: %+v", mode, model, result)
+			}
+		}
+	}
+}
+
+func TestClaudeUsageRetainsAllLegacyPremiumConstraints(t *testing.T) {
+	for _, tc := range claudeLegacyPremiumCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			assertClaudeLegacyPremiumConstraints(t, fetchFixture(t, tc.body), tc)
+		})
+	}
+}
+
+type claudeGeneralReconciliationCase struct {
+	name, body  string
+	primary     bool
+	wantPercent float64
+	wantReset   time.Time
+	conflict    bool
+}
+
+func claudeGeneralReconciliationCases() []claudeGeneralReconciliationCase {
+	const reset = `"2099-01-05T00:00:00Z"`
+	resetTime := time.Date(2099, 1, 5, 0, 0, 0, 0, time.UTC)
+	var cases []claudeGeneralReconciliationCase
+	for _, window := range []struct{ name, field, kind string }{
+		{"session", "five_hour", LimitKindSession},
+		{"weekly", "seven_day", LimitKindWeeklyAll},
+	} {
+		for _, tc := range []struct {
+			name, top, limit, topReset, limitReset string
+			wantPercent                            float64
+			wantReset                              time.Time
+			conflict                               bool
+		}{
+			{"zero versus exhausted", "0", "100", reset, reset, 0, resetTime, true},
+			{"exhausted versus zero", "100", "0", reset, reset, 100, resetTime, true},
+			{"fraction versus lower integer", "12.5", "12", reset, reset, 12.5, resetTime, true},
+			{"integer versus higher fraction", "12", "12.5", reset, reset, 12, resetTime, true},
+			{"fraction versus higher integer", "12.5", "13", reset, reset, 12.5, resetTime, true},
+			{"half percent versus zero", "0.5", "0", reset, reset, 0.5, resetTime, true},
+			{"zero versus half percent", "0", "0.5", reset, reset, 0, resetTime, true},
+			{"equal decimal zero", "0.0", "0", reset, reset, 0, resetTime, false},
+			{"equal fractional values", "12.5", "12.50", reset, reset, 12.5, resetTime, false},
+			{"equal half percent", "0.5", "0.50", reset, reset, 0.5, resetTime, false},
+			{"equal multiplication boundary", "57.0", "57", reset, reset, 57, resetTime, false},
+			{"equal exhausted values", "100", "100.0", reset, reset, 100, resetTime, false},
+			{"top null falls back", "null", "12.5", "null", reset, 12.5, resetTime, false},
+			{"null limit does not contradict", "12.5", "null", reset, `"2020-01-01T00:00:00Z"`, 12.5, resetTime, false},
+			{"same reset different zone", "12.5", "12.5", reset, `"2099-01-04T19:00:00-05:00"`, 12.5, resetTime, false},
+			{"same reset different precision", "12.5", "12.5", `"2099-01-05T00:00:00.000000000Z"`, reset, 12.5, resetTime, false},
+			{"later limit reset", "12.5", "12.5", reset, `"2099-01-05T00:00:01Z"`, 12.5, resetTime, true},
+			{"earlier limit reset", "12.5", "12.5", reset, `"2099-01-04T23:59:59Z"`, 12.5, resetTime, true},
+			{"distinct nanosecond resets", "12.5", "12.5", `"2099-01-05T00:00:00.000000001Z"`, `"2099-01-05T00:00:00.000000002Z"`, 12.5, resetTime.Add(time.Nanosecond), true},
+			{"limit supplies missing reset", "12.5", "12.5", "null", reset, 12.5, resetTime, false},
+			{"top supplies missing reset", "12.5", "12.5", reset, "null", 12.5, resetTime, false},
+			{"both resets absent", "12.5", "12.5", "null", "null", 12.5, time.Time{}, false},
+		} {
+			fields := `"` + window.field + `":{"utilization":` + tc.top + `,"resets_at":` + tc.topReset + `}`
+			primary := window.kind == LimitKindSession
+			if primary {
+				fields += `,` + claudeCompatibilityWeekly
+			} else {
+				fields += `,"five_hour":null`
+			}
+			limit := `{"kind":"` + window.kind + `","percent":` + tc.limit + `,"resets_at":` + tc.limitReset + `}`
+			// Keep the model entry after the general duplicate. Detecting a
+			// conflict must not stop normalization and erase later constraints.
+			body := claudeCompatibilityBody(fields, limit, claudeCompatibilityFableLimit)
+			cases = append(cases, claudeGeneralReconciliationCase{
+				window.name + "/" + tc.name, body, primary, tc.wantPercent, tc.wantReset, tc.conflict,
+			})
+		}
+	}
+	return cases
+}
+
+func assertClaudeGeneralReconciliation(t *testing.T, info *UsageInfo, err error, tc claudeGeneralReconciliationCase) {
+	t.Helper()
+	if info == nil {
+		t.Fatalf("duplicate general quota lost its diagnostic document: %v", err)
+	}
+	w := info.SecondaryWindow
+	if tc.primary {
+		w = info.PrimaryWindow
+		if info.SecondaryWindow == nil || info.SecondaryWindow.UsedPercent != 25 {
+			t.Fatalf("session conflict erased the known weekly allowance: %+v", info.SecondaryWindow)
+		}
+	} else if info.PrimaryWindow != nil {
+		t.Fatalf("weekly-only response invented a session allowance: %+v", info.PrimaryWindow)
+	}
+	if w == nil || w.Utilization != tc.wantPercent/100 || w.UsedPercent != int(tc.wantPercent) || !w.ResetsAt.Equal(tc.wantReset) {
+		t.Fatalf("general measurement lost its precision or reset: got %+v, want %v%% reset %v", w, tc.wantPercent, tc.wantReset)
+	}
+	if model := info.WindowForModel("fable"); model == nil || model.UsedPercent != 100 {
+		t.Fatalf("general conflict erased the later model constraint: %+v", model)
+	}
+	if tc.conflict {
+		if err == nil || info.QuotaStatus != QuotaDegraded || info.Error == "" || !strings.Contains(info.QuotaNote, "conflicting") {
+			t.Fatalf("conflicting duplicate quota was accepted: info=%+v err=%v", info, err)
+		}
+		assertClaudeQuotaNotRoutable(t, info)
+	} else if err != nil || info.Error != "" || !info.NumericQuotaKnown() {
+		t.Fatalf("agreeing or inapplicable duplicate was rejected: info=%+v err=%v", info, err)
+	}
+}
+
+func TestClaudeUsageGeneralDuplicateReconciliation(t *testing.T) {
+	for _, tc := range claudeGeneralReconciliationCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := fetchClaudeFixtureResult(t, tc.body)
+			assertClaudeGeneralReconciliation(t, info, err, tc)
+		})
 	}
 }

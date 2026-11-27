@@ -29,9 +29,12 @@ package cmd
 //     routing verdict a controller would act on. `--source` is the override.
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -39,6 +42,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
+	claudeprovider "github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/claude"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/shallow"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
 )
@@ -48,16 +52,20 @@ const (
 	credNamespaceVault    = "vault"
 	credNamespaceIsolated = "isolated"
 	credNamespaceShallow  = "shallow"
+	credNamespaceLive     = "live"
 )
 
 // credNamespaces is the resolution order: the vault stays first so an
 // unqualified --profile keeps meaning what it always meant.
 var credNamespaces = []string{credNamespaceVault, credNamespaceIsolated, credNamespaceShallow}
 
+const credentialSourceNames = "vault, isolated, shallow, live"
+
 // Credential states, worst to best. A namespace that holds no credential for
 // the name at all is credStateMissing.
 const (
 	credStateMissing = "missing"
+	credStateInvalid = "invalid"
 	credStateExpired = "expired"
 	credStateUnknown = "unknown"
 	credStateHealthy = "healthy"
@@ -84,6 +92,8 @@ type credentialLookup struct {
 	Profiles   *profile.Store
 	Shallow    *shallow.Manager
 	LiveHome   string // real HOME, for the live .claude.json of the active profile
+	LiveEnv    func(string) string
+	LiveOS     string
 	ActiveName func(provider string) string
 	Now        time.Time
 }
@@ -100,10 +110,13 @@ type credentialCandidate struct {
 	Token      string
 	State      string
 	ExpiresAt  time.Time
+	// Err makes a present but unusable source different from an absent one.
+	// Never silently route around a conflicting or malformed selected login.
+	Err error
 }
 
 // Found reports whether this namespace actually holds a credential.
-func (c credentialCandidate) Found() bool { return c.State != credStateMissing }
+func (c credentialCandidate) Found() bool { return c.State != credStateMissing && c.Err == nil }
 
 // resolvedCredential is the outcome of a --profile lookup.
 type resolvedCredential struct {
@@ -117,6 +130,9 @@ type resolvedCredential struct {
 
 // ValidCredNamespace reports whether s names a namespace.
 func ValidCredNamespace(s string) bool {
+	if s == credNamespaceLive {
+		return true
+	}
 	for _, n := range credNamespaces {
 		if n == s {
 			return true
@@ -130,16 +146,43 @@ func ValidCredNamespace(s string) bool {
 // returns nothing.
 func (l credentialLookup) candidatePaths(namespace, provider, name string) []string {
 	switch namespace {
+	case credNamespaceLive:
+		if l.LiveHome == "" {
+			return nil
+		}
+		getenv := l.LiveEnv
+		if getenv == nil {
+			getenv = os.Getenv
+		}
+		switch provider {
+		case "grok":
+			home := getenv("GROK_HOME")
+			if home == "" {
+				home = filepath.Join(l.LiveHome, ".grok")
+			}
+			return []string{filepath.Join(home, "auth.json")}
+		case "cursor":
+			goos := l.LiveOS
+			if goos == "" {
+				goos = runtime.GOOS
+			}
+			return []string{authfile.ResolveCursorPaths(l.LiveHome, goos, getenv).AuthFile}
+		}
 	case credNamespaceVault:
 		dir := filepath.Join(l.VaultDir, provider, name)
 		switch provider {
 		case "claude":
 			return []string{
 				filepath.Join(dir, ".credentials.json"),
-				filepath.Join(dir, ".claude.json"),
 				filepath.Join(dir, "auth.json"),
+				filepath.Join(dir, "settings.json"),
+				filepath.Join(dir, ".claude.json"),
 			}
 		case "codex":
+			return []string{filepath.Join(dir, "auth.json")}
+		case "grok":
+			return []string{filepath.Join(dir, "auth.json")}
+		case "cursor":
 			return []string{filepath.Join(dir, "auth.json")}
 		}
 	case credNamespaceIsolated:
@@ -152,14 +195,21 @@ func (l credentialLookup) candidatePaths(namespace, provider, name string) []str
 		}
 		switch provider {
 		case "claude":
-			// Legacy HOME layout first, then the XDG layout an in-app
-			// /login writes under `caam exec` (issues #70, #72, #100).
-			return []string{
-				filepath.Join(prof.HomePath(), ".claude", ".credentials.json"),
-				filepath.Join(prof.XDGConfigPath(), "claude-code", ".credentials.json"),
+			path, _, err := isolatedClaudeQuotaPaths(prof)
+			if err != nil {
+				return nil // inspect retains the selection error for this source.
 			}
+			return []string{path}
 		case "codex":
 			return []string{filepath.Join(prof.CodexHomePath(), "auth.json")}
+		case "grok":
+			return []string{filepath.Join(prof.HomePath(), ".grok", "auth.json")}
+		case "cursor":
+			// The provider pins environment roots to this HOME's defaults.
+			// Use the same platform resolver, never the caller's environment
+			// or a stale alternate credential tree.
+			paths := authfile.ResolveCursorPaths(prof.HomePath(), runtime.GOOS, func(string) string { return "" })
+			return []string{paths.AuthFile}
 		}
 	case credNamespaceShallow:
 		if l.Shallow == nil {
@@ -189,8 +239,19 @@ func (l credentialLookup) claudeJSONPath(namespace, provider, name string) strin
 	}
 	switch namespace {
 	case credNamespaceVault:
-		if l.ActiveName != nil && l.LiveHome != "" && l.ActiveName(provider) == name {
-			return filepath.Join(l.LiveHome, ".claude.json")
+		if l.ActiveName != nil && l.ActiveName(provider) == name {
+			getenv := l.LiveEnv
+			if getenv == nil {
+				getenv = os.Getenv
+			}
+			if dir := getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+				// The selected credentials and cached state share one directory.
+				// A missing cache cannot borrow a different host login's state.
+				return filepath.Join(dir, ".claude.json")
+			}
+			if l.LiveHome != "" {
+				return filepath.Join(l.LiveHome, ".claude.json")
+			}
 		}
 		return filepath.Join(l.VaultDir, provider, name, ".claude.json")
 	case credNamespaceIsolated:
@@ -201,7 +262,11 @@ func (l credentialLookup) claudeJSONPath(namespace, provider, name string) strin
 		if err != nil {
 			return ""
 		}
-		return filepath.Join(prof.HomePath(), ".claude.json")
+		_, state, err := isolatedClaudeQuotaPaths(prof)
+		if err != nil {
+			return "" // An ambiguous account cannot supply cached routing data.
+		}
+		return state
 	case credNamespaceShallow:
 		if l.Shallow == nil {
 			return ""
@@ -217,6 +282,12 @@ func (l credentialLookup) claudeJSONPath(namespace, provider, name string) strin
 
 // inspect reads what one namespace holds for (provider, name).
 func (l credentialLookup) inspect(namespace, provider, name string) credentialCandidate {
+	if namespace == credNamespaceIsolated && provider == "claude" {
+		return l.inspectIsolatedClaude(name)
+	}
+	if namespace == credNamespaceVault && provider == "claude" {
+		return l.inspectVaultClaude(name)
+	}
 	out := credentialCandidate{Namespace: namespace, State: credStateMissing}
 	paths := l.candidatePaths(namespace, provider, name)
 	if len(paths) == 0 {
@@ -233,6 +304,8 @@ func (l credentialLookup) inspect(namespace, provider, name string) credentialCa
 			token, _, err = usage.ReadClaudeCredentials(path)
 		case "codex":
 			token, _, err = usage.ReadCodexCredentials(path)
+		case "grok", "cursor":
+			token, err = usage.NativeCredentialLocator(provider, path)
 		default:
 			return out
 		}
@@ -247,9 +320,90 @@ func (l credentialLookup) inspect(namespace, provider, name string) credentialCa
 	return out
 }
 
+func (l credentialLookup) inspectVaultClaude(name string) credentialCandidate {
+	dir := filepath.Join(l.VaultDir, "claude", name)
+	out := credentialCandidate{
+		Namespace: credNamespaceVault, State: credStateMissing,
+		Path:       filepath.Join(dir, ".credentials.json"),
+		ClaudeJSON: l.claudeJSONPath(credNamespaceVault, "claude", name),
+	}
+	selected, err := usage.ReadClaudeProfileCredentials(dir)
+	if selected.Path != "" {
+		out.Path = selected.Path
+	}
+	if err != nil {
+		if selected.Path == "" && errors.Is(err, os.ErrNotExist) {
+			return out
+		}
+		out.State, out.Err = credStateInvalid, err
+		return out
+	}
+	out.Token = selected.AccessToken
+	out.State, out.ExpiresAt = l.credentialExpiryState(selected.ExpiresAt, selected.Renewable)
+	return out
+}
+
+// Resolve through the same read-only provider selector as caam exec. Neither
+// token freshness nor a parse failure may select an ignored legacy login.
+// The paired cache follows CLAUDE_CONFIG_DIR too; only a legacy-only profile
+// may use home/.claude.json when its nested state is absent. No preparation,
+// environment mutation, keychain access, or token renewal belongs here.
+func isolatedClaudeQuotaPaths(prof *profile.Profile) (credential, state string, err error) {
+	if prof == nil || prof.AuthMode != "oauth" {
+		return "", "", fmt.Errorf("isolated Claude quota requires an OAuth profile")
+	}
+	env, err := claudeprovider.New().Env(context.Background(), prof)
+	if err != nil {
+		// Selection errors must not include a credential parser's input.
+		return "", "", fmt.Errorf("isolated Claude source is conflicting or unreadable; resolve the profile before reading quota")
+	}
+	dir := env["CLAUDE_CONFIG_DIR"]
+	if dir == "" {
+		return "", "", fmt.Errorf("isolated Claude configuration directory is unavailable")
+	}
+	state = filepath.Join(dir, ".claude.json")
+	if dir == filepath.Join(prof.HomePath(), ".claude") {
+		if _, err := os.Stat(state); os.IsNotExist(err) {
+			state = filepath.Join(prof.HomePath(), ".claude.json")
+		}
+	}
+	return filepath.Join(dir, ".credentials.json"), state, nil
+}
+
+func (l credentialLookup) inspectIsolatedClaude(name string) credentialCandidate {
+	out := credentialCandidate{Namespace: credNamespaceIsolated, State: credStateMissing}
+	if l.Profiles == nil {
+		return out
+	}
+	prof, err := l.Profiles.Load("claude", name)
+	if err != nil {
+		if !errors.Is(err, profile.ErrNotFound) {
+			out.State = credStateInvalid
+			out.Err = fmt.Errorf("isolated Claude profile is unreadable")
+		}
+		return out
+	}
+	out.Path, out.ClaudeJSON, err = isolatedClaudeQuotaPaths(prof)
+	if err == nil {
+		out.Token, _, err = usage.ReadClaudeCredentials(out.Path)
+		if errors.Is(err, os.ErrNotExist) {
+			return out // No supported quota credential in the selected layout.
+		}
+		if err != nil || strings.TrimSpace(out.Token) == "" {
+			err = fmt.Errorf("selected isolated Claude credential is missing or invalid; no other login was used")
+		}
+	}
+	if err != nil {
+		out.State, out.Err, out.Token = credStateInvalid, err, ""
+		return out
+	}
+	out.State, out.ExpiresAt = l.credentialState("claude", out.Path)
+	return out
+}
+
 // credentialState classifies a credential file that was read successfully.
-// A renewable credential counts as healthy even past its expiry: the CLI or
-// caam's refresher renews it without a human (issue #102).
+// Claude/Codex retain their renewable-credential classification (issue #102).
+// Native quota reads use access credentials only and cannot renew them.
 func (l credentialLookup) credentialState(provider, path string) (string, time.Time) {
 	var (
 		info *health.ExpiryInfo
@@ -257,21 +411,37 @@ func (l credentialLookup) credentialState(provider, path string) (string, time.T
 	)
 	switch provider {
 	case "claude":
-		info, err = health.ParseClaudeExpiry(filepath.Dir(path))
+		var data []byte
+		data, err = os.ReadFile(path)
+		if err == nil {
+			info, err = health.ParseClaudeCredentialExpiry(path, data)
+		}
 	case "codex":
 		info, err = health.ParseCodexExpiry(path)
+	case "grok":
+		info, err = health.ParseGrokExpiry(path)
+	case "cursor":
+		info, err = health.ParseCursorExpiry(path)
 	}
 	if err != nil || info == nil || info.ExpiresAt.IsZero() {
+		return credStateUnknown, time.Time{}
+	}
+	renewable := info.Renewable && provider != "grok" && provider != "cursor"
+	return l.credentialExpiryState(info.ExpiresAt, renewable)
+}
+
+func (l credentialLookup) credentialExpiryState(expiresAt time.Time, renewable bool) (string, time.Time) {
+	if expiresAt.IsZero() {
 		return credStateUnknown, time.Time{}
 	}
 	now := l.Now
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if info.ExpiresAt.After(now) || info.Renewable {
-		return credStateHealthy, info.ExpiresAt
+	if expiresAt.After(now) || renewable {
+		return credStateHealthy, expiresAt
 	}
-	return credStateExpired, info.ExpiresAt
+	return credStateExpired, expiresAt
 }
 
 // resolveProfileCredential picks the namespace to read a named profile from
@@ -284,12 +454,15 @@ func (l credentialLookup) credentialState(provider, path string) (string, time.T
 func resolveProfileCredential(l credentialLookup, provider, name, source string) (*resolvedCredential, error) {
 	source = strings.ToLower(strings.TrimSpace(source))
 	if source != "" && !ValidCredNamespace(source) {
-		return nil, fmt.Errorf("unknown --source %q (want one of: %s)", source, strings.Join(credNamespaces, ", "))
+		return nil, fmt.Errorf("unknown --source %q (want one of: %s)", source, credentialSourceNames)
+	}
+	if source == credNamespaceLive {
+		return resolveLiveCredential(l, provider, name)
 	}
 
 	found := make([]credentialCandidate, 0, len(credNamespaces))
 	for _, ns := range credNamespaces {
-		if c := l.inspect(ns, provider, name); c.Found() {
+		if c := l.inspect(ns, provider, name); c.Found() || c.Err != nil {
 			found = append(found, c)
 		}
 	}
@@ -297,6 +470,9 @@ func resolveProfileCredential(l credentialLookup, provider, name, source string)
 	if source != "" {
 		for _, c := range found {
 			if c.Namespace == source {
+				if c.Err != nil {
+					return nil, fmt.Errorf("%s/%s: %w", provider, name, c.Err)
+				}
 				res := &resolvedCredential{Selected: c, Explicit: true}
 				res.Alternatives = othersThan(found, source)
 				return res, nil
@@ -310,11 +486,46 @@ func resolveProfileCredential(l credentialLookup, provider, name, source string)
 	}
 
 	selected := found[0] // credNamespaces order: vault first
+	if selected.Err != nil {
+		return nil, fmt.Errorf("%s/%s: %w", provider, name, selected.Err)
+	}
 	res := &resolvedCredential{Selected: selected}
 	res.Alternatives = othersThan(found, selected.Namespace)
 	for _, alt := range res.Alternatives {
 		if credStateRank(alt.State) > credStateRank(selected.State) {
 			res.Healthier = append(res.Healthier, alt)
+		}
+	}
+	return res, nil
+}
+
+// Live credentials have no profile name of their own. Bind them to an
+// explicit saved profile by account identity, never by the active marker or
+// a filename; native CLIs can rotate credentials or switch logins themselves.
+func resolveLiveCredential(l credentialLookup, provider, name string) (*resolvedCredential, error) {
+	if provider != "grok" && provider != "cursor" {
+		return nil, fmt.Errorf("--source live supports grok and cursor only")
+	}
+	if name == "" || authfile.IsSystemProfile(name) {
+		return nil, fmt.Errorf("--source live requires a saved account selected with --profile")
+	}
+	paths := l.candidatePaths(credNamespaceLive, provider, name)
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("cannot resolve live %s credential path", provider)
+	}
+	vaultPath := filepath.Join(l.VaultDir, provider, name, "auth.json")
+	locator, err := usage.NativeLiveCredentialLocator(provider, paths[0], vaultPath)
+	if err != nil {
+		return nil, fmt.Errorf("%s/%s: --source live (%s): %w", provider, name, paths[0], err)
+	}
+	state, expiresAt := l.credentialState(provider, paths[0])
+	res := &resolvedCredential{
+		Selected: credentialCandidate{Namespace: credNamespaceLive, Path: paths[0], Token: locator, State: state, ExpiresAt: expiresAt},
+		Explicit: true,
+	}
+	for _, ns := range credNamespaces {
+		if c := l.inspect(ns, provider, name); c.Found() {
+			res.Alternatives = append(res.Alternatives, c)
 		}
 	}
 	return res, nil
@@ -408,6 +619,8 @@ func (r *resolvedCredential) describe(provider, name string) string {
 func namespaceProfileNames(l credentialLookup, namespace, provider string) ([]string, error) {
 	var names []string
 	switch namespace {
+	case credNamespaceLive:
+		return nil, fmt.Errorf("--source live requires --profile to verify the live account against its saved identity")
 	case credNamespaceVault:
 		entries, err := os.ReadDir(filepath.Join(l.VaultDir, provider))
 		if err != nil {

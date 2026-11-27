@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -41,23 +42,29 @@ const (
 )
 
 // ErrNoCachedUsage reports that a .claude.json holds no usage snapshot: the
-// file is absent or unreadable, predates the cache, or carries an empty limits
-// array. It is the expected state for a profile that has not run a session
+// file is absent or unreadable, predates the cache, or has no window entries.
+// It is the expected state for a profile that has not run a session
 // since Claude Code started caching, not a fault — and it must be reported as
 // "no cached data", never as 0% used.
 var ErrNoCachedUsage = errors.New("no cached usage data")
 
+// A projected reset is useful for display but does not measure any usage in
+// the new window. A live weekly allowance cannot establish that a previously
+// reported session or model allowance has spare capacity after its reset.
+var errCachedQuotaRolled = errors.New("cached usage crossed a quota reset; refresh usage before selecting this account")
+
+var errCachedAccountMismatch = errors.New("cached usage belongs to a different Claude account; refresh usage before selecting this account")
+
 // cachedUsageFile is the slice of a .claude.json this package reads.
 type cachedUsageFile struct {
-	Cached *cachedUsageBlock `json:"cachedUsageUtilization"`
+	Cached       *cachedUsageBlock `json:"cachedUsageUtilization"`
+	OAuthAccount json.RawMessage   `json:"oauthAccount"`
 }
 
 type cachedUsageBlock struct {
-	FetchedAtMs int64  `json:"fetchedAtMs"`
-	AccountUUID string `json:"accountUuid"`
-	Utilization struct {
-		Limits []claudeLimit `json:"limits"`
-	} `json:"utilization"`
+	FetchedAtMs int64               `json:"fetchedAtMs"`
+	AccountUUID string              `json:"accountUuid"`
+	Utilization claudeUsageResponse `json:"utilization"`
 }
 
 // ReadCachedClaudeUsage reads the usage snapshot out of the .claude.json at
@@ -86,12 +93,20 @@ func ReadCachedClaudeUsage(path string, now time.Time) (*UsageInfo, error) {
 //
 // Malformed JSON is an error. A well-formed file with no snapshot yields
 // ErrNoCachedUsage so the caller can say "no cached data" instead of "0%".
+// An incomplete, unsupported, or rolled quota returns diagnostic UsageInfo
+// and an error; callers should retain the windows and original cache timestamp
+// for display, then refresh usage before selecting the account for new work.
 func ParseCachedClaudeUsage(data []byte, now time.Time) (*UsageInfo, error) {
 	var file cachedUsageFile
 	if err := json.Unmarshal(data, &file); err != nil {
 		return nil, fmt.Errorf("parse .claude.json: %w", err)
 	}
-	if file.Cached == nil || len(file.Cached.Utilization.Limits) == 0 {
+	if file.Cached == nil {
+		return nil, ErrNoCachedUsage
+	}
+	quota := file.Cached.Utilization
+	if len(quota.Limits) == 0 && quota.FiveHour == nil && quota.SevenDay == nil &&
+		quota.Opus == nil && quota.SevenDayOpus == nil {
 		return nil, ErrNoCachedUsage
 	}
 
@@ -104,30 +119,63 @@ func ParseCachedClaudeUsage(data []byte, now time.Time) (*UsageInfo, error) {
 		info.FetchedAt = time.UnixMilli(file.Cached.FetchedAtMs)
 	}
 
-	// The cached payload is the same limits[] array the usage API returns, so
-	// it folds in through the same code path — including the per-model
-	// ("weekly_scoped") allowances.
-	applyLimits(info, file.Cached.Utilization.Limits)
+	// Use the live parser's normalization and general-quota guard. A partial
+	// snapshot can retain diagnostic windows without becoming spare capacity.
+	quotaErr := quota.apply(info, now)
+	// Native account labels are not ownership proof, but an explicit
+	// disagreement makes this snapshot unsafe to attribute to the login.
+	// Legacy files may omit this object or carry an old string label.
+	var account struct {
+		AccountUUID string `json:"accountUuid"`
+	}
+	if quotaErr == nil && json.Unmarshal(file.OAuthAccount, &account) == nil {
+		cachedID, currentID := strings.TrimSpace(info.AccountID), strings.TrimSpace(account.AccountUUID)
+		if cachedID != "" && currentID != "" && cachedID != currentID {
+			quotaErr = errCachedAccountMismatch
+			info.QuotaStatus = QuotaDegraded
+			info.Error, info.QuotaNote = quotaErr.Error(), quotaErr.Error()
+		}
+	}
 
+	rolled := false
 	for _, w := range []*UsageWindow{info.PrimaryWindow, info.SecondaryWindow, info.TertiaryWindow} {
-		markRolled(w, now)
+		if markRolled(w, now) {
+			rolled = true
+		}
 	}
 	for _, w := range info.ModelWindows {
-		markRolled(w, now)
+		if markRolled(w, now) {
+			rolled = true
+		}
+	}
+	for _, w := range info.ScopedWindows {
+		if markRolled(w, now) {
+			rolled = true
+		}
+	}
+	if rolled && quotaErr == nil {
+		// Keep the recorded windows, their projected resets, and the cache's
+		// own timestamp for diagnostics. Selecting new work needs a fresh
+		// measurement of every restriction, not this synthetic zero.
+		quotaErr = errCachedQuotaRolled
+		info.QuotaStatus = QuotaDegraded
+		info.Error, info.QuotaNote = quotaErr.Error(), quotaErr.Error()
 	}
 
-	return info, nil
+	return info, quotaErr
 }
 
 // markRolled zeroes a window whose reset time has already passed, recording
-// that it did so.
-func markRolled(w *UsageWindow, now time.Time) {
+// that it did so. The result also marks the snapshot unsafe for selection,
+// including when another same-model window later replaces this candidate.
+func markRolled(w *UsageWindow, now time.Time) bool {
 	if w == nil || w.ResetsAt.IsZero() || w.ResetsAt.After(now) {
-		return
+		return false
 	}
 	w.Rolled = true
 	w.Utilization = 0
 	w.UsedPercent = 0
+	return true
 }
 
 // CacheAge reports how stale a cached snapshot is. It returns false when the

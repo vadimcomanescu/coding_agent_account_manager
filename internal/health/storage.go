@@ -12,8 +12,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 )
 
 // ProfileHealth holds health metadata for a single profile.
@@ -40,8 +43,29 @@ type ProfileHealth struct {
 	// paid spelling, so "max" stays "max" in storage and output.
 	PlanType string `json:"plan_type,omitempty"`
 
-	// LastChecked is when health was last verified.
+	// LastChecked is when the stored expiry was last written. It records a
+	// local file read, not a provider check; see LastVerifiedAt for that.
 	LastChecked time.Time `json:"last_checked,omitempty"`
+
+	// LastVerifiedAt is when the provider last accepted this profile's
+	// credential (issue #108), and VerifiedFingerprint identifies the
+	// credential it accepted.
+	LastVerifiedAt      time.Time `json:"last_verified_at,omitempty"`
+	VerifiedFingerprint string    `json:"verified_fingerprint,omitempty"`
+
+	// ProviderRejectedAt is when the provider last rejected this profile's
+	// credential (a 401/403, or a refresh refused as revoked, reused or
+	// expired). ProviderRejection is a short non-secret reason code and
+	// RejectedFingerprint identifies the rejected credential, so a new login
+	// clears the rejection by replacing the credential (issue #108).
+	ProviderRejectedAt  time.Time `json:"provider_rejected_at,omitempty"`
+	ProviderRejection   string    `json:"provider_rejection,omitempty"`
+	RejectedFingerprint string    `json:"rejected_fingerprint,omitempty"`
+
+	// CredentialFingerprint identifies the credential currently on disk for
+	// this profile. Set at report time alongside TokenExpiresAt and never
+	// persisted; ProviderRejected compares it with RejectedFingerprint.
+	CredentialFingerprint string `json:"-"`
 
 	// RateLimitedUntil is the end of an active rate-limit cooldown, filled in
 	// at report time from the limit_events table. It is never persisted here:
@@ -52,9 +76,9 @@ type ProfileHealth struct {
 	RateLimitedUntil time.Time `json:"-"`
 
 	// SelfRefreshing marks TokenExpiresAt as the expiry of an access token
-	// the provider's own CLI renews in place (Claude Code, when a refresh
-	// token is present). Set at report time alongside TokenExpiresAt and
-	// never persisted: the token's TTL is then informational only and must
+	// the provider's own CLI renews in place (Claude Code with a refresh
+	// token, or Cursor with a stored API key). Set at report time alongside
+	// TokenExpiresAt and never persisted: the token's TTL is then informational only and must
 	// not lower the verdict, list a reason, or recommend a refresh caam
 	// cannot perform (PR #84).
 	SelfRefreshing bool `json:"-"`
@@ -70,6 +94,12 @@ type ProfileHealth struct {
 	// expiry (it has a Codex refresher), but a lapsed-yet-refreshable token
 	// must not be reported as an expired account (issue #102).
 	TokenRenewable bool `json:"-"`
+
+	// ReloginWarningLead is extra warning time for a non-renewable login with a hard
+	// deadline, such as a Cursor session. Derived alongside TokenExpiresAt at
+	// report time and never persisted, so switching to an API-key credential
+	// immediately removes the relogin warning.
+	ReloginWarningLead time.Duration `json:"-"`
 }
 
 // RateLimited reports whether an active rate-limit cooldown is in effect.
@@ -99,8 +129,9 @@ type HealthStore struct {
 
 // Storage manages health metadata persistence.
 type Storage struct {
-	path string
-	mu   sync.RWMutex
+	path      string
+	vaultPath string
+	mu        sync.RWMutex
 }
 
 // NewStorage creates a new health storage manager.
@@ -110,6 +141,23 @@ func NewStorage(path string) *Storage {
 		path = DefaultHealthPath()
 	}
 	return &Storage{path: path}
+}
+
+// SetVaultPath binds report-time credential reads to the vault used by the
+// caller. An empty path restores the default vault beside health.json. It
+// changes neither persisted health metadata nor any credential file.
+func (s *Storage) SetVaultPath(root string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.vaultPath = root
+}
+
+// vaultPathLocked returns the configured vault root. Caller holds s.mu.
+func (s *Storage) vaultPathLocked() string {
+	if s.vaultPath != "" {
+		return s.vaultPath
+	}
+	return filepath.Join(filepath.Dir(s.path), "vault")
 }
 
 // DefaultHealthPath returns the default health file location.
@@ -227,16 +275,117 @@ func (s *Storage) saveLocked(store *HealthStore) error {
 	return nil
 }
 
-// GetProfile returns health data for a specific profile.
-// Returns nil if the profile has no health data.
+// GetProfile combines persisted health metadata with the current vault
+// credential. It returns nil only when neither source knows the profile.
+// Cached expiry alone is not credential evidence: its renewal semantics were
+// deliberately not persisted, and the credential may have since been replaced.
 func (s *Storage) GetProfile(provider, name string) (*ProfileHealth, error) {
-	store, err := s.Load()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	store, err := s.loadLocked()
 	if err != nil {
 		return nil, err
 	}
 
 	key := profileKey(provider, name)
-	return store.Profiles[key], nil
+	return hydrateVaultHealth(s.vaultPathLocked(), provider, name, store.Profiles[key]), nil
+}
+
+// hydrateVaultHealth never persists its result. Both the expiry and the means
+// to renew it belong to the current credential, not to health.json. In
+// particular, keeping only a stored expiry would turn an expired renewable
+// access token into a hard login deadline after every process restart.
+func hydrateVaultHealth(root, provider, name string, stored *ProfileHealth) *ProfileHealth {
+	var h *ProfileHealth
+	if stored != nil {
+		copy := *stored
+		h = &copy
+	}
+	var candidates []string
+	switch provider {
+	case "claude":
+		candidates = []string{".credentials.json", ".claude.json", "auth.json", filepath.Join("claude-code", "auth.json")}
+	case "gemini":
+		// ParseGeminiExpiry validates the selected source itself. An unused
+		// cache must not invalidate an explicitly selected API key.
+		candidates = []string{"settings.json"}
+	case "codex", "cursor", "grok":
+		candidates = []string{"auth.json"}
+	default:
+		return h
+	}
+	if h != nil {
+		h.TokenExpiresAt = time.Time{}
+		h.TokenRenewable = false
+		h.SelfRefreshing = false
+		h.ReloginWarningLead = 0
+		h.CredentialFingerprint = ""
+	}
+	if !validVaultProfileName(name) {
+		return h
+	}
+	dir := filepath.Join(root, provider, name)
+	fi, err := os.Stat(dir)
+	if err != nil || !fi.IsDir() {
+		return h
+	}
+	if h == nil {
+		h = &ProfileHealth{}
+	}
+	// Do not open a device or FIFO through a passive status read. Symlinks
+	// to regular files are supported, like adopted profile credentials.
+	for _, candidate := range candidates {
+		path := filepath.Join(dir, candidate)
+		fi, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			fi, err = os.Stat(path)
+		}
+		if err != nil || !fi.Mode().IsRegular() {
+			return h
+		}
+	}
+	var info *ExpiryInfo
+	switch provider {
+	case "claude":
+		// A present primary credential is authoritative. Do not revive an
+		// older login from an optional state file when the primary is bad.
+		primary := filepath.Join(dir, ".credentials.json")
+		if _, statErr := os.Stat(primary); statErr == nil {
+			info, err = parseClaudeCredentialsFile(primary)
+			if info != nil {
+				info.Renewable = info.HasRefreshToken
+				info.SelfRefreshing = info.HasRefreshToken
+			}
+		} else {
+			info, err = ParseClaudeExpiry(dir)
+		}
+	case "codex":
+		info, err = ParseCodexExpiry(filepath.Join(dir, "auth.json"))
+	case "cursor":
+		info, err = ParseCursorExpiry(filepath.Join(dir, "auth.json"))
+	case "gemini":
+		info, err = ParseGeminiExpiry(dir)
+	case "grok":
+		info, err = ParseGrokExpiry(filepath.Join(dir, "auth.json"))
+	}
+	// Expiry fields without credential material are not proof of a login.
+	// A parse failure is also not evidence that a rejected login changed.
+	if err != nil || info == nil || info.Fingerprint == "" {
+		return h
+	}
+	h.TokenExpiresAt = info.ExpiresAt
+	h.TokenRenewable = info.Renewable
+	h.SelfRefreshing = info.SelfRefreshing
+	h.ReloginWarningLead = info.ReloginWarningLead
+	h.CredentialFingerprint = info.Fingerprint
+	return h
+}
+
+func validVaultProfileName(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, `/\`)
 }
 
 // UpdateProfile updates or creates health data for a profile.
@@ -455,18 +604,40 @@ func (s *Storage) GetStatus(provider, name string) (HealthStatus, error) {
 	return CalculateStatus(health), nil
 }
 
-// ListProfiles returns a copy of all profiles with health data.
+// ListProfiles returns current health for persisted profiles and profiles in
+// the vault, including credentials never written to health.json.
 func (s *Storage) ListProfiles() (map[string]*ProfileHealth, error) {
-	store, err := s.Load()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	store, err := s.loadLocked()
 	if err != nil {
 		return nil, err
 	}
-	// Return a copy to prevent external modification of internal state
+	vaultRoot := s.vaultPathLocked()
+	for _, provider := range []string{"claude", "codex", "gemini", "grok", "cursor"} {
+		entries, err := os.ReadDir(filepath.Join(vaultRoot, provider))
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() && validVaultProfileName(entry.Name()) && !authfile.IsSystemProfile(entry.Name()) {
+				key := profileKey(provider, entry.Name())
+				if _, exists := store.Profiles[key]; !exists {
+					store.Profiles[key] = nil
+				}
+			}
+		}
+	}
 	result := make(map[string]*ProfileHealth, len(store.Profiles))
 	for k, v := range store.Profiles {
-		// Deep copy the ProfileHealth struct
-		copy := *v
-		result[k] = &copy
+		if provider, name, ok := strings.Cut(k, "/"); ok {
+			if h := hydrateVaultHealth(vaultRoot, provider, name, v); h != nil {
+				result[k] = h
+			}
+		} else if v != nil {
+			copy := *v
+			result[k] = &copy
+		}
 	}
 	return result, nil
 }

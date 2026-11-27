@@ -49,6 +49,8 @@ func init() {
 	addCmd.Flags().Duration("timeout", 5*time.Minute, "timeout for login flow completion")
 	addCmd.Flags().Bool("force", false, "skip confirmation prompts")
 	addCmd.Flags().Bool("device-code", false, "use device code flow for codex (headless)")
+	addCmd.Flags().StringP("description", "d", "", "description shown in 'caam ls' (e.g. \"Client X work\")")
+	addCmd.Flags().StringSlice("tag", nil, "tags for the new profile (repeatable or comma-separated)")
 }
 
 func runAdd(cmd *cobra.Command, args []string) error {
@@ -111,6 +113,11 @@ func runAdd(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("backup current auth: %w", err)
 		}
 		fmt.Printf("  Backed up to %s/%s\n", tool, backupName)
+		if tool == "claude" {
+			for _, warning := range claudeBackupIdentityWarnings(vault.ProfilePath(tool, backupName)) {
+				fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", warning)
+			}
+		}
 	}
 
 	// Step 2: Clear auth files
@@ -204,13 +211,38 @@ func runAdd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("save profile: %w", err)
 	}
 	fmt.Printf("  Saved %s/%s\n", tool, profileName)
+	if tool == "claude" {
+		for _, warning := range claudeBackupIdentityWarnings(vault.ProfilePath(tool, profileName)) {
+			fmt.Fprintln(cmd.ErrOrStderr(), "Warning:", warning)
+		}
+	}
+
+	description, _ := cmd.Flags().GetString("description")
+	tags, _ := cmd.Flags().GetStringSlice("tag")
+	if strings.TrimSpace(description) != "" || len(tags) > 0 {
+		labels, err := loadProfileLabels(tool, profileName)
+		if err != nil {
+			return fmt.Errorf("label profile: %w", err)
+		}
+		labels.Description = strings.TrimSpace(description)
+		for _, tag := range tags {
+			if err := labels.AddTag(tag); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: cannot add tag %q: %v\n", tag, err)
+			}
+		}
+		if err := labels.Save(); err != nil {
+			return fmt.Errorf("label profile: %w", err)
+		}
+	}
 
 	// Step 7: Optionally activate
 	if !noActivate {
 		fmt.Printf("Activating %s/%s...\n", tool, profileName)
-		if err := vault.Restore(fileSet, profileName); err != nil {
+		switched, err := vault.Switch(fileSet, profileName, loadSwitchOptions())
+		if err != nil {
 			return fmt.Errorf("activate profile: %w", err)
 		}
+		printSwitchPreservation(cmd.OutOrStdout(), tool, switched)
 		fmt.Printf("  Activated %s/%s\n", tool, profileName)
 	}
 

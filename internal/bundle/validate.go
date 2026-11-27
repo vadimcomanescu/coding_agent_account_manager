@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/vaulttransfer"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
@@ -63,6 +65,44 @@ func ValidateManifest(m *ManifestV1) error {
 	if err := validateChecksumInfo(&m.Checksums); err != nil {
 		return err
 	}
+	providers := make(map[string]bool)
+	for provider, profiles := range m.Contents.Vault.Profiles {
+		if authfile.IsPrivateVaultEntry(provider) {
+			return fmt.Errorf("private vault recovery directories cannot be imported as providers")
+		}
+		if err := vaulttransfer.ValidatePathSegment(provider); err != nil {
+			return fmt.Errorf("invalid vault provider %q: %w", provider, err)
+		}
+		key := strings.ToLower(provider)
+		if providers[key] {
+			return fmt.Errorf("duplicate vault provider %q", provider)
+		}
+		providers[key] = true
+		seen := make(map[string]bool)
+		for _, profile := range profiles {
+			if authfile.IsPrivateVaultEntry(profile) {
+				return fmt.Errorf("private vault recovery directories cannot be imported as profiles")
+			}
+			if err := vaulttransfer.ValidatePathSegment(profile); err != nil {
+				return fmt.Errorf("invalid vault profile %q: %w", profile, err)
+			}
+			key := strings.ToLower(profile)
+			if seen[key] {
+				return fmt.Errorf("duplicate vault profile %q for %s", profile, provider)
+			}
+			seen[key] = true
+		}
+	}
+	for _, content := range []OptionalContent{m.Contents.Config, m.Contents.Projects, m.Contents.Health, m.Contents.Database, m.Contents.SyncConfig} {
+		if content.Included {
+			if name := strings.TrimSuffix(content.Path, "/"); strings.EqualFold(name, ManifestFileName) || strings.EqualFold(name, EncryptionMarkerFile) {
+				return fmt.Errorf("reserved bundle metadata cannot be restored as content: %s", content.Path)
+			}
+			if err := vaulttransfer.ValidateRelativePath(strings.TrimSuffix(content.Path, "/")); err != nil {
+				return fmt.Errorf("invalid optional content path %q: %w", content.Path, err)
+			}
+		}
+	}
 
 	return nil
 }
@@ -108,6 +148,11 @@ func validateSourceInfo(s *SourceInfo) error {
 
 // validateChecksumInfo validates the checksum information.
 func validateChecksumInfo(c *ChecksumInfo) error {
+	for path := range c.Files {
+		if err := vaulttransfer.ValidateRelativePath(strings.TrimSuffix(path, "/")); err != nil {
+			return fmt.Errorf("invalid checksum path %q: %w", path, err)
+		}
+	}
 	validAlgorithms := map[string]bool{
 		"sha256": true,
 		"sha512": true,
@@ -157,28 +202,13 @@ func isHexChar(r rune) bool {
 // ValidateManifestPath checks that a path from the manifest is safe and stays
 // within the bundle directory. Prevents path traversal attacks.
 func ValidateManifestPath(basePath, relPath string) (string, error) {
-	if relPath == "" {
-		return "", &ValidationError{Message: "path is empty"}
+	if err := vaulttransfer.ValidateRelativePath(strings.TrimSuffix(relPath, "/")); err != nil {
+		return "", err
 	}
-
-	// Reject absolute paths
-	if filepath.IsAbs(relPath) {
-		return "", &ValidationError{
-			Field:   relPath,
-			Message: "absolute paths are not allowed in manifest",
-		}
-	}
-
-	// Reject paths that attempt traversal
-	if strings.Contains(relPath, "..") {
-		return "", &ValidationError{
-			Field:   relPath,
-			Message: "path traversal not allowed in manifest",
-		}
-	}
+	relPath = strings.TrimSuffix(relPath, "/")
 
 	// Join and clean the path
-	fullPath := filepath.Join(basePath, relPath)
+	fullPath := filepath.Join(basePath, filepath.FromSlash(relPath))
 
 	// Verify the resolved path is within basePath
 	cleanBase := filepath.Clean(basePath)
@@ -193,6 +223,21 @@ func ValidateManifestPath(basePath, relPath string) (string, error) {
 		}
 	}
 
+	// The lexical check alone does not detect a symlink inside the root.
+	current := basePath
+	for _, part := range strings.Split(relPath, "/") {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("symlink in bundle path: %s", current)
+		}
+	}
 	return fullPath, nil
 }
 

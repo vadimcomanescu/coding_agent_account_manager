@@ -208,10 +208,23 @@ type SubscriptionConfig struct {
 
 // DaemonConfig holds daemon-specific settings.
 type DaemonConfig struct {
-	AuthPool         AuthPoolConfig `yaml:"auth_pool"`
-	CheckInterval    Duration       `yaml:"check_interval"`
-	RefreshThreshold Duration       `yaml:"refresh_threshold"`
-	Verbose          bool           `yaml:"verbose"`
+	AuthPool         AuthPoolConfig    `yaml:"auth_pool"`
+	CheckInterval    Duration          `yaml:"check_interval"`
+	RefreshThreshold Duration          `yaml:"refresh_threshold"`
+	Verbose          bool              `yaml:"verbose"`
+	UpdateCheck      UpdateCheckConfig `yaml:"update_check"`
+}
+
+// UpdateCheckConfig schedules release checks in the daemon. A check only
+// announces a new version through the configured alerts; nothing is
+// installed without 'caam update'.
+type UpdateCheckConfig struct {
+	// Enabled turns the checks on. Default: false (opt-in).
+	Enabled bool `yaml:"enabled"`
+	// Interval is the time between checks. Default: 24h; minimum 1h.
+	Interval Duration `yaml:"interval"`
+	// Channel is "stable" (default) or "beta".
+	Channel string `yaml:"channel"`
 }
 
 // AuthPoolConfig holds auth pool settings.
@@ -445,6 +458,11 @@ func DefaultSPMConfig() *SPMConfig {
 			CheckInterval:    Duration(5 * time.Minute),
 			RefreshThreshold: Duration(30 * time.Minute),
 			Verbose:          false,
+			UpdateCheck: UpdateCheckConfig{
+				Enabled:  false, // Opt-in
+				Interval: Duration(24 * time.Hour),
+				Channel:  "stable",
+			},
 		},
 		TUI: TUIConfig{
 			Theme:         "auto",
@@ -487,7 +505,14 @@ func LoadSPMConfig() (*SPMConfig, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return DefaultSPMConfig(), nil
+			// No config file: defaults, but environment overrides
+			// (NO_TUI, CAAM_TUI_*, ...) still apply.
+			config := DefaultSPMConfig()
+			config.ApplyEnvOverrides()
+			if err := config.Validate(); err != nil {
+				return nil, fmt.Errorf("invalid SPM config: %w", err)
+			}
+			return config, nil
 		}
 		return nil, fmt.Errorf("read SPM config: %w", err)
 	}
@@ -660,6 +685,14 @@ func (c *SPMConfig) Validate() error {
 	}
 	if c.Daemon.AuthPool.MaxRefreshRetries < 0 {
 		return fmt.Errorf("daemon.auth_pool.max_refresh_retries cannot be negative")
+	}
+	if iv := c.Daemon.UpdateCheck.Interval.Duration(); iv != 0 && iv < time.Hour {
+		return fmt.Errorf("daemon.update_check.interval must be at least 1h")
+	}
+	switch c.Daemon.UpdateCheck.Channel {
+	case "", "stable", "beta":
+	default:
+		return fmt.Errorf("daemon.update_check.channel must be stable or beta")
 	}
 
 	// Subscription validation

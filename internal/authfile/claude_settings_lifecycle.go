@@ -1,0 +1,382 @@
+package authfile
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/claudesettings"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+)
+
+// All vault callers (CLI, robot, API, TUI, wrap, workspace and smart runner)
+// resolve the same policy here, rather than opting into it at each call site.
+func claudeSettingsPolicy() (claudesettings.Policy, error) {
+	return claudesettings.LoadPolicy()
+}
+
+func isClaudeSettingsDocument(tool, path string) bool {
+	return isClaudeUserSettings(tool, path) || (tool == "claude" && filepath.Base(path) == ".claude.json")
+}
+
+type claudeSettingsSnapshot struct {
+	data    []byte
+	hasAuth bool
+}
+
+func readClaudeSettingsSnapshot(path string, policy claudesettings.Policy) (claudeSettingsSnapshot, error) {
+	data, err := claudesettings.Read(path)
+	if err != nil {
+		return claudeSettingsSnapshot{}, err
+	}
+	_, err = claudesettings.Identity(data, policy)
+	if filepath.Base(path) == ".claude.json" {
+		_, err = claudesettings.LegacyIdentity(data)
+	}
+	if err != nil {
+		return claudeSettingsSnapshot{}, fmt.Errorf("parse Claude settings %s: %w", path, err)
+	}
+	hasAuth, err := ClaudeCredentialMaterial(data, filepath.Base(path))
+	if err != nil {
+		return claudeSettingsSnapshot{}, fmt.Errorf("parse Claude settings %s: %w", path, err)
+	}
+	return claudeSettingsSnapshot{data: data, hasAuth: hasAuth}, nil
+}
+
+// readClaudeSettingsForBackup classifies every Claude source, including absence,
+// before Backup changes the vault. Otherwise updating an OAuth profile after
+// switching it to helper/env auth would retain its obsolete OAuth snapshots.
+// Mixed settings are validated before touching the keychain mirror. The mirror
+// is pulled before raw credentials are captured, so keychain-only logins are
+// never mistaken for an absent source and removed from an existing backup.
+func readClaudeSettingsForBackup(fileSet AuthFileSet) (map[string]claudeSettingsSnapshot, error) {
+	if fileSet.Tool != "claude" {
+		return nil, nil
+	}
+	policy, err := claudeSettingsPolicy()
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]claudeSettingsSnapshot)
+	for _, spec := range fileSet.Files {
+		if !isClaudeSettingsDocument(fileSet.Tool, spec.Path) {
+			continue
+		}
+		snapshot, err := readClaudeSettingsSnapshot(spec.Path, policy)
+		if err != nil {
+			return nil, err
+		}
+		result[spec.Path] = snapshot
+	}
+	if err := pullClaudeKeychain(fileSet); err != nil {
+		return nil, err
+	}
+	for _, spec := range fileSet.Files {
+		filename := filepath.Base(spec.Path)
+		var fields []string
+		switch {
+		case filename == claudeCredentialsFile || filename == "auth.json":
+			// Validate the complete raw credential, not just its access token.
+		case isClaudeDesktopConfig(fileSet.Tool, spec.Path):
+			fields = claudeDesktopTokenKeys
+		default:
+			continue
+		}
+		data, err := readClaudeBackupSource(spec.Path, fields)
+		if err != nil {
+			return nil, fmt.Errorf("%w: capture Claude backup source %s: %w", ErrInvalidCredentials, spec.Path, err)
+		}
+		hasAuth, err := ClaudeCredentialMaterial(data, filename)
+		if err != nil {
+			return nil, fmt.Errorf("validate Claude backup source %s: %w", spec.Path, err)
+		}
+		if data != nil && !hasAuth {
+			return nil, fmt.Errorf("%w: %s contains no access credential", ErrNoCredentials, spec.Path)
+		}
+		if fields == nil && data != nil {
+			// Existing raw sources retain Backup's verbatim copy path, including
+			// refreshed keychain bytes. Only their absence needs a new plan.
+			continue
+		}
+		// A nil snapshot deliberately removes the previous vault file through
+		// Backup's existing snapshot branch, rather than skipping that file.
+		result[spec.Path] = claudeSettingsSnapshot{data: data, hasAuth: hasAuth}
+	}
+	return result, nil
+}
+
+type claudeSettingsRestore struct {
+	// All planned files share one batch; hasAuth remains specific to this file
+	// for Restore's required/optional-source accounting.
+	update  interface{ Apply() error }
+	hasAuth bool
+}
+
+// resolveLiveParent follows symlinks in the directory part of one of the
+// host's live Claude paths. The user's own ~/.claude may be a symlink (GNU
+// stow, a dotfiles checkout), which v0.1.22 restored through (#120). The
+// private-path checks stay strict for vault profiles and still see the final
+// file itself, so a symlinked credential file is still refused.
+func resolveLiveParent(path string) string {
+	dir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		return path
+	}
+	return filepath.Join(dir, filepath.Base(path))
+}
+
+// prepareClaudeSettingsRestore runs before credentials or keychain mirrors are
+// changed. Both present and absent raw credentials participate in the same
+// recoverable batch as mixed settings and Desktop caches. Source generations,
+// including the identity used by the existing freshness guard, stay captured.
+func prepareClaudeSettingsRestore(fileSet AuthFileSet, profileDir string) (map[string]claudeSettingsRestore, error) {
+	return prepareClaudeSettingsRestoreIdentity(fileSet, profileDir, nil, nil)
+}
+
+func prepareClaudeSettingsRestoreIdentity(fileSet AuthFileSet, profileDir string, selected, live *switchState) (map[string]claudeSettingsRestore, error) {
+	if fileSet.Tool != "claude" {
+		return nil, nil
+	}
+	policy, err := claudeSettingsPolicy()
+	if err != nil {
+		return nil, err
+	}
+	identitySources := make(map[string][]byte)
+	liveState := claudeFileSetPath(fileSet, claudeSettingsFile)
+	if liveState != "" {
+		// Keyed like the batch destinations, which resolve parent symlinks.
+		liveState = resolveLiveParent(liveState)
+	}
+	identityPaths := []string{liveState, filepath.Join(profileDir, claudeSettingsFile), filepath.Join(profileDir, "meta.json"), filepath.Join(profileDir, identity.ClaudeIdentityCacheFile)}
+	if credential := claudeFileSetPath(fileSet, claudeCredentialsFile); credential != "" {
+		identityPaths = append(identityPaths, filepath.Join(filepath.Dir(resolveLiveParent(credential)), identity.ClaudeIdentityCacheFile))
+	}
+	for _, path := range identityPaths {
+		if path == "" {
+			continue
+		}
+		data, err := claudesettings.Read(path)
+		if err != nil {
+			return nil, fmt.Errorf("capture Claude restore identity: %w", err)
+		}
+		identitySources[path] = data
+	}
+	// The cached-proof freshness check is read-only; this view never creates
+	// or modifies any vault directory.
+	identityVault := NewVault(filepath.Dir(filepath.Dir(profileDir)))
+	var result map[string]claudeSettingsRestore
+	for _, spec := range fileSet.Files {
+		filename := filepath.Base(spec.Path)
+		snapshotPath := filepath.Join(profileDir, filename)
+		livePath := resolveLiveParent(spec.Path)
+		var plan claudeSettingsRestore
+		switch {
+		case isClaudeSettingsDocument(fileSet.Tool, spec.Path):
+			prepare := claudesettings.PrepareRestore
+			if filename == ".claude.json" {
+				prepare = claudesettings.PrepareLegacyRestore
+			}
+			var update *claudesettings.Update
+			var err error
+			if filename == claudeSettingsFile && selected != nil && selected.credentialName == claudeCredentialsFile {
+				update, err = claudesettings.PrepareLegacyRestoreAccount(snapshotPath, livePath, policy, claudeOAuthAccount(selected.claudeIdentity))
+			} else {
+				update, err = prepare(snapshotPath, livePath, policy)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("prepare Claude settings restore: %w", err)
+			}
+			snapshot, err := readClaudeSettingsSnapshot(snapshotPath, policy)
+			if err != nil {
+				return nil, err
+			}
+			plan = claudeSettingsRestore{update: update, hasAuth: snapshot.hasAuth}
+		case filename == claudeCredentialsFile || filename == "auth.json":
+			mirror := claudeRetirementMirror(fileSet, spec.Path)
+			retirement, err := prepareClaudeCredentialRetirement(snapshotPath, livePath, mirror)
+			if err != nil {
+				return nil, fmt.Errorf("prepare Claude credential retirement: %w", err)
+			}
+			if retirement != nil {
+				plan.update = retirement
+				break
+			}
+			var keepLive func() bool
+			if filename == claudeCredentialsFile {
+				keepLive = func() bool {
+					if selected != nil && live != nil {
+						return live.sameAccount(*selected) && live.complete &&
+							!selected.freshness.IsZero() && live.freshness.After(selected.freshness)
+					}
+					return identityVault.claudeLiveIsNewer(livePath, snapshotPath)
+				}
+			}
+			replacement, err := prepareClaudeCredentialRestore(snapshotPath, livePath, identitySources, mirror, keepLive)
+			if err != nil {
+				return nil, fmt.Errorf("prepare Claude credential replacement: %w", err)
+			}
+			if selected != nil && filename == selected.credentialName && !bytes.Equal(replacement.target, selected.credential) {
+				return nil, fmt.Errorf("claude snapshot changed after identity verification")
+			}
+			hasAuth, err := ClaudeCredentialMaterial(replacement.target, filename)
+			if err != nil {
+				return nil, fmt.Errorf("%w: Claude credential snapshot %s: %v", ErrInvalidCredentials, snapshotPath, err)
+			}
+			if !hasAuth {
+				return nil, fmt.Errorf("%w: Claude credential snapshot %s contains no access credential", ErrNoCredentials, snapshotPath)
+			}
+			plan = claudeSettingsRestore{update: replacement, hasAuth: true}
+		case isClaudeDesktopConfig(fileSet.Tool, spec.Path):
+			update, err := claudesettings.PrepareFieldsRestore(snapshotPath, livePath, claudeDesktopTokenKeys)
+			if err != nil {
+				return nil, fmt.Errorf("prepare Claude Desktop cache restore: %w", err)
+			}
+			_, hasAuth, err := claudeDesktopTokenCache(snapshotPath)
+			if err != nil {
+				return nil, err
+			}
+			plan = claudeSettingsRestore{update: update, hasAuth: hasAuth}
+		default:
+			continue
+		}
+		if result == nil {
+			result = make(map[string]claudeSettingsRestore)
+		}
+		result[spec.Path] = plan
+	}
+	if len(result) == 0 {
+		return result, nil
+	}
+
+	// Do not scrub the outgoing account for an empty/incomplete target. Shared
+	// policy alone is not an optional-only authentication artifact.
+	required, optional := false, false
+	var missingRequired string
+	for _, spec := range fileSet.Files {
+		path := filepath.Join(profileDir, filepath.Base(spec.Path))
+		info, err := os.Stat(path)
+		if os.IsNotExist(err) {
+			if spec.Required && missingRequired == "" {
+				missingRequired = path
+			}
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat snapshot %s: %w", path, err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("snapshot is not a regular file: %s", path)
+		}
+		if plan, ok := result[spec.Path]; ok && !plan.hasAuth {
+			if spec.Required && missingRequired == "" {
+				missingRequired = path
+			}
+			continue
+		}
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			if _, ok, err := claudeDesktopTokenCache(path); err != nil {
+				return nil, err
+			} else if !ok {
+				continue
+			}
+		}
+		if spec.Required {
+			required = true
+		} else {
+			optional = true
+		}
+	}
+	if missingRequired != "" && !(fileSet.AllowOptionalOnly && !required && optional) {
+		return nil, fmt.Errorf("required backup not found: %s", missingRequired)
+	}
+	if !required && !optional {
+		return nil, fmt.Errorf("no auth files restored for %s", fileSet.Tool)
+	}
+	// Restore visits plans in file-set order. Stage every participant once,
+	// and publish the authoritative keychain while recovery is still possible.
+	authority, err := prepareClaudeKeychainPublication(fileSet)
+	if err != nil {
+		return nil, err
+	}
+	batch := &claudeRestoreBatch{authority: authority}
+	if selected != nil && selected.claudeIdentity != nil {
+		credential := resolveLiveParent(claudeFileSetPath(fileSet, claudeCredentialsFile))
+		cachePath := filepath.Join(filepath.Dir(credential), identity.ClaudeIdentityCacheFile)
+		update, err := claudesettings.PrepareIdentityCache(filepath.Join(profileDir, claudeCredentialsFile), credential, cachePath, selected.claudeIdentity)
+		if err != nil {
+			return nil, fmt.Errorf("prepare Claude identity cache: %w", err)
+		}
+		batch.updates = append(batch.updates, update)
+	}
+	for _, spec := range fileSet.Files {
+		plan, ok := result[spec.Path]
+		if !ok {
+			continue
+		}
+		switch update := plan.update.(type) {
+		case *claudesettings.Update:
+			batch.updates = append(batch.updates, update)
+		case *claudeCredentialRestore:
+			batch.credentials = append(batch.credentials, update)
+		case *claudeCredentialRetirement:
+			batch.retirements = append(batch.retirements, update)
+		default:
+			return nil, fmt.Errorf("unsupported Claude restore plan for %s", spec.Path)
+		}
+		plan.update = batch
+		result[spec.Path] = plan
+	}
+	if selected != nil && selected.claudeIdentity != nil && !IsSystemProfile(filepath.Base(profileDir)) {
+		// Recovery snapshots are immutable evidence, even when activated.
+		// Persist a first-time verification with a user profile's generation so the
+		// next activation and post-restart matching can remain offline. These
+		// updates follow native publication preparation; all source documents
+		// are still guarded until the same recoverable batch installs them.
+		credential := filepath.Join(profileDir, claudeCredentialsFile)
+		metadata, err := claudesettings.PrepareIdentityCache(credential, credential, filepath.Join(profileDir, "meta.json"), selected.claudeIdentity)
+		if err != nil {
+			return nil, fmt.Errorf("prepare saved Claude identity: %w", err)
+		}
+		batch.updates = append(batch.updates, metadata)
+		snapshotState := filepath.Join(profileDir, claudeSettingsFile)
+		stateUpdate, err := claudesettings.PrepareLegacyRestoreAccount(snapshotState, snapshotState, policy, claudeOAuthAccount(selected.claudeIdentity))
+		if err != nil {
+			return nil, fmt.Errorf("prepare saved Claude account state: %w", err)
+		}
+		batch.updates = append(batch.updates, stateUpdate)
+	}
+	return result, nil
+}
+
+func clearClaudeUserSettings(fileSet AuthFileSet) error {
+	var updates []*claudesettings.Update
+	for _, spec := range fileSet.Files {
+		if !isClaudeSettingsDocument(fileSet.Tool, spec.Path) {
+			continue
+		}
+		policy, err := claudeSettingsPolicy()
+		if err != nil {
+			return err
+		}
+		prepare := claudesettings.PrepareClear
+		if filepath.Base(spec.Path) == ".claude.json" {
+			prepare = claudesettings.PrepareLegacyClear
+		}
+		update, err := prepare(spec.Path, policy)
+		if err != nil {
+			return fmt.Errorf("prepare Claude settings logout: %w", err)
+		}
+		updates = append(updates, update)
+	}
+	return claudesettings.ApplyUpdates(updates)
+}
+
+func hasClaudeUserSettingsAuth(path string) bool {
+	policy, err := claudeSettingsPolicy()
+	if err != nil {
+		return false
+	}
+	snapshot, err := readClaudeSettingsSnapshot(path, policy)
+	return err == nil && snapshot.hasAuth
+}

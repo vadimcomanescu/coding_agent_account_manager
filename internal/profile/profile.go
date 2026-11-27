@@ -9,6 +9,8 @@
 package profile
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,7 +20,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/passthrough"
 )
 
 // Profile represents a single account profile for an AI coding tool.
@@ -83,6 +87,11 @@ type Profile struct {
 	// Examples: "Work Google", "Personal GitHub"
 	// Used for display purposes only.
 	BrowserProfileName string `json:"browser_profile_name,omitempty"`
+
+	// Import source guards belong only to an unpublished preparation. They
+	// prevent a later validation step from publishing a snapshot after its
+	// native source has changed and are never persisted in profile.json.
+	importSourceGuards []func() error
 }
 
 // HomePath returns the pseudo-HOME directory for this profile.
@@ -101,6 +110,112 @@ func (p *Profile) XDGConfigPath() string {
 // Codex CLI specifically uses this for auth.json.
 func (p *Profile) CodexHomePath() string {
 	return filepath.Join(p.BasePath, "codex_home")
+}
+
+// ClaudeConfigDir selects the same native credential store for execution and
+// identity reporting. A present XDG store owns the profile even when its token
+// is expired or malformed; a newer ignored legacy token cannot replace it.
+func (p *Profile) ClaudeConfigDir() (string, error) {
+	xdg := filepath.Join(p.XDGConfigPath(), "claude-code")
+	legacy := filepath.Join(p.HomePath(), ".claude")
+	legacyState := filepath.Join(legacy, ".claude.json")
+	if _, err := os.Lstat(legacyState); os.IsNotExist(err) {
+		legacyState = filepath.Join(p.HomePath(), ".claude.json")
+	}
+	xdgAuth, err := ClaudeDirectoryHasAuth(xdg, filepath.Join(xdg, ".claude.json"))
+	if err != nil {
+		return "", err
+	}
+	legacyAuth, err := ClaudeDirectoryHasAuth(legacy, legacyState)
+	if err != nil {
+		return "", err
+	}
+	if xdgAuth && legacyAuth {
+		xdgID, legacyID := ClaudeDirectoryAccountID(xdg), ClaudeDirectoryAccountID(legacy)
+		if xdgID != "" && legacyID != "" && xdgID != legacyID {
+			return "", fmt.Errorf("claude profile contains conflicting accounts in legacy and XDG config directories")
+		}
+	}
+	if xdgAuth || !legacyAuth {
+		return xdg, nil
+	}
+	return legacy, nil
+}
+
+// ClaudeDirectoryHasAuth recognizes an installed authentication source rather
+// than an account label or workflow policy. Malformed selected documents retain
+// their authority so later validation cannot revive an ignored login.
+func ClaudeDirectoryHasAuth(dir, statePath string) (bool, error) {
+	for _, filename := range []string{".credentials.json", "auth.json"} {
+		if _, err := os.Lstat(filepath.Join(dir, filename)); err == nil {
+			return true, nil
+		} else if !os.IsNotExist(err) {
+			return false, fmt.Errorf("inspect Claude auth: %w", err)
+		}
+	}
+	for _, path := range []string{filepath.Join(dir, "settings.json"), statePath} {
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return true, nil
+		}
+		if err := authfile.ValidateCredentialData("claude", filepath.Base(path), data); !errors.Is(err, authfile.ErrNoCredentials) {
+			return true, nil
+		}
+		// Discovery intentionally ignores malformed mixed policy documents.
+		// They still select this native store. Only the no-credential case
+		// needs this syntax check; do not decode a large credential-bearing
+		// settings document twice just to decide its source directory.
+		trimmed := bytes.TrimSpace(data)
+		if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid(trimmed) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ClaudeDirectoryAccountID is only a conflict hint for legacy layouts. It may
+// be unverified and must never authorize account matching or credential writes.
+func ClaudeDirectoryAccountID(dir string) string {
+	if id, err := identity.ExtractFromClaudeCredentials(filepath.Join(dir, ".credentials.json")); err == nil {
+		return id.AccountID
+	}
+	path := filepath.Join(dir, ".claude.json")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) && filepath.Base(dir) == ".claude" {
+		data, err = os.ReadFile(filepath.Join(filepath.Dir(dir), ".claude.json"))
+	}
+	if err != nil {
+		return ""
+	}
+	var state struct {
+		Account struct {
+			ID string `json:"accountUuid"`
+		} `json:"oauthAccount"`
+	}
+	if json.Unmarshal(data, &state) != nil {
+		return ""
+	}
+	return strings.TrimSpace(state.Account.ID)
+}
+
+// GuardImportSource adds a read-only guard for the final directory publication.
+// Providers also check their captured sources while writing the prepared files.
+func (p *Profile) GuardImportSource(check func() error) {
+	if check != nil {
+		p.importSourceGuards = append(p.importSourceGuards, check)
+	}
+}
+
+func (p *Profile) checkImportSources() error {
+	for _, check := range p.importSourceGuards {
+		if err := check(); err != nil {
+			return fmt.Errorf("import source changed before publication: %w", err)
+		}
+	}
+	return nil
 }
 
 // EnsureLayout creates the profile's directory structure if any of it is
@@ -155,9 +270,9 @@ func (p *Profile) MetaPath() string {
 // Errors are ignored to keep identity extraction best-effort.
 //
 // The identity is always re-derived from the live auth files when they can be
-// read. A previously cached value persisted in profile.json is used only as a
-// fallback when live extraction yields nothing. Short-circuiting on a non-nil
-// cached identity (the old behavior) pinned stale plan_type/expires_at forever
+// read. Except for Claude's token-bound identity, a previously cached value in
+// profile.json is used only when live extraction yields nothing. Short-circuiting
+// on a non-nil cached identity pinned stale plan_type/expires_at forever
 // with no way to refresh them (issue #60): the health/status display kept
 // showing a warning for a credential that was in fact healthy.
 func (p *Profile) LoadIdentity() {
@@ -172,17 +287,22 @@ func (p *Profile) LoadIdentity() {
 			filepath.Join(p.CodexHomePath(), "auth.json"),
 		}, identity.ExtractFromCodexAuth)
 	case "claude":
-		// XDG-aware Claude Code builds honor the XDG_CONFIG_HOME /
-		// CLAUDE_CONFIG_DIR the profile env sets and write .credentials.json
-		// under xdg_config/claude-code/ instead of the legacy home/.claude/.
-		// Probe both, legacy first (issue #70) — but a stale or corrupt
-		// legacy file must not shadow fresh XDG-side credentials (issue
-		// #72), so prefer whichever candidate is unexpired, breaking ties
-		// on the fresher expiry.
-		id = loadIdentityPreferValid([]string{
-			filepath.Join(p.HomePath(), ".claude", ".credentials.json"),
-			filepath.Join(p.XDGConfigPath(), "claude-code", ".credentials.json"),
-		}, identity.ExtractFromClaudeCredentials)
+		// Stored profile.json labels are not bound to the current token. Do
+		// not revive them if the selected store is missing or unreadable.
+		p.Identity = nil
+		// The extractor below only understands modern credentials. When
+		// neither store has that file, scanning potentially large policy or
+		// helper documents cannot supply an identity and does no useful work.
+		_, xdgErr := os.Lstat(filepath.Join(p.XDGConfigPath(), "claude-code", ".credentials.json"))
+		_, legacyErr := os.Lstat(filepath.Join(p.HomePath(), ".claude", ".credentials.json"))
+		if os.IsNotExist(xdgErr) && os.IsNotExist(legacyErr) {
+			return
+		}
+		configDir, err := p.ClaudeConfigDir()
+		if err != nil {
+			return
+		}
+		id, _ = identity.ExtractFromClaudeCredentials(filepath.Join(configDir, ".credentials.json"))
 	case "gemini":
 		candidates := []string{
 			filepath.Join(p.HomePath(), ".gemini", "settings.json"),
@@ -204,6 +324,8 @@ func (p *Profile) LoadIdentity() {
 		id = loadIdentityFromPaths([]string{
 			filepath.Join(p.HomePath(), ".cursor", "cli-config.json"),
 			filepath.Join(p.HomePath(), ".cursor", "auth.json"),
+			// Linux cursor-agent keeps file-backed credentials under XDG config.
+			filepath.Join(p.HomePath(), ".config", "cursor", "auth.json"),
 		}, identity.ExtractFromGenericAuth)
 	}
 
@@ -243,43 +365,6 @@ func (p *Profile) CountAuthFiles() int {
 		})
 	}
 	return count
-}
-
-// loadIdentityPreferValid extracts an identity from every readable candidate
-// path and returns the best one: an unexpired identity beats an expired one,
-// within the same tier the fresher expiry wins (an identity without an expiry
-// ranks oldest), and remaining ties keep the earlier-listed path. Extraction
-// errors fall through to later candidates, matching loadIdentityFromPaths.
-// This keeps a stale legacy credential file from shadowing a fresh one while
-// preserving the listed precedence when both are equally usable (issue #72).
-func loadIdentityPreferValid(paths []string, extractor func(string) (*identity.Identity, error)) *identity.Identity {
-	var best *identity.Identity
-	now := time.Now()
-	for _, path := range paths {
-		if strings.TrimSpace(path) == "" {
-			continue
-		}
-		id, err := extractor(path)
-		if err != nil || id == nil {
-			continue
-		}
-		if best == nil || identityFresher(id, best, now) {
-			best = id
-		}
-	}
-	return best
-}
-
-// identityFresher reports whether a should be preferred over b. An identity
-// with a zero ExpiresAt counts as unexpired (no expiry info) but ranks oldest
-// for the freshness tie-break.
-func identityFresher(a, b *identity.Identity, now time.Time) bool {
-	aValid := a.ExpiresAt.IsZero() || !a.ExpiresAt.Before(now)
-	bValid := b.ExpiresAt.IsZero() || !b.ExpiresAt.Before(now)
-	if aValid != bValid {
-		return aValid
-	}
-	return a.ExpiresAt.After(b.ExpiresAt)
 }
 
 func loadIdentityFromPaths(paths []string, extractor func(string) (*identity.Identity, error)) *identity.Identity {
@@ -330,6 +415,33 @@ func (p *Profile) IsLocked() bool {
 // Lock creates a lock file to indicate the profile is in use.
 // Uses O_EXCL for atomic creation to prevent race conditions.
 func (p *Profile) Lock() error {
+	return p.lockWithMutation(false)
+}
+
+func (p *Profile) lockWithMutation(cleanStale bool) error {
+	// A previously loaded profile can be launched while a forced import is
+	// publishing its replacement. Share the store's mutation lock so that a
+	// runner cannot recreate the destination between the two directory moves.
+	base := filepath.Clean(p.BasePath)
+	if p.Provider != "" && filepath.Base(base) == p.Name && filepath.Base(filepath.Dir(base)) == p.Provider {
+		store := NewStore(filepath.Dir(filepath.Dir(base)))
+		unlock, err := store.lockMutation(p.Provider, p.Name)
+		if err != nil {
+			return err
+		}
+		defer unlock()
+	}
+	if cleanStale {
+		if _, err := p.CleanStaleLock(); err != nil {
+			return fmt.Errorf("check stale lock: %w", err)
+		}
+	}
+	return p.lockFile()
+}
+
+// lockFile is used when the caller already owns the store mutation lock, or
+// when locking a private staging directory outside the registered layout.
+func (p *Profile) lockFile() error {
 	lockPath := p.LockPath()
 
 	// Ensure the parent directory exists (for transient profiles that may not
@@ -511,29 +623,29 @@ func (p *Profile) CleanStaleLock() (bool, error) {
 // LockWithCleanup attempts to acquire a lock, cleaning stale locks first.
 // This is the recommended method for acquiring locks.
 func (p *Profile) LockWithCleanup() error {
-	// Try to clean any stale locks first
-	_, err := p.CleanStaleLock()
-	if err != nil {
-		return fmt.Errorf("check stale lock: %w", err)
-	}
-
-	// Now try to acquire the lock
-	return p.Lock()
+	return p.lockWithMutation(true)
 }
 
 // Save persists the profile metadata to disk.
 func (p *Profile) Save() error {
+	return p.saveAt(p.BasePath)
+}
+
+// saveAt lets a prepared profile record its final runtime path while its
+// metadata is still being written inside the unpublished staging directory.
+func (p *Profile) saveAt(basePath string) error {
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal profile: %w", err)
 	}
 
-	if err := os.MkdirAll(p.BasePath, 0700); err != nil {
+	if err := os.MkdirAll(basePath, 0700); err != nil {
 		return fmt.Errorf("create profile dir: %w", err)
 	}
 
 	// Atomic write: write to temp file then rename
-	tmpPath := p.MetaPath() + ".tmp"
+	metaPath := filepath.Join(basePath, "profile.json")
+	tmpPath := metaPath + ".tmp"
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("create temp profile file: %w", err)
@@ -556,7 +668,7 @@ func (p *Profile) Save() error {
 		return fmt.Errorf("close temp profile file: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, p.MetaPath()); err != nil {
+	if err := os.Rename(tmpPath, metaPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp profile file: %w", err)
 	}
@@ -642,6 +754,11 @@ func (s *Store) Create(provider, name, authMode string) (*Profile, error) {
 		return nil, err
 	}
 	authMode = strings.TrimSpace(authMode)
+	unlock, err := s.lockMutation(provider, name)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	profilePath := s.ProfilePath(provider, name)
 
@@ -674,6 +791,197 @@ func (s *Store) Create(provider, name, authMode string) (*Profile, error) {
 	return profile, nil
 }
 
+// ImportResult describes a published isolated profile. BackupPath is populated
+// when an existing profile was replaced; that complete directory is retained
+// outside the routable profile layout so a forced import never erases it.
+type ImportResult struct {
+	Profile    *Profile
+	BackupPath string
+}
+
+// lockMutation serializes creation, import, deletion and cloning of one name
+// across Store instances and processes. The lock lives outside that profile,
+// so publishing a prepared directory cannot replace the lock itself.
+func (s *Store) lockMutation(provider, name string) (func(), error) {
+	lock := &Profile{
+		Name:     provider + "/" + name,
+		BasePath: filepath.Join(s.basePath, ".imports", "locks", provider, name),
+	}
+	if err := lock.LockWithCleanup(); err != nil {
+		return nil, fmt.Errorf("profile %s/%s is being modified: %w", provider, name, err)
+	}
+	owned, err := os.Lstat(lock.LockPath())
+	if err != nil {
+		return nil, fmt.Errorf("inspect mutation lock: %w", err)
+	}
+	return func() { unlockImportedProfile(lock, owned) }, nil
+}
+
+func unlockImportedProfile(p *Profile, owned os.FileInfo) {
+	// A concurrent directory replacement must never make cleanup remove a
+	// different process's lock. Rename preserves the identity of our lock.
+	if current, err := os.Lstat(p.LockPath()); err == nil && os.SameFile(owned, current) {
+		_ = p.Unlock()
+	}
+}
+
+// Import prepares and validates a new isolated profile before publishing it.
+// The callback must write only into the supplied profile and reject unusable
+// credentials. Existing profiles remain in place throughout preparation, and
+// an in-use profile cannot be replaced. A successful forced replacement keeps
+// the complete previous directory; a failed publish restores it.
+func (s *Store) Import(ctx context.Context, provider, name, authMode string, force bool, prepare func(*Profile) error) (*ImportResult, error) {
+	if s == nil || strings.TrimSpace(s.basePath) == "" {
+		return nil, fmt.Errorf("profile store base path is empty")
+	}
+	if prepare == nil {
+		return nil, fmt.Errorf("profile import requires preparation and validation")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var err error
+	provider, err = validateStoreSegment("provider", provider)
+	if err != nil {
+		return nil, err
+	}
+	name, err = validateStoreSegment("name", name)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := s.lockMutation(provider, name)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	target, err := filepath.Abs(s.ProfilePath(provider, name))
+	if err != nil {
+		return nil, err
+	}
+	parent := filepath.Dir(target)
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return nil, fmt.Errorf("create provider directory: %w", err)
+	}
+	parentInfo, err := os.Lstat(parent)
+	if err != nil || !parentInfo.IsDir() {
+		return nil, fmt.Errorf("provider directory must be a private directory")
+	}
+	previousInfo, err := os.Lstat(target)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspect existing profile: %w", err)
+	}
+	var previousLock *Profile
+	if err == nil {
+		if !force {
+			return nil, fmt.Errorf("profile %s/%s already exists (use --force to overwrite)", provider, name)
+		}
+		if !previousInfo.IsDir() {
+			return nil, fmt.Errorf("existing profile must be a private directory")
+		}
+		previousLock = &Profile{Name: name, Provider: provider, BasePath: target}
+		if err := previousLock.lockFile(); err != nil {
+			return nil, fmt.Errorf("cannot replace profile in use: %w", err)
+		}
+		owned, err := os.Lstat(previousLock.LockPath())
+		if err != nil {
+			return nil, fmt.Errorf("inspect existing profile lock: %w", err)
+		}
+		defer func() { unlockImportedProfile(previousLock, owned) }()
+	}
+
+	// Neither List nor ListAll can see a profile.json at this nesting level.
+	// Keeping staging on the store filesystem also permits directory renames.
+	transactions, err := filepath.Abs(filepath.Join(s.basePath, ".imports"))
+	if err != nil {
+		return nil, err
+	}
+	work, err := os.MkdirTemp(transactions, provider+"-"+name+"-")
+	if err != nil {
+		return nil, fmt.Errorf("create import staging directory: %w", err)
+	}
+	retainPrevious := false
+	defer func() {
+		if !retainPrevious {
+			_ = os.RemoveAll(work)
+		}
+	}()
+	staging := filepath.Join(work, "prepared")
+	prepared := &Profile{
+		Name: name, Provider: provider, AuthMode: strings.TrimSpace(authMode),
+		BasePath: staging, CreatedAt: time.Now(), Metadata: make(map[string]string),
+	}
+	if err := prepared.EnsureLayout(); err != nil {
+		return nil, fmt.Errorf("prepare profile layout: %w", err)
+	}
+	if err := prepare(prepared); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if prepared.BasePath != staging || prepared.Name != name || prepared.Provider != provider {
+		return nil, fmt.Errorf("profile identity or staging path changed during import")
+	}
+	prepared.LoadIdentity()
+	// Block a runner until publication and lock cleanup are both complete.
+	preparedLock := &Profile{Name: name, Provider: provider, BasePath: staging}
+	if err := preparedLock.lockFile(); err != nil {
+		return nil, fmt.Errorf("lock prepared profile: %w", err)
+	}
+	owned, err := os.Lstat(preparedLock.LockPath())
+	if err != nil {
+		return nil, fmt.Errorf("inspect prepared profile lock: %w", err)
+	}
+	defer func() { unlockImportedProfile(preparedLock, owned) }()
+	prepared.BasePath = target
+	if err := prepared.saveAt(staging); err != nil {
+		return nil, fmt.Errorf("save prepared profile: %w", err)
+	}
+
+	currentParent, err := os.Lstat(parent)
+	if err != nil || !os.SameFile(parentInfo, currentParent) {
+		return nil, fmt.Errorf("provider directory changed during import; retry")
+	}
+	current, err := os.Lstat(target)
+	if previousInfo == nil {
+		if err == nil || !os.IsNotExist(err) {
+			return nil, fmt.Errorf("profile destination changed during import; retry")
+		}
+	} else if err != nil || !os.SameFile(previousInfo, current) {
+		return nil, fmt.Errorf("existing profile changed during import; retry")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := prepared.checkImportSources(); err != nil {
+		return nil, err
+	}
+
+	result := &ImportResult{Profile: prepared}
+	if previousLock != nil {
+		result.BackupPath = filepath.Join(work, "previous")
+		if err := os.Rename(target, result.BackupPath); err != nil {
+			return nil, fmt.Errorf("preserve previous profile: %w", err)
+		}
+		retainPrevious = true
+		previousLock.BasePath = result.BackupPath
+	}
+	if err := os.Rename(staging, target); err != nil {
+		if previousLock != nil {
+			if restoreErr := os.Rename(result.BackupPath, target); restoreErr != nil {
+				return nil, fmt.Errorf("publish profile: %v; restore previous profile: %v; previous profile retained at %s", err, restoreErr, result.BackupPath)
+			}
+			previousLock.BasePath = target
+			retainPrevious = false
+		}
+		return nil, fmt.Errorf("publish imported profile: %w", err)
+	}
+	preparedLock.BasePath = target
+	prepared.importSourceGuards = nil
+	return result, nil
+}
+
 // Load retrieves a profile from disk.
 func (s *Store) Load(provider, name string) (*Profile, error) {
 	if s == nil || strings.TrimSpace(s.basePath) == "" {
@@ -695,7 +1003,7 @@ func (s *Store) Load(provider, name string) (*Profile, error) {
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("profile %s/%s not found", provider, name)
+			return nil, fmt.Errorf("profile %s/%s %w", provider, name, ErrNotFound)
 		}
 		return nil, fmt.Errorf("read profile: %w", err)
 	}
@@ -714,6 +1022,10 @@ func (s *Store) Load(provider, name string) (*Profile, error) {
 	return &profile, nil
 }
 
+// ErrNotFound is returned (wrapped) by Store.Load when no isolated profile
+// with that name exists.
+var ErrNotFound = errors.New("not found")
+
 // Delete removes a profile and all its data.
 func (s *Store) Delete(provider, name string) error {
 	if s == nil || strings.TrimSpace(s.basePath) == "" {
@@ -728,6 +1040,11 @@ func (s *Store) Delete(provider, name string) error {
 	if err != nil {
 		return err
 	}
+	unlock, err := s.lockMutation(provider, name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	profilePath := s.ProfilePath(provider, name)
 
@@ -844,6 +1161,13 @@ func (s *Store) Clone(provider, sourceName, targetName string, opts CloneOptions
 	if sourceName == targetName {
 		return nil, fmt.Errorf("source and target profile names cannot be the same")
 	}
+	// Hold the source stable while Import owns the destination transaction.
+	// Import acquires the target mutation lock itself.
+	unlock, err := s.lockMutation(provider, sourceName)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	// Load source profile
 	source, err := s.Load(provider, sourceName)
@@ -851,91 +1175,78 @@ func (s *Store) Clone(provider, sourceName, targetName string, opts CloneOptions
 		return nil, fmt.Errorf("load source profile: %w", err)
 	}
 
-	// Check if target exists
-	targetPath := s.ProfilePath(provider, targetName)
-	if _, err := os.Stat(targetPath); err == nil {
-		if !opts.Force {
-			return nil, fmt.Errorf("profile %s/%s already exists (use --force to overwrite)", provider, targetName)
+	sourcePath, err := filepath.Abs(s.ProfilePath(provider, sourceName))
+	if err != nil {
+		return nil, err
+	}
+	storedPath, err := filepath.Abs(source.BasePath)
+	if err != nil || storedPath != sourcePath {
+		return nil, fmt.Errorf("source profile path does not match its store location")
+	}
+	sourceInfo, err := os.Lstat(sourcePath)
+	if err != nil || !sourceInfo.IsDir() {
+		return nil, fmt.Errorf("source profile must be a private directory")
+	}
+	source.BasePath = sourcePath
+	if opts.WithAuth {
+		if err := source.lockFile(); err != nil {
+			return nil, fmt.Errorf("cannot clone credentials from a profile in use: %w", err)
 		}
-		// Remove existing target
-		if err := os.RemoveAll(targetPath); err != nil {
-			return nil, fmt.Errorf("remove existing target: %w", err)
+		owned, err := os.Lstat(source.LockPath())
+		if err != nil {
+			return nil, fmt.Errorf("inspect source profile lock: %w", err)
 		}
+		defer unlockImportedProfile(source, owned)
 	}
 
-	// Create new profile with cloned settings
-	target := &Profile{
-		Name:               targetName,
-		Provider:           provider,
-		AuthMode:           source.AuthMode,
-		BasePath:           targetPath,
-		CreatedAt:          time.Now(),
-		BrowserCommand:     source.BrowserCommand,
-		BrowserProfileDir:  source.BrowserProfileDir,
-		BrowserProfileName: source.BrowserProfileName,
-	}
-
-	// Set description
-	if opts.Description != "" {
+	result, err := s.Import(context.Background(), provider, targetName, source.AuthMode, opts.Force, func(target *Profile) error {
+		target.BrowserCommand = source.BrowserCommand
+		target.BrowserProfileDir = source.BrowserProfileDir
+		target.BrowserProfileName = source.BrowserProfileName
 		target.Description = opts.Description
-	} else {
-		target.Description = fmt.Sprintf("Cloned from %s", sourceName)
-	}
-
-	// Copy metadata
-	if source.Metadata != nil {
-		target.Metadata = make(map[string]string)
+		if target.Description == "" {
+			target.Description = fmt.Sprintf("Cloned from %s", sourceName)
+		}
 		for k, v := range source.Metadata {
 			target.Metadata[k] = v
 		}
-	}
-
-	// Create directory structure
-	dirs := []string{
-		target.BasePath,
-		target.HomePath(),
-		target.XDGConfigPath(),
-		target.CodexHomePath(),
-	}
-	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return nil, fmt.Errorf("create directory %s: %w", dir, err)
+		if opts.WithAuth {
+			if err := copyAuthFiles(source, target); err != nil {
+				return fmt.Errorf("copy auth files: %w", err)
+			}
 		}
-	}
-
-	// Optionally copy auth files
-	if opts.WithAuth {
-		if err := copyAuthFiles(source, target); err != nil {
-			// Clean up on failure
-			os.RemoveAll(targetPath)
-			return nil, fmt.Errorf("copy auth files: %w", err)
+		current, err := os.Lstat(sourcePath)
+		if err != nil || !os.SameFile(sourceInfo, current) {
+			return fmt.Errorf("source profile changed during clone; retry")
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	// Save new profile
-	if err := target.Save(); err != nil {
-		os.RemoveAll(targetPath)
-		return nil, fmt.Errorf("save profile: %w", err)
-	}
-
-	return target, nil
+	return result.Profile, nil
 }
 
 // copyAuthFiles copies auth files from source to target profile.
 func copyAuthFiles(source, target *Profile) error {
 	// Copy home directory contents
-	if err := copyDir(source.HomePath(), target.HomePath()); err != nil {
+	if err := copyDir(source.HomePath(), target.HomePath(), "home"); err != nil {
 		return fmt.Errorf("copy home: %w", err)
 	}
 
 	// Copy xdg_config directory contents
-	if err := copyDir(source.XDGConfigPath(), target.XDGConfigPath()); err != nil {
+	if err := copyDir(source.XDGConfigPath(), target.XDGConfigPath(), "xdg_config"); err != nil {
 		return fmt.Errorf("copy xdg_config: %w", err)
 	}
 
 	// Copy codex_home directory contents
-	if err := copyDir(source.CodexHomePath(), target.CodexHomePath()); err != nil {
+	if err := copyDir(source.CodexHomePath(), target.CodexHomePath(), "codex_home"); err != nil {
 		return fmt.Errorf("copy codex_home: %w", err)
+	}
+	if source.Provider == "gemini" && source.AuthMode == "vertex-adc" {
+		if err := copyDir(filepath.Join(source.BasePath, "gcloud"), filepath.Join(target.BasePath, "gcloud"), "gcloud"); err != nil {
+			return fmt.Errorf("copy gcloud: %w", err)
+		}
 	}
 
 	return nil
@@ -949,23 +1260,29 @@ func copyAuthFiles(source, target *Profile) error {
 // lstat's the root, sees a symlink (not a directory), and returns immediately
 // without descending — which silently produced an empty clone (issue #60).
 // Resolving to the real path makes Walk traverse the actual tree.
-func copyDir(src, dst string) error {
-	info, err := os.Stat(src) // Stat (not Lstat) follows symlinks.
+func copyDir(src, dst, root string) error {
+	_, err := os.Lstat(src)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil // Source doesn't exist, nothing to copy.
 		}
 		return err
 	}
+	info, err := os.Stat(src)
+	if err != nil {
+		return err // A dangling root is not an absent optional directory.
+	}
 	if !info.IsDir() {
-		// src resolves to a non-directory (e.g. a dangling or file symlink);
-		// there is no directory tree to copy.
-		return nil
+		return fmt.Errorf("credential root is not a directory: %s", src)
 	}
 
 	// Resolve any symlinks in src so Walk traverses the real directory.
-	if resolved, rerr := filepath.EvalSymlinks(src); rerr == nil {
-		src = resolved
+	src, err = filepath.EvalSymlinks(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, 0700); err != nil {
+		return err
 	}
 
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
@@ -984,9 +1301,26 @@ func copyDir(src, dst string) error {
 		}
 
 		targetPath := filepath.Join(dst, rel)
+		if info.Mode()&os.ModeSymlink != 0 {
+			// Provider preparation recreates these ambient tooling links. Never
+			// copy shared SSH/cloud trees or preserve a provider credential link.
+			if clonePassthroughLink(root, filepath.ToSlash(rel)) {
+				return nil
+			}
+			info, err = os.Stat(path)
+			if err != nil {
+				return fmt.Errorf("resolve %s: %w", path, err)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("unsupported credential symlink: %s", path)
+			}
+		}
 
 		if info.IsDir() {
-			return os.MkdirAll(targetPath, info.Mode())
+			return os.MkdirAll(targetPath, 0700)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unsupported credential file: %s", path)
 		}
 
 		// Copy file
@@ -995,12 +1329,48 @@ func copyDir(src, dst string) error {
 			return fmt.Errorf("read %s: %w", path, err)
 		}
 
-		if err := os.WriteFile(targetPath, data, info.Mode()); err != nil {
+		if err := os.WriteFile(targetPath, data, 0600|info.Mode().Perm()&0100); err != nil {
 			return fmt.Errorf("write %s: %w", targetPath, err)
 		}
 
 		return nil
 	})
+}
+
+// clonePassthroughLink recognizes only the individual non-account links that
+// CAAM's provider preparation installs; their containing roots stay private.
+func clonePassthroughLink(root, rel string) bool {
+	if root == "home" {
+		for _, path := range passthrough.DefaultPassthroughs {
+			if rel == path {
+				return true
+			}
+		}
+		for _, prefix := range []string{".config/", ".local/share/", ".local/state/"} {
+			if name, ok := strings.CutPrefix(rel, prefix); ok && !strings.Contains(name, "/") {
+				return !passthrough.IsIsolatedXDGEntry(name)
+			}
+		}
+	}
+	if root == "xdg_config" && !strings.Contains(rel, "/") {
+		return !passthrough.IsIsolatedXDGEntry(rel)
+	}
+	asset := ""
+	switch root {
+	case "home":
+		if name, ok := strings.CutPrefix(rel, ".claude/"); ok {
+			asset = name
+		}
+	case "xdg_config":
+		if name, ok := strings.CutPrefix(rel, "claude-code/"); ok {
+			asset = name
+		}
+	}
+	switch asset {
+	case "skills", "plugins", "commands", "agents":
+		return true
+	}
+	return false
 }
 
 // Exists checks if a profile exists.

@@ -1,16 +1,95 @@
 package tui
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	claudeidentity "github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/refresh"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 )
+
+func TestCursorTUIHealthUsesCurrentCredential(t *testing.T) {
+	root := t.TempDir()
+	m := NewWithProviders([]string{"cursor"})
+	m.vaultPath = filepath.Join(root, "custom-vault")
+	m.healthStorage = health.NewStorage(filepath.Join(root, "metadata", "health.json"))
+	m.profiles["cursor"] = []Profile{{Name: "work"}}
+	m.detailPanel.SetSize(100, 50)
+	authPath := filepath.Join(m.vaultPath, "cursor", "work", "auth.json")
+	if err := os.MkdirAll(filepath.Dir(authPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		ttl        time.Duration
+		apiKey     string
+		wantStatus health.HealthStatus
+		wantText   string
+		wantLogin  bool
+	}{
+		{name: "long lead session", ttl: 5 * 24 * time.Hour, wantStatus: health.StatusWarning, wantText: "Login soon"},
+		{name: "expired session", ttl: -time.Hour, wantStatus: health.StatusCritical, wantText: "Login required", wantLogin: true},
+		{name: "API key replacement", ttl: -time.Hour, apiKey: "synthetic-key", wantStatus: health.StatusHealthy, wantText: "Auto-refresh"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(tc.ttl).Unix())))
+			data := []byte(fmt.Sprintf(`{"accessToken":%q,"apiKey":%q}`, "e30."+payload+".synthetic", tc.apiKey))
+			if err := os.WriteFile(authPath, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			info := m.buildProfileInfo("cursor", Profile{Name: "work"}, "")
+			if info.HealthStatus != tc.wantStatus || info.LoginRequired != tc.wantLogin || info.TokenRenewable != (tc.apiKey != "") {
+				t.Fatalf("profile info=%+v", info)
+			}
+			if got := formatTUIStatus(&info); !strings.Contains(got, tc.wantText) {
+				t.Errorf("status=%q, want %q", got, tc.wantText)
+			}
+			m.profilesPanel.SetProfiles([]ProfileInfo{info})
+			m.syncDetailPanel()
+			detail := m.detailPanel.profile
+			if detail == nil || detail.TokenRenewable != info.TokenRenewable || detail.LoginRequired != info.LoginRequired || detail.ReloginWarningLead != info.ReloginWarningLead {
+				t.Fatalf("detail lost credential semantics: %+v", detail)
+			}
+			view := ansi.Strip(m.detailPanel.View())
+			if tc.apiKey != "" {
+				if !strings.Contains(view, "Auto-refresh") || strings.Contains(view, "Expired") || strings.Contains(view, "Log in again") {
+					t.Errorf("renewable credential shown as expired: %s", view)
+				}
+			} else if !strings.Contains(view, "Log in again") || strings.Contains(view, "Login/refresh") {
+				t.Errorf("session advice missing or recommends refresh: %s", view)
+			}
+			updated, cmd := m.handleLoginProfile()
+			if cmd != nil {
+				t.Fatal("Cursor login advice scheduled an unsupported refresh")
+			}
+			message := updated.(Model).statusMsg
+			if tc.apiKey == "" && !strings.Contains(message, "cursor-agent login") {
+				t.Errorf("missing native login instructions: %q", message)
+			}
+			after, err := os.ReadFile(authPath)
+			if err != nil || !bytes.Equal(after, data) {
+				t.Fatalf("TUI health/action changed credentials: %v", err)
+			}
+		})
+	}
+	if _, err := os.Stat(m.healthStorage.Path()); !os.IsNotExist(err) {
+		t.Errorf("TUI health read created metadata: %v", err)
+	}
+}
 
 func TestNew(t *testing.T) {
 	m := New()
@@ -30,6 +109,141 @@ func TestNewWithProviders(t *testing.T) {
 	m := NewWithProviders(providers)
 	if len(m.providers) != 2 {
 		t.Errorf("expected 2 providers, got %d", len(m.providers))
+	}
+}
+
+func TestActivateCommandPreservesLiveLogin(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		owner      string
+		mode       string
+		malformed  bool
+		wantNamed  bool
+		wantBackup bool
+	}{
+		{name: "rotated named login", owner: "alice", wantNamed: true},
+		{name: "unmatched login", owner: "carol", wantBackup: true},
+		{name: "configured never", owner: "carol", mode: "never"},
+		{name: "configured always", owner: "alice", mode: "always", wantNamed: true, wantBackup: true},
+		{name: "malformed target", owner: "alice", malformed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			home := filepath.Join(root, "home")
+			t.Setenv("HOME", home)
+			t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+			t.Setenv("CLAUDE_CONFIG_DIR", "")
+			t.Setenv("CAAM_HOME", filepath.Join(root, "caam"))
+			t.Setenv("CAAM_KEYCHAIN", "0")
+			cfg := config.DefaultSPMConfig()
+			if tc.mode != "" {
+				cfg.Safety.AutoBackupBeforeSwitch = tc.mode
+			}
+			m := NewWithProvidersAndConfig([]string{"claude"}, cfg)
+			m.vaultPath = filepath.Join(root, "vault")
+			vault := authfile.NewVault(m.vaultPath)
+			credentials := func(token string, expiry int64) []byte {
+				return []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":%q,"refreshToken":%q,"expiresAt":%d}}`, token, "refresh-"+token, expiry))
+			}
+			identity := func(account string) []byte {
+				return []byte(fmt.Sprintf(`{"oauthAccount":{"accountUuid":%q,"emailAddress":%q},"userID":"shared-machine"}`, "id-"+account, account+"@example.com"))
+			}
+			oldAlice := credentials("alice-old", 2000000000000)
+			rotated := credentials(tc.owner+"-rotated", 2000003600000)
+			bob := credentials("bob", 2000007200000)
+			if tc.malformed {
+				bob = []byte(`{"claudeAiOauth":null}`)
+			}
+			for name, data := range map[string][]byte{"alice": oldAlice, "bob": bob} {
+				writeTUIActivationFile(t, vault.BackupPath("claude", name, ".credentials.json"), data)
+				writeTUIActivationFile(t, vault.BackupPath("claude", name, ".claude.json"), identity(name))
+				if name != "bob" || !tc.malformed {
+					writeTUIActivationBinding(t, vault.BackupPath("claude", name, "meta.json"), data, name)
+				}
+			}
+			livePath := filepath.Join(home, ".claude", ".credentials.json")
+			writeTUIActivationFile(t, livePath, rotated)
+			writeTUIActivationFile(t, filepath.Join(home, ".claude.json"), identity(tc.owner))
+			writeTUIActivationBinding(t, filepath.Join(filepath.Dir(livePath), claudeidentity.ClaudeIdentityCacheFile), rotated, tc.owner)
+
+			msg, ok := m.doActivateProfile("claude", "bob")().(activateResultMsg)
+			if !ok {
+				t.Fatal("activation returned unexpected message")
+			}
+			if (msg.err != nil) != tc.malformed {
+				t.Fatalf("activation error = %v, malformed=%v", msg.err, tc.malformed)
+			}
+			wantLive := bob
+			if tc.malformed {
+				wantLive = rotated
+			}
+			assertTUIActivationFile(t, livePath, wantLive)
+			wantAlice := oldAlice
+			if tc.wantNamed {
+				wantAlice = rotated
+			}
+			assertTUIActivationFile(t, vault.BackupPath("claude", "alice", ".credentials.json"), wantAlice)
+			assertTUIActivationFile(t, vault.BackupPath("claude", "bob", ".credentials.json"), bob)
+			profiles, err := vault.List("claude")
+			if err != nil {
+				t.Fatal(err)
+			}
+			backups := 0
+			for _, name := range profiles {
+				if authfile.IsSystemProfile(name) {
+					backups++
+					assertTUIActivationFile(t, vault.BackupPath("claude", name, ".credentials.json"), rotated)
+				}
+			}
+			if (backups == 1) != tc.wantBackup || backups > 1 {
+				t.Fatalf("backups = %d, want backup %v", backups, tc.wantBackup)
+			}
+			updated, _ := m.Update(msg)
+			if tc.malformed && strings.Contains(updated.(Model).statusMsg, "Activated") {
+				t.Fatal("failed activation was reported as successful")
+			}
+		})
+	}
+}
+
+func writeTUIActivationBinding(t *testing.T, path string, credentials []byte, account string) {
+	t.Helper()
+	fingerprint, err := claudeidentity.ClaudeCredentialFingerprint(credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Persist provider-confirmed ownership so the TUI's independently created
+	// Vault instance can recognize the same account after token rotation.
+	binding := &claudeidentity.ClaudeIdentityBinding{
+		Identity: claudeidentity.Identity{Provider: "claude", AccountID: "id-" + account,
+			OrganizationID: "organization-" + account, Email: account + "@example.com"},
+		CredentialFingerprint: fingerprint, VerifiedAt: time.Now().UTC(),
+	}
+	metadata, err := json.Marshal(map[string]any{"claude_identity": binding})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeTUIActivationFile(t, path, metadata)
+}
+
+func writeTUIActivationFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertTUIActivationFile(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Errorf("unexpected credential content at %s", path)
 	}
 }
 
@@ -634,6 +848,61 @@ func TestShowRefreshSuccess(t *testing.T) {
 	m.showRefreshSuccess("work@company.com", expiry)
 	if !strings.Contains(m.statusMsg, "Mar 15") || !strings.Contains(m.statusMsg, "14:30") {
 		t.Errorf("expected expiry time in status, got %q", m.statusMsg)
+	}
+}
+
+func TestRefreshResultDistinguishesSkipsFromFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		severity StatusSeverity
+		skipped  bool
+	}{
+		{
+			name:     "native managed credential",
+			err:      &refresh.UnsupportedError{Provider: "cursor", Reason: "session logins cannot refresh; use cursor-agent login"},
+			severity: StatusInfo,
+			skipped:  true,
+		},
+		{
+			name:     "newer live credential",
+			err:      &refresh.StaleCredentialError{Provider: "codex", Profile: "work"},
+			severity: StatusInfo,
+			skipped:  true,
+		},
+		{
+			name:     "provider failure",
+			err:      fmt.Errorf("refresh failed: token endpoint returned 503"),
+			severity: StatusError,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := New()
+			result, command := m.Update(refreshResultMsg{provider: "codex", profile: "work", err: tc.err})
+			updated := result.(Model)
+			if command != nil {
+				t.Fatal("an unsuccessful refresh scheduled a success reload")
+			}
+			if got := updated.statusMessageSeverity(); got != tc.severity {
+				t.Errorf("status severity = %v, want %v; message = %q", got, tc.severity, updated.statusMsg)
+			}
+			if strings.HasPrefix(updated.statusMsg, "Refresh skipped:") != tc.skipped || !strings.Contains(updated.statusMsg, tc.err.Error()) {
+				t.Errorf("status = %q, want original reason with skipped=%v", updated.statusMsg, tc.skipped)
+			}
+		})
+	}
+}
+
+func TestRefreshDeliveryWarningRetainsSuccessAndReloads(t *testing.T) {
+	m := New()
+	warning := &refresh.DeliveryError{Destinations: []string{"active codex login"}}
+	result, command := m.Update(refreshResultMsg{provider: "codex", profile: "work", err: warning})
+	updated := result.(Model)
+	if command == nil {
+		t.Fatal("successful vault renewal with delivery warning did not reload health")
+	}
+	if updated.statusMessageSeverity() == StatusError || !strings.Contains(updated.statusMsg, warning.Error()) {
+		t.Fatalf("delivery warning was shown as a failed renewal: %q", updated.statusMsg)
 	}
 }
 

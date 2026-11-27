@@ -1,9 +1,104 @@
 package health
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestCursorSessionHealthBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ttl  time.Duration
+		want HealthStatus
+	}{
+		{"outside lead", 7*24*time.Hour + time.Minute, StatusHealthy},
+		{"at lead", 7 * 24 * time.Hour, StatusWarning},
+		{"inside lead", 6 * 24 * time.Hour, StatusWarning},
+		{"critical", 10 * time.Minute, StatusCritical},
+		{"expiry boundary", 0, StatusCritical},
+		{"expired", -time.Hour, StatusCritical},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &ProfileHealth{TokenExpiresAt: time.Now().Add(tc.ttl), ReloginWarningLead: 7 * 24 * time.Hour, PlanType: "enterprise"}
+			if got := CalculateStatus(h); got != tc.want {
+				t.Fatalf("status = %v, want %v", got, tc.want)
+			}
+			signals := CredentialSignals(h, DefaultHealthConfig())
+			if signals.RefreshDue == nil || *signals.RefreshDue {
+				t.Fatal("session must never request refresh")
+			}
+			if signals.LoginRequired == nil || *signals.LoginRequired != (tc.ttl <= 0) {
+				t.Fatalf("login signal = %+v", signals)
+			}
+			if tc.want != StatusHealthy {
+				rec := FormatRecommendation("cursor", "work", h)
+				if !strings.Contains(rec, "caam login cursor work") || strings.Contains(rec, "caam refresh") {
+					t.Fatalf("recommendation = %s", rec)
+				}
+			}
+			h.TokenRenewable, h.SelfRefreshing = true, true
+			if got := CalculateStatus(h); got != StatusHealthy {
+				t.Fatalf("API key status = %v", got)
+			}
+			if rec := FormatRecommendation("cursor", "work", h); rec != "" {
+				t.Fatalf("API key recommendation = %s", rec)
+			}
+		})
+	}
+}
+
+func TestCursorReloginExpiryBoundaries(t *testing.T) {
+	now := time.Date(2030, 10, 6, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		ttl  time.Duration
+		want HealthStatus
+	}{
+		{"outside seven days", CursorReloginLead + time.Nanosecond, StatusHealthy},
+		{"exactly seven days", CursorReloginLead, StatusWarning},
+		{"inside seven days", CursorReloginLead - time.Nanosecond, StatusWarning},
+		{"one day", 24 * time.Hour, StatusWarning},
+		{"above critical boundary", 15*time.Minute + time.Nanosecond, StatusWarning},
+		{"critical boundary", 15 * time.Minute, StatusCritical},
+		{"just before expiry", time.Nanosecond, StatusCritical},
+		{"expiry instant", 0, StatusCritical},
+		{"expired", -time.Nanosecond, StatusCritical},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &ProfileHealth{TokenExpiresAt: now.Add(tc.ttl), ReloginWarningLead: CursorReloginLead, PlanType: "enterprise"}
+			status, _ := calculateHealthAt(h, DefaultHealthConfig(), now)
+			if status != tc.want {
+				t.Errorf("status = %v, want %v", status, tc.want)
+			}
+			signals := credentialSignalsAt(h, DefaultHealthConfig(), now)
+			checkBoolPtr(t, "refresh_due", signals.RefreshDue, ptr(false))
+			checkBoolPtr(t, "launch_usable", signals.LaunchUsable, ptr(tc.ttl > 0))
+			checkBoolPtr(t, "login_required", signals.LoginRequired, ptr(tc.ttl <= 0))
+		})
+	}
+
+	t.Run("configured longer warning still applies", func(t *testing.T) {
+		cfg := DefaultHealthConfig()
+		cfg.TokenExpiryWarningMinutes = 10 * 24 * 60
+		h := &ProfileHealth{TokenExpiresAt: now.Add(9 * 24 * time.Hour), ReloginWarningLead: CursorReloginLead}
+		if status, _ := calculateHealthAt(h, cfg, now); status != StatusWarning {
+			t.Errorf("status = %v, want warning inside configured ten-day window", status)
+		}
+	})
+	t.Run("lead only affects non-renewable login", func(t *testing.T) {
+		h := &ProfileHealth{TokenExpiresAt: now.Add(-time.Hour), ReloginWarningLead: CursorReloginLead, TokenRenewable: true, SelfRefreshing: true}
+		if status, _ := calculateHealthAt(h, DefaultHealthConfig(), now); status != StatusHealthy {
+			t.Errorf("API-key status = %v, want healthy", status)
+		}
+	})
+	t.Run("expired hard deadline survives cooldown", func(t *testing.T) {
+		h := &ProfileHealth{TokenExpiresAt: now, ReloginWarningLead: CursorReloginLead, RateLimitedUntil: now.Add(time.Hour)}
+		if status, _ := calculateHealthAt(h, DefaultHealthConfig(), now); status != StatusCritical {
+			t.Errorf("expired session status = %v, want critical even during cooldown", status)
+		}
+	})
+}
 
 func TestCalculateHealth(t *testing.T) {
 	now := time.Now()

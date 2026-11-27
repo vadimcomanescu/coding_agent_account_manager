@@ -35,8 +35,8 @@ type Signals struct {
 	// RefreshDue reports whether caam should renew this credential soon:
 	// the expiry is known, it is inside the warning window (or already past),
 	// and caam is the one that does the renewing. It is false for a
-	// self-refreshing credential (Claude), which caam must leave alone, and
-	// nil when no expiry could be determined.
+	// self-refreshing credential, which caam must leave alone, and nil when
+	// neither expiry nor self-refreshing behavior could be determined.
 	RefreshDue *bool `json:"refresh_due"`
 
 	// LaunchUsable reports whether a new session can start on this account
@@ -48,7 +48,7 @@ type Signals struct {
 	// LoginRequired reports whether a human must re-authenticate. It is true
 	// only for a credential whose expiry has passed AND that carries nothing
 	// to renew itself with; a lapsed but renewable access token is false. It
-	// is nil when no expiry could be determined.
+	// is nil when neither expiry nor renewability could be determined.
 	LoginRequired *bool `json:"login_required"`
 }
 
@@ -59,14 +59,38 @@ type Signals struct {
 // account start work" must not be told "no" by an error budget that decays on
 // its own.
 func CredentialSignals(h *ProfileHealth, config HealthConfig) Signals {
+	return credentialSignalsAt(h, config, time.Now())
+}
+
+func credentialSignalsAt(h *ProfileHealth, config HealthConfig, now time.Time) Signals {
 	var out Signals
 	if h == nil {
 		return out
 	}
-	now := time.Now()
 	rateLimited := h.RateLimited(now)
 
+	// The provider refused this very credential (issue #108). That outranks
+	// anything the file says: a revoked refresh token is still present, and
+	// the access token beside it may still be days from expiry. Nothing caam
+	// can refresh will fix it; a human has to log in again.
+	if h.ProviderRejected() {
+		out.RefreshDue = boolPtr(false)
+		out.LoginRequired = boolPtr(true)
+		out.LaunchUsable = boolPtr(false)
+		return out
+	}
+
 	if h.TokenExpiresAt.IsZero() {
+		if h.CredentialRenewable() {
+			// A stored Cursor API key can mint the access token even when
+			// one is absent. Do not carry forward a stale session deadline.
+			out.LoginRequired = boolPtr(false)
+			out.LaunchUsable = boolPtr(!rateLimited)
+			if h.SelfRefreshing {
+				out.RefreshDue = boolPtr(false)
+			}
+			return out
+		}
 		// No expiry evidence. A cooldown is still hard evidence that nothing
 		// can launch right now; everything else stays unknown.
 		if rateLimited {
@@ -75,7 +99,7 @@ func CredentialSignals(h *ProfileHealth, config HealthConfig) Signals {
 		return out
 	}
 
-	expired := h.TokenExpiresAt.Before(now)
+	expired := !h.TokenExpiresAt.After(now)
 	renewable := h.CredentialRenewable()
 
 	// Refresh scheduling. Two things make a refresh impossible rather than
