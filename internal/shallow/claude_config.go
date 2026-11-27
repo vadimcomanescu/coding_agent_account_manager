@@ -65,9 +65,15 @@ func (m *Manager) SyncClaudeConfig(name string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	settings, err := m.prepareClaudeSettings(home, policy)
+	linked, err := m.claudeSettingsLinkedToRealHome(home)
 	if err != nil {
 		return nil, err
+	}
+	var settings *claudesettings.Update
+	if !linked {
+		if settings, err = m.prepareClaudeSettings(home, policy); err != nil {
+			return nil, err
+		}
 	}
 	legacy, changed, err := m.prepareClaudeJSON(home, policy)
 	if err != nil {
@@ -80,10 +86,14 @@ func (m *Manager) SyncClaudeConfig(name string) ([]string, error) {
 	if err := m.applyClaudeIdentityRepairs(home, repairs); err != nil {
 		return nil, err
 	}
-	if err := claudesettings.ApplyUpdates([]*claudesettings.Update{settings, legacy}); err != nil {
+	updates := []*claudesettings.Update{legacy}
+	if settings != nil {
+		updates = append(updates, settings)
+	}
+	if err := claudesettings.ApplyUpdates(updates); err != nil {
 		return nil, fmt.Errorf("write private Claude configuration: %w", err)
 	}
-	if settings.Changed() {
+	if settings != nil && settings.Changed() {
 		changed = append(changed, ".claude/settings.json")
 	}
 	sort.Strings(changed)
@@ -118,10 +128,16 @@ func (m *Manager) EnsureClaudeSettingsPrivate(name string) error {
 	if err != nil {
 		return err
 	}
+	linked, err := m.claudeSettingsLinkedToRealHome(home)
+	if err != nil {
+		return err
+	}
 	var settings *claudesettings.Update
-	if account == "" {
+	switch {
+	case linked:
+	case account == "":
 		settings, err = m.prepareClaudeSettings(home, policy)
-	} else {
+	default:
 		settings, err = claudesettings.PreparePrivate(
 			path, sharedSettings, filepath.Join(m.realHome, ".claude", "settings.json"),
 		)
@@ -136,7 +152,11 @@ func (m *Manager) EnsureClaudeSettingsPrivate(name string) error {
 	if err := m.applyClaudeIdentityRepairs(home, repairs); err != nil {
 		return err
 	}
-	return claudesettings.ApplyUpdates([]*claudesettings.Update{settings, legacy})
+	updates := []*claudesettings.Update{legacy}
+	if settings != nil {
+		updates = append(updates, settings)
+	}
+	return claudesettings.ApplyUpdates(updates)
 }
 
 // ValidateClaudeConfigBoundary checks the files an exported Claude HOME will
@@ -174,12 +194,16 @@ func (m *Manager) ValidateClaudeConfigBoundary(name string) error {
 		}
 	}
 	sharedSettings, sharedLegacy := claudesettings.SharedPaths(m.realHome)
-	for _, document := range []struct {
-		path, shared, defaultShared string
-	}{
-		{filepath.Join(home, ".claude", "settings.json"), sharedSettings, filepath.Join(m.realHome, ".claude", "settings.json")},
-		{filepath.Join(home, ".claude.json"), sharedLegacy, filepath.Join(m.realHome, ".claude.json")},
-	} {
+	type document struct{ path, shared, defaultShared string }
+	documents := []document{{filepath.Join(home, ".claude.json"), sharedLegacy, filepath.Join(m.realHome, ".claude.json")}}
+	linked, err := m.claudeSettingsLinkedToRealHome(home)
+	if err != nil {
+		return refuse(err)
+	}
+	if !linked {
+		documents = append(documents, document{filepath.Join(home, ".claude", "settings.json"), sharedSettings, filepath.Join(m.realHome, ".claude", "settings.json")})
+	}
+	for _, document := range documents {
 		// Reuse the same private-file and JSON validation as --no-sync-config.
 		// PreparePrivate reads only this document, not shared policy contents;
 		// deliberately never apply the returned update on an export path.
@@ -200,6 +224,13 @@ func (m *Manager) writeClaudeSettings(home string, opts CreateOptions) error {
 	}
 	shared, _ := claudesettings.SharedPaths(m.realHome)
 	account := opts.ExtraSources[".claude/settings.json"]
+	if account == "" {
+		if err := m.linkClaudeSettingsToRealHome(home); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("link Claude settings to the real HOME: %w", err)
+		}
+	}
 	settings, err := claudesettings.PrepareImport(shared, account, filepath.Join(home, ".claude", "settings.json"), policy)
 	if err != nil {
 		return fmt.Errorf("prepare private Claude settings: %w", err)
@@ -266,6 +297,44 @@ func (m *Manager) claudeSettingsAccountPath(home string) (string, error) {
 		return "", fmt.Errorf("Claude settings must be a private regular file: %s", path)
 	}
 	return path, nil
+}
+
+// claudeSettingsLinkedToRealHome reports whether the profile's settings.json is
+// a link to the real HOME's settings. On this fork that link is kept: every
+// account then reads and writes one settings file, so a setting or plugin
+// changed in any session applies to all of them at once.
+func (m *Manager) claudeSettingsLinkedToRealHome(home string) (bool, error) {
+	path := filepath.Join(home, ".claude", "settings.json")
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	account, err := m.claudeSettingsAccountPath(home)
+	return err == nil && account == "", err
+}
+
+// linkClaudeSettingsToRealHome points a new profile's settings.json at the
+// shared settings (the real HOME's, or CLAUDE_CONFIG_DIR's when that is set),
+// the layout claudeSettingsLinkedToRealHome keeps.
+func (m *Manager) linkClaudeSettingsToRealHome(home string) error {
+	target, _ := claudesettings.SharedPaths(m.realHome)
+	if _, err := os.Stat(target); err != nil {
+		return err
+	}
+	path := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Symlink(target, path)
 }
 
 // prepareClaudeJSON uses the vault/isolated merger but keeps the shallow CLI's

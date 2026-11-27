@@ -430,9 +430,9 @@ func TestShallowSettingsRefreshPreservesSelectedAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	freshSettings := parseJSONObject(t, []byte(readFile(t, filepath.Join(fresh, ".claude", "settings.json"))))
-	if freshSettings["apiKeyHelper"] != nil || freshSettings["env"] != nil || freshSettings["permissions"] == nil {
-		t.Fatalf("new profile did not separate shared policy from host auth: %v", freshSettings)
+	// This fork links a new profile's settings to the shared settings file.
+	if target, err := os.Readlink(filepath.Join(fresh, ".claude", "settings.json")); err != nil || target != shared {
+		t.Fatalf("new profile settings do not link to the shared file: %q %v", target, err)
 	}
 	accountBody := `{"permissions":{"allow":["Bash(old)"]},"apiKeyHelper":"alice-helper","env":{"ANTHROPIC_API_KEY":"synthetic-alice"}}`
 	account := writeTempFile(t, "alice-settings.json", accountBody)
@@ -499,7 +499,9 @@ func TestShallowSettingsPolicyOverrides(t *testing.T) {
 	}
 }
 
-func TestShallowSettingsMigrateRecognizedSharedLinks(t *testing.T) {
+// This fork keeps a symlink to the shared settings, so every account reads one
+// file; a hardlink is still detached.
+func TestShallowSettingsKeepSharedSymlinksAndDetachHardlinks(t *testing.T) {
 	for _, kind := range []string{"symlink", "hardlink", "dangling"} {
 		t.Run(kind, func(t *testing.T) {
 			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -518,6 +520,9 @@ func TestShallowSettingsMigrateRecognizedSharedLinks(t *testing.T) {
 				}
 				writeFile(t, shared, body)
 			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
 			if kind == "hardlink" {
 				err = os.Link(shared, path)
 			} else {
@@ -528,6 +533,15 @@ func TestShallowSettingsMigrateRecognizedSharedLinks(t *testing.T) {
 			}
 			if err := mgr.EnsureClaudeSettingsPrivate("old-profile"); err != nil {
 				t.Fatal(err)
+			}
+			if kind != "hardlink" {
+				if _, err := mgr.SyncClaudeConfig("old-profile"); err != nil {
+					t.Fatal(err)
+				}
+				if target, err := os.Readlink(path); err != nil || target != shared {
+					t.Fatalf("shared settings link was not kept: %q %v", target, err)
+				}
+				return
 			}
 			private, err := os.Lstat(path)
 			if err != nil || !private.Mode().IsRegular() {

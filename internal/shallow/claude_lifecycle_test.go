@@ -275,6 +275,13 @@ func TestValidateClaudeConfigBoundaryRejectsUnsafeDocuments(t *testing.T) {
 				beforeProfile := snapshotClaudeLibraryTree(t, home)
 				beforeHost := snapshotClaudeLibraryTree(t, realHome)
 				err = mgr.ValidateClaudeConfigBoundary("alice")
+				if document == "settings.json" && shape == "shared symlink" {
+					// This fork keeps a settings link to the shared file.
+					if err != nil {
+						t.Fatalf("shared settings link was refused: %v", err)
+					}
+					return
+				}
 				if err == nil || !strings.Contains(err.Error(), "caam shallow-spawn alice -- true") {
 					t.Fatalf("unsafe configuration needs an actionable refusal: %v", err)
 				}

@@ -680,11 +680,10 @@ func assertShallowExportShell(t *testing.T, script string, expected map[string]s
 }
 
 func TestShallowPrintEnvFailuresAreReadOnlyAndFailClosed(t *testing.T) {
-	for _, problem := range []string{"missing", "invalid-state", "shared-settings"} {
+	// A settings link to the shared file is a valid layout on this fork, so it
+	// is not among the refused exports.
+	for _, problem := range []string{"missing", "invalid-state"} {
 		t.Run(problem, func(t *testing.T) {
-			if problem == "shared-settings" && runtime.GOOS == "windows" {
-				t.Skip("fixture requires Unix symlinks")
-			}
 			base, realHome := shallowEnv(t)
 			if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "seat", "--tool", "claude"); err != nil {
 				t.Fatal(err)
@@ -695,18 +694,6 @@ func TestShallowPrintEnvFailuresAreReadOnlyAndFailClosed(t *testing.T) {
 				name = "missing"
 			case "invalid-state":
 				if err := os.WriteFile(filepath.Join(base, name, ".claude.json"), []byte(`{"oauthToken":"synthetic-export-secret`), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			case "shared-settings":
-				host := filepath.Join(realHome, ".claude", "settings.json")
-				if err := os.WriteFile(host, []byte(`{"apiKeyHelper":"echo synthetic-export-secret"}`), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				path := filepath.Join(base, name, ".claude", "settings.json")
-				if err := os.Rename(path, path+".before-test"); err != nil && !os.IsNotExist(err) {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(host, path); err != nil {
 					t.Fatal(err)
 				}
 			}
